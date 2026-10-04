@@ -4,7 +4,7 @@
 //  SPACE: tap=salto | hold=volo | 2xTap=FREE-FALL
 //  SHIFT: boost 10x
 //  Collisione: pareti + mobili + casse + acqua + sabbia, con substepping 5cm
-//  per evitare tunneling a velocita' elevate.
+//  Ripple: emesso automaticamente mentre ti muovi nell'acqua
 // ============================================================================
 #include "nqg_cleanroom_engine.hpp"
 #include "nqg_matter_physics.hpp"
@@ -60,6 +60,7 @@ int main(int argc, char *argv[]) {
   double spacePressTime = 0.0;
   double lastTapTime = -100.0;
   double controlTime = 0.0;
+  double lastRippleTime = -1.0;
 
   constexpr double TAP_MAX_DURATION = 0.25;
   constexpr double DOUBLE_TAP_WINDOW = 0.40;
@@ -68,7 +69,8 @@ int main(int argc, char *argv[]) {
   constexpr real JUMP_IMPULSE = 5.5;
   constexpr real FREEFALL_THRUST = 20.0;
   constexpr real SHIFT_BOOST = 10.0;
-  constexpr real COLLISION_STEP = 0.05; // 5 cm substep
+  constexpr real COLLISION_STEP = 0.05;    // 5 cm substep
+  constexpr double RIPPLE_INTERVAL = 0.10; // s
 
   std::cout
       << "Appartamento: 12m x 10m x 3.2m con porta sud.\n"
@@ -193,18 +195,17 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // Compute delta from movement
+    // Delta di movimento -> sub-stepping con collisione ogni 5 cm
     Vec3 delta = camPos - oldPos;
     real moveLen = delta.norm();
 
-    // Substep: chunks of COLLISION_STEP (5 cm) each, collision after each
     int nSub = 1;
     if (std::isfinite(moveLen) && moveLen > COLLISION_STEP) {
       nSub = int(std::ceil(moveLen / COLLISION_STEP));
       if (nSub < 1)
         nSub = 1;
       if (nSub > 256)
-        nSub = 256; // hard cap safety
+        nSub = 256;
     }
 
     camPos = oldPos;
@@ -212,6 +213,14 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < nSub; ++i) {
       camPos = camPos + subDelta;
       scene.resolvePlayerCollision(camPos, camVel, playerBody);
+    }
+
+    // Ripple se il giocatore si muove nell'acqua
+    real actualMove = (camPos - oldPos).norm();
+    real actualSpeed = actualMove / std::max(0.001, dt);
+    if (actualSpeed > 0.3 && controlTime - lastRippleTime > RIPPLE_INTERVAL) {
+      scene.notifyPlayerInWater(camPos, playerBody, actualSpeed);
+      lastRippleTime = controlTime;
     }
 
     Vec3 spawnTarget = camPos + lookDir * 2.2;
@@ -295,7 +304,7 @@ int main(int argc, char *argv[]) {
       SDL_GetWindowSize(app.window(), &winW, &winH);
       SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
-      SDL_FRect rMat{20, 20, 440, 308};
+      SDL_FRect rMat{20, 20, 460, 344};
       SDL_SetRenderDrawColor(ren, 15, 25, 38, 230);
       SDL_RenderFillRect(ren, &rMat);
       SDL_SetRenderDrawColor(ren, 50, 130, 210, 255);
@@ -309,24 +318,26 @@ int main(int argc, char *argv[]) {
       SDL_RenderDebugTextFormat(ren, 30, 66, "Piedi/Testa: %.2f / %.2f m",
                                 playerBody.footZ(camPos.z),
                                 playerBody.headZ(camPos.z));
-      SDL_RenderDebugTextFormat(ren, 30, 84, "Dentro stanza XY: %s",
-                                scene.room.insideXY(camPos) ? "SI" : "NO");
+      SDL_RenderDebugTextFormat(
+          ren, 30, 84, "In stanza: %s | In spillway: %s",
+          scene.room.insideXY(camPos) ? "SI" : "NO",
+          scene.water.isInsideSpillway(camPos.x, camPos.y) ? "SI" : "NO");
       SDL_RenderDebugTextFormat(ren, 30, 102, "Altitudine: %.1f m",
                                 scene.currentAltitude);
-      SDL_RenderDebugTextFormat(ren, 30, 120, "Lat/Lon: %.4f / %.4f deg",
-                                scene.currentLatitude * 180.0 / nqg::PI,
-                                scene.currentLongitude * 180.0 / nqg::PI);
-      SDL_RenderDebugTextFormat(ren, 30, 138, "Gravita': %.4f m/s^2",
+      SDL_RenderDebugTextFormat(ren, 30, 120, "Gravita': %.4f m/s^2",
                                 scene.currentGravity);
-      SDL_RenderDebugTextFormat(ren, 30, 156, "Pressione: %.0f Pa",
+      SDL_RenderDebugTextFormat(ren, 30, 138, "Pressione: %.0f Pa",
                                 scene.currentPressure);
-      SDL_RenderDebugTextFormat(ren, 30, 174, "Densita': %.5f kg/m^3",
+      SDL_RenderDebugTextFormat(ren, 30, 156, "Densita': %.5f kg/m^3",
                                 scene.currentDensity);
-      SDL_RenderDebugTextFormat(ren, 30, 192, "Vel. camera: %.2f m/s",
+      SDL_RenderDebugTextFormat(ren, 30, 174, "Vel. camera: %.2f m/s",
                                 camVel.norm());
-      SDL_RenderDebugTextFormat(ren, 30, 210, "Vel. controllo: %.1f m/s",
-                                moveSpeed);
-      SDL_RenderDebugTextFormat(ren, 30, 228, "Substep collisione: %d", nSub);
+      SDL_RenderDebugTextFormat(ren, 30, 192, "Substep collisione: %d", nSub);
+      SDL_RenderDebugTextFormat(
+          ren, 30, 210, "Acqua livello: %.3f m (vol %.2f m^3)",
+          scene.water.currentLevel(), scene.water.waterVolume);
+      SDL_RenderDebugTextFormat(ren, 30, 228, "Ripples attivi: %zu",
+                                scene.water.ripples.size());
       SDL_SetRenderDrawColor(ren, freefallMode ? 255 : 100,
                              freefallMode ? 180 : 220, 255, 255);
       SDL_RenderDebugTextFormat(ren, 30, 246,
@@ -334,10 +345,11 @@ int main(int argc, char *argv[]) {
                                 freefallMode ? "FREE-FALL ON" : "Direct");
       SDL_SetRenderDrawColor(ren, 230, 240, 255, 255);
       SDL_RenderDebugTextFormat(ren, 30, 264,
-                                "Stanza 12x10x3.2m | Cap r=%.2f h=%.2f",
-                                playerBody.radius, playerBody.height);
+                                "Stanza 12x10x3.2m + spillway 2x3m", 0);
       SDL_RenderDebugTextFormat(ren, 30, 282, "Solidi: %zu | FPS: %.1f",
                                 scene.solids.size(), app.fps());
+      SDL_RenderDebugTextFormat(ren, 30, 300, "Pos. spawn: %.2f, %.2f, %.2f",
+                                spawnTarget.x, spawnTarget.y, spawnTarget.z);
 
       SDL_FRect rAir{static_cast<float>(winW - 360), 20, 340, 120};
       SDL_SetRenderDrawColor(ren, 15, 25, 38, 230);

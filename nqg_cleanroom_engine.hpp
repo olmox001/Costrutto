@@ -12,6 +12,11 @@
 //    - Camera collide con: pareti, mobili, casse, acqua, sabbia
 //    - Tunneling: substepping 5cm nel game loop
 //    - Hardening: guardie NaN/Inf, safe-normalize, clamp posizioni
+//    - WATER: nessun bacino invisibile. Superficie globale limitata dalle
+//      pareti + spillway dalla porta. Volume tracciato. Vento pilota onde.
+//      Archimede ovunque + drag acqua. Ripple da movimento giocatore.
+//    - SOLIDI: collisione esplicita con pareti e altri solidi, cap anti-
+//      penetrazione profonda, correzione di velocita' con restituzione.
 // ============================================================================
 #ifndef NQG_CLEANROOM_ENGINE_HPP
 #define NQG_CLEANROOM_ENGINE_HPP
@@ -29,7 +34,7 @@
 #include <vector>
 
 // ============================================================================
-//  namespace nqg::apartment  -  geometria stanza + collisione capsula
+//  namespace nqg::apartment
 // ============================================================================
 namespace nqg {
 namespace apartment {
@@ -38,9 +43,6 @@ using engine::Rgb;
 using engine::Vec3;
 using nqg::real;
 
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
 inline bool isFiniteVec(const Vec3 &v) {
   return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
@@ -55,9 +57,6 @@ inline Vec3 safeNormalize(const Vec3 &v, const Vec3 &fb = Vec3(0, 0, 1)) {
   return v * inv;
 }
 
-// ---------------------------------------------------------------------------
-// AABB
-// ---------------------------------------------------------------------------
 struct AABB {
   Vec3 center = Vec3(0, 0, 0);
   Vec3 half = Vec3(0.5, 0.5, 0.5);
@@ -67,9 +66,6 @@ struct AABB {
   bool isStatic = true;
 };
 
-// ---------------------------------------------------------------------------
-// Capsule collider (verticale, in piedi)
-// ---------------------------------------------------------------------------
 struct CapsuleCollider {
   real radius = 0.30;
   real height = 1.80;
@@ -79,9 +75,6 @@ struct CapsuleCollider {
   real headZ(real camZ) const { return camZ - eyeHeight + height; }
 };
 
-// ---------------------------------------------------------------------------
-// RoomGeometry: 12m x 10m x 3.2m, porta sul lato Sud (y = yMin)
-// ---------------------------------------------------------------------------
 struct RoomGeometry {
   real xMin = -6.0, xMax = 6.0;
   real yMin = -5.0, yMax = 5.0;
@@ -125,7 +118,7 @@ struct RoomGeometry {
       a.roughness = 0.88;
       walls.push_back(a);
     }
-    // Muro Nord
+    // Nord
     {
       AABB a;
       a.center = Vec3(cx, yMax + T * 0.5, cz);
@@ -134,7 +127,7 @@ struct RoomGeometry {
       a.roughness = 0.80;
       walls.push_back(a);
     }
-    // Muro Est
+    // Est
     {
       AABB a;
       a.center = Vec3(xMax + T * 0.5, cy, cz);
@@ -143,7 +136,7 @@ struct RoomGeometry {
       a.roughness = 0.80;
       walls.push_back(a);
     }
-    // Muro Ovest
+    // Ovest
     {
       AABB a;
       a.center = Vec3(xMin - T * 0.5, cy, cz);
@@ -152,7 +145,7 @@ struct RoomGeometry {
       a.roughness = 0.80;
       walls.push_back(a);
     }
-    // Muro Sud sinistro (xMin -> doorX0)
+    // Sud sinistro
     {
       real sx = 0.5 * (xMin + doorX0), shx = 0.5 * (doorX0 - xMin);
       AABB a;
@@ -162,7 +155,7 @@ struct RoomGeometry {
       a.roughness = 0.80;
       walls.push_back(a);
     }
-    // Muro Sud destro (doorX1 -> xMax)
+    // Sud destro
     {
       real sx = 0.5 * (doorX1 + xMax), shx = 0.5 * (xMax - doorX1);
       AABB a;
@@ -174,10 +167,8 @@ struct RoomGeometry {
     }
     // Architrave sopra la porta
     {
-      real sx = 0.5 * (doorX0 + doorX1);
-      real shx = 0.5 * (doorX1 - doorX0);
-      real sz = 0.5 * (doorZ1 + zMax);
-      real shz = 0.5 * (zMax - doorZ1);
+      real sx = 0.5 * (doorX0 + doorX1), shx = 0.5 * (doorX1 - doorX0);
+      real sz = 0.5 * (doorZ1 + zMax), shz = 0.5 * (zMax - doorZ1);
       AABB a;
       a.center = Vec3(sx, yMin - T * 0.5, sz);
       a.half = Vec3(shx, T * 0.5, shz);
@@ -188,21 +179,16 @@ struct RoomGeometry {
   }
 
   bool isFloorSlab(const AABB &a) const {
-    real bz1 = a.center.z + a.half.z;
-    return bz1 <= zMin + 1e-6;
+    return (a.center.z + a.half.z) <= zMin + 1e-6;
   }
   bool isCeilingSlab(const AABB &a) const {
-    real bz0 = a.center.z - a.half.z;
-    return bz0 >= zMax - 1e-6;
+    return (a.center.z - a.half.z) >= zMax - 1e-6;
   }
   bool insideXY(const Vec3 &p) const {
     return p.x >= xMin && p.x <= xMax && p.y >= yMin && p.y <= yMax;
   }
 };
 
-// ---------------------------------------------------------------------------
-// Cilindro verticale vs AABB (pareti, mobili, casse)
-// ---------------------------------------------------------------------------
 inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
                                 const CapsuleCollider &cap, const AABB &box,
                                 real margin = 0.005) {
@@ -210,7 +196,6 @@ inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
   const real headZ = cap.headZ(camPos.z);
   const real boxZ0 = box.center.z - box.half.z;
   const real boxZ1 = box.center.z + box.half.z;
-
   if (headZ <= boxZ0 || footZ >= boxZ1)
     return false;
 
@@ -225,23 +210,18 @@ inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
   const real dy = camPos.y - py;
   const real dist2 = dx * dx + dy * dy;
   const real r = cap.radius + margin;
-  const real r2 = r * r;
-
-  if (dist2 >= r2)
+  if (dist2 >= r * r)
     return false;
 
   const real dist = std::sqrt(std::max(dist2, 1e-12));
   Vec3 n;
   real push;
-
   if (dist > 1e-5) {
     n = Vec3(dx / dist, dy / dist, 0.0);
     push = r - dist;
   } else {
-    real dxL = camPos.x - boxX0;
-    real dxR = boxX1 - camPos.x;
-    real dyL = camPos.y - boxY0;
-    real dyR = boxY1 - camPos.y;
+    real dxL = camPos.x - boxX0, dxR = boxX1 - camPos.x;
+    real dyL = camPos.y - boxY0, dyR = boxY1 - camPos.y;
     real minD = std::min({dxL, dxR, dyL, dyR});
     if (minD == dxL) {
       n = Vec3(-1, 0, 0);
@@ -257,7 +237,6 @@ inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
       push = dyR + r;
     }
   }
-
   camPos = camPos + n * push;
   const real vn = camVel.dot(n);
   if (vn < 0)
@@ -265,9 +244,6 @@ inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// FIX: pavimento sempre, soffitto SOLO dentro footprint XY della stanza
-// ---------------------------------------------------------------------------
 inline void resolveFloorCeiling(Vec3 &camPos, Vec3 &camVel,
                                 const CapsuleCollider &cap,
                                 const RoomGeometry &room) {
@@ -277,7 +253,6 @@ inline void resolveFloorCeiling(Vec3 &camPos, Vec3 &camVel,
     if (camVel.z < 0)
       camVel.z = 0;
   }
-
   if (room.insideXY(camPos)) {
     const real headZ = cap.headZ(camPos.z);
     if (headZ > room.zMax) {
@@ -299,7 +274,7 @@ inline void resolveFloorCeiling(Vec3 &camPos, Vec3 &camVel,
 #include "nqg_matter_physics.hpp"
 
 // ============================================================================
-//  namespace nqg::cleanroom  -  illuminazione + scena + ray tracing
+//  namespace nqg::cleanroom
 // ============================================================================
 namespace nqg {
 namespace cleanroom {
@@ -313,9 +288,6 @@ using engine::Image;
 using engine::Rgb;
 using engine::Vec3;
 
-// ----------------------------------------------------------------------------
-// Sistema di Illuminazione
-// ----------------------------------------------------------------------------
 struct LightSource {
   enum class Type { Directional, Point, CeilingPanel };
   Type type = Type::Point;
@@ -343,26 +315,30 @@ public:
 
   static LightingSystem createApartmentPreset() {
     LightingSystem sys;
-    LightSource lamp;
-    lamp.type = LightSource::Type::CeilingPanel;
-    lamp.position = Vec3(0, 0, 3.0);
-    lamp.temperatureK = 3500.0;
-    lamp.intensity = 3.0;
-    sys.lights.push_back(lamp);
-
-    LightSource doorFill;
-    doorFill.type = LightSource::Type::Point;
-    doorFill.position = Vec3(0, -4.8, 1.4);
-    doorFill.temperatureK = 5500.0;
-    doorFill.intensity = 1.2;
-    sys.lights.push_back(doorFill);
-
-    LightSource sun;
-    sun.type = LightSource::Type::Directional;
-    sun.direction = Vec3(-0.4, 0.3, -0.85).normalized();
-    sun.temperatureK = 6500.0;
-    sun.intensity = 0.8;
-    sys.lights.push_back(sun);
+    {
+      LightSource lamp;
+      lamp.type = LightSource::Type::CeilingPanel;
+      lamp.position = Vec3(0, 0, 3.0);
+      lamp.temperatureK = 3500.0;
+      lamp.intensity = 3.0;
+      sys.lights.push_back(lamp);
+    }
+    {
+      LightSource doorFill;
+      doorFill.type = LightSource::Type::Point;
+      doorFill.position = Vec3(0, -4.8, 1.4);
+      doorFill.temperatureK = 5500.0;
+      doorFill.intensity = 1.2;
+      sys.lights.push_back(doorFill);
+    }
+    {
+      LightSource sun;
+      sun.type = LightSource::Type::Directional;
+      sun.direction = Vec3(-0.4, 0.3, -0.85).normalized();
+      sun.temperatureK = 6500.0;
+      sun.intensity = 0.8;
+      sys.lights.push_back(sun);
+    }
     return sys;
   }
 
@@ -371,9 +347,6 @@ public:
   }
 };
 
-// ----------------------------------------------------------------------------
-// Sfera di prova
-// ----------------------------------------------------------------------------
 struct PhysicalSphere {
   Vec3 pos = Vec3(0, 3, 2.0);
   Vec3 vel = Vec3(0, 0, 0);
@@ -392,7 +365,6 @@ struct PhysicalSphere {
     if (dt <= 0)
       return;
     std::array<real, 6> y0 = {pos.x, pos.y, pos.z, vel.x, vel.y, vel.z};
-
     auto rhs = [&](real, const std::array<real, 6> &y) -> std::array<real, 6> {
       Vec3 p(y[0], y[1], y[2]);
       Vec3 v(y[3], y[4], y[5]);
@@ -404,7 +376,6 @@ struct PhysicalSphere {
       Vec3 accel = fTotal * (1.0 / mass);
       return {v.x, v.y, v.z, accel.x, accel.y, accel.z};
     };
-
     auto res = nqg::integrateDP45<6>(rhs, y0, 0.0, dt, 1e-6, 1e-8);
     Vec3 newPos(res.y[0], res.y[1], res.y[2]);
     Vec3 newVel(res.y[3], res.y[4], res.y[5]);
@@ -413,10 +384,8 @@ struct PhysicalSphere {
         std::isfinite(newVel.y) && std::isfinite(newVel.z)) {
       pos = newPos;
       vel = newVel;
-    } else {
+    } else
       vel = Vec3(0, 0, 0);
-    }
-
     if (pos.z - radius < 0.0) {
       pos.z = radius;
       if (vel.z < 0) {
@@ -432,9 +401,6 @@ struct PhysicalSphere {
   }
 };
 
-// ----------------------------------------------------------------------------
-// SCENA
-// ----------------------------------------------------------------------------
 class CleanRoomScene {
 public:
   AirProperties air;
@@ -451,7 +417,6 @@ public:
   Camera camera;
   Vec3 gravityVec = Vec3(0, 0, -9.80665);
 
-  // Globo
   earth::EarthGlobe globe;
   earth::WindProfile windProfile;
   real homeLat = 45.0 * PI / 180.0;
@@ -459,10 +424,8 @@ public:
   Vec3 homeECEF;
   Vec3 homeUp, homeEast, homeNorth;
 
-  // Appartamento
   RoomGeometry room;
 
-  // Stato osservatore
   mutable Vec3 lastObserverPos = Vec3(0, -3, 1.7);
   mutable real currentAltitude = 1.7;
   mutable real currentLatitude = 0.0;
@@ -488,7 +451,11 @@ public:
     camera.pitch = -0.10;
     camera.fovY = 65.0 * PI / 180.0;
 
-    // Popola solids con pareti della stanza (tag mass = 1e9 per skip)
+    // WATER: superficie estesa a tutta la stanza + spillway dalla porta.
+    water.setRoomBounds(room.xMin, room.xMax, room.yMin, room.yMax, room.zMin);
+    water.setDoor(room.doorX0, room.doorX1, 3.0); // 3 m di spillway
+
+    // Popola solids con pareti della stanza
     for (const auto &w : room.walls) {
       continuum::RigidSolidElement s;
       s.pos = w.center;
@@ -504,41 +471,41 @@ public:
 
     // Tavolo statico
     {
-      continuum::RigidSolidElement table;
-      table.pos = Vec3(-3.0, 2.5, 0.40);
-      table.size = Vec3(1.8, 0.9, 0.80);
-      table.mass = 25.0;
-      table.albedo = {0.72f, 0.55f, 0.35f};
-      table.metallic = 0.0;
-      table.roughness = 0.55;
-      table.restitution = 0.05;
-      table.isStatic = true;
-      solids.push_back(table);
+      continuum::RigidSolidElement t;
+      t.pos = Vec3(-3.0, 2.5, 0.40);
+      t.size = Vec3(1.8, 0.9, 0.80);
+      t.mass = 25.0;
+      t.albedo = {0.72f, 0.55f, 0.35f};
+      t.metallic = 0.0;
+      t.roughness = 0.55;
+      t.restitution = 0.05;
+      t.isStatic = true;
+      solids.push_back(t);
     }
     // Casse dinamiche
     {
-      continuum::RigidSolidElement crate;
-      crate.pos = Vec3(3.5, 2.0, 0.50);
-      crate.size = Vec3(0.9, 0.9, 0.9);
-      crate.mass = 8.0;
-      crate.albedo = {0.65f, 0.45f, 0.28f};
-      crate.metallic = 0.0;
-      crate.roughness = 0.62;
-      crate.restitution = 0.15;
-      crate.isStatic = false;
-      solids.push_back(crate);
+      continuum::RigidSolidElement c;
+      c.pos = Vec3(3.5, 2.0, 0.50);
+      c.size = Vec3(0.9, 0.9, 0.9);
+      c.mass = 8.0;
+      c.albedo = {0.65f, 0.45f, 0.28f};
+      c.metallic = 0.0;
+      c.roughness = 0.62;
+      c.restitution = 0.15;
+      c.isStatic = false;
+      solids.push_back(c);
     }
     {
-      continuum::RigidSolidElement crate;
-      crate.pos = Vec3(3.8, 2.6, 1.50);
-      crate.size = Vec3(0.7, 0.7, 0.7);
-      crate.mass = 4.0;
-      crate.albedo = {0.58f, 0.40f, 0.22f};
-      crate.metallic = 0.0;
-      crate.roughness = 0.60;
-      crate.restitution = 0.20;
-      crate.isStatic = false;
-      solids.push_back(crate);
+      continuum::RigidSolidElement c;
+      c.pos = Vec3(3.8, 2.6, 1.50);
+      c.size = Vec3(0.7, 0.7, 0.7);
+      c.mass = 4.0;
+      c.albedo = {0.58f, 0.40f, 0.22f};
+      c.metallic = 0.0;
+      c.roughness = 0.60;
+      c.restitution = 0.20;
+      c.isStatic = false;
+      solids.push_back(c);
     }
 
     PhysicalSphere s;
@@ -565,7 +532,6 @@ public:
   void updateEnvironment() {
     real alt = lastObserverPos.z;
     currentAltitude = alt;
-
     Vec3 obsECEF = localToECEF(lastObserverPos);
     earth::EarthGlobe::ecefToLatLon(obsECEF, currentLatitude, currentLongitude,
                                     currentAltitude);
@@ -594,41 +560,29 @@ public:
     air.windVelocity = currentWind;
   }
 
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   // COLLISIONE UNIFICATA: pareti + mobili + casse + acqua + sabbia
-  // Chiamare questa funzione ogni volta che la camera si muove (idealmente
-  // in sub-step da 5cm per evitare tunneling attraverso pareti sottili).
-  // ---------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
   void resolvePlayerCollision(Vec3 &camPos, Vec3 &camVel,
                               const CapsuleCollider &cap) const {
-    // Sanity
     if (!apartment::isFiniteVec(camPos) || !apartment::isFiniteVec(camVel)) {
       camPos = Vec3(0, 0, cap.eyeHeight);
       camVel = Vec3(0, 0, 0);
       return;
     }
 
-    // 1. Pavimento + soffitto (soffitto solo dentro footprint stanza)
+    // 1. Pavimento + soffitto
     apartment::resolveFloorCeiling(camPos, camVel, cap, room);
 
-    // 2. Pareti
-    for (const auto &w : room.walls) {
-      if (room.isFloorSlab(w) || room.isCeilingSlab(w))
-        continue;
-      apartment::resolveCylinderAABB(camPos, camVel, cap, w);
-    }
-
-    // 3. Solidi: mobili, casse (skip wall-solid duplicati tag mass = 1e9)
+    // 2. TUTTI i solidi (pareti + mobili + casse) via stessa primitiva
     for (const auto &s : solids) {
-      if (s.mass > 1e8)
-        continue; // pareti gia' gestite sopra
       apartment::AABB box;
       box.center = s.pos;
       box.half = s.halfExtents();
       apartment::resolveCylinderAABB(camPos, camVel, cap, box);
     }
 
-    // 4. Acqua: se i piedi sono sotto il pelo libero, spingi su
+    // 3. Acqua: cammina sul pelo libero (stanza + spillway)
     if (water.isInsideBasin(camPos.x, camPos.y)) {
       real h = water.evaluateHeight(camPos.x, camPos.y, simTime);
       real footZ = cap.footZ(camPos.z);
@@ -639,7 +593,7 @@ public:
       }
     }
 
-    // 5. Sabbia: superficie continua via height field
+    // 4. Sabbia
     {
       real h = sand.sampleHeight(camPos.x, camPos.y);
       if (h > 0.001) {
@@ -652,11 +606,30 @@ public:
       }
     }
 
-    // 6. Clamp di sicurezza
     camPos.x = std::clamp(camPos.x, -100000.0, 100000.0);
     camPos.y = std::clamp(camPos.y, -100000.0, 100000.0);
     camPos.z =
         std::clamp(camPos.z, cap.eyeHeight + 0.001, cap.eyeHeight + 100000.0);
+  }
+
+  // -------------------------------------------------------------------------
+  // Emit ripples quando il giocatore si muove nell'acqua
+  // -------------------------------------------------------------------------
+  void notifyPlayerInWater(const Vec3 &camPos, const CapsuleCollider &cap,
+                           real speed) {
+    if (!water.isInsideBasin(camPos.x, camPos.y))
+      return;
+    real h = water.evaluateHeight(camPos.x, camPos.y, simTime);
+    real footZ = cap.footZ(camPos.z);
+    // Consideriamo "in acqua" se i piedi sono entro 5 cm dal pelo libero o
+    // sotto
+    if (footZ > h + 0.05)
+      return;
+
+    // Strength proporzionale alla velocita' (clamped)
+    real strength =
+        std::clamp(0.008 + 0.012 * std::min(speed, 8.0), 0.008, 0.05);
+    water.addRipple(Vec3(camPos.x, camPos.y, h), simTime, strength);
   }
 
   // -------------------------------------------------------------------------
@@ -710,13 +683,10 @@ public:
       t = -b + sq;
     if (t < 0.001)
       return false;
-
     Vec3 hitLocal = ro + rd * t;
     Vec3 hitECEF = localToECEF(hitLocal);
-
     real alt;
     earth::EarthGlobe::ecefToLatLon(hitECEF, latOut, lonOut, alt);
-
     tOut = t;
     nOut = apartment::safeNormalize(hitLocal - C);
     return true;
@@ -789,7 +759,6 @@ public:
     Vec3 sunDir = apartment::safeNormalize(homeEast * 0.70 + homeUp * 0.55 +
                                            homeNorth * 0.45);
     real cosSun = std::max(0.0, dir.dot(sunDir));
-
     real baseR = (0.30 + 0.35 * cosSun) * rhoRatio;
     real baseG = (0.48 + 0.30 * cosSun) * rhoRatio;
     real baseB = (0.85 + 0.10 * cosSun) * rhoRatio;
@@ -857,7 +826,7 @@ public:
       }
     }
 
-    // 3. Sabbia locale
+    // 3. Sabbia
     real tS;
     Vec3 nS;
     if (sand.intersectSand(ro, rd, tS, nS)) {
@@ -1126,10 +1095,9 @@ public:
     simTime += dt;
     updateEnvironment();
 
-    real wSpeed = currentWind.norm();
-    for (auto &w : water.waves) {
-      w.amplitude = 0.015 + wSpeed * 0.006;
-    }
+    // Onde guidate dal vento
+    water.updateFromWind(currentWind, dt);
+    water.cleanupRipples(simTime);
 
     sand.relaxAvalanche(1);
     real airDensity = currentDensity;
@@ -1141,6 +1109,7 @@ public:
       s.stepDynamics(dt, gravityVec, water, wind, airDensity, simTime);
     }
 
+    // Collisioni solido-solido (pareti + mobili + casse)
     for (std::size_t i = 0; i < solids.size(); ++i) {
       for (std::size_t j = i + 1; j < solids.size(); ++j) {
         Vec3 colNormal;
@@ -1148,6 +1117,10 @@ public:
         if (continuum::RigidSolidElement::aabbOverlap(
                 solids[i].pos, solids[i].halfExtents(), solids[j].pos,
                 solids[j].halfExtents(), colNormal, overlap)) {
+          // Cap anti-teleport per penetrazioni profonde
+          overlap = std::min(overlap, 0.15);
+
+          // Separazione posizionale
           real totalMass = solids[i].mass + solids[j].mass;
           if (!solids[i].isStatic && !solids[j].isStatic) {
             solids[i].pos = solids[i].pos +
@@ -1159,10 +1132,13 @@ public:
           } else if (!solids[j].isStatic) {
             solids[j].pos = solids[j].pos - colNormal * overlap;
           }
-          real vRel = (solids[i].vel - solids[j].vel).dot(colNormal);
-          if (vRel < 0) {
+
+          // Correzione di velocita' con restituzione
+          Vec3 vRel = solids[i].vel - solids[j].vel;
+          real vn = vRel.dot(colNormal);
+          if (vn < 0) {
             real e = std::min(solids[i].restitution, solids[j].restitution);
-            real jImpulse = -(1.0 + e) * vRel;
+            real jImpulse = -(1.0 + e) * vn;
             if (solids[i].isStatic) {
               jImpulse /= (1.0 / solids[j].mass);
               solids[j].vel =
@@ -1183,19 +1159,11 @@ public:
       }
     }
 
-    for (auto &s : spheres) {
+    for (auto &s : spheres)
       s.step(dt, air, currentGravity);
-    }
 
     matterSim.gravity = gravityVec;
     matterSim.step(dt, air);
-
-    water.ripples.erase(
-        std::remove_if(water.ripples.begin(), water.ripples.end(),
-                       [this](const continuum::ContinuousWaterBody::Ripple &r) {
-                         return (simTime - r.startTime) > 5.0;
-                       }),
-        water.ripples.end());
   }
 };
 
