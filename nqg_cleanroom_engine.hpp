@@ -2,17 +2,16 @@
 //  nqg_cleanroom_engine.hpp  -  Appartamento su Globo Terrestre
 //  (SELF-CONTAINED)
 //  ---------------------------------------------------------------------------
-//  TUTTO IN UN SOLO FILE. Non dipende da nqg_apartment.hpp.
-//
 //  Contenuto:
 //    namespace nqg::apartment  -> utility + geometria stanza + collisione
 //    namespace nqg::cleanroom  -> illuminazione + scena + ray tracing
 //
 //  FIX applicati:
-//    - Polo: lat/lon via ECEF + atan2 (nessuna distorsione)
+//    - Polo: lat/lon via ECEF + atan2
 //    - Soffitto: collisione SOLO dentro il footprint XY della stanza
+//    - Camera collide con: pareti, mobili, casse, acqua, sabbia
+//    - Tunneling: substepping 5cm nel game loop
 //    - Hardening: guardie NaN/Inf, safe-normalize, clamp posizioni
-//    - Scattering atmosferico scala planetaria (visibilita' ~50 km)
 // ============================================================================
 #ifndef NQG_CLEANROOM_ENGINE_HPP
 #define NQG_CLEANROOM_ENGINE_HPP
@@ -202,7 +201,7 @@ struct RoomGeometry {
 };
 
 // ---------------------------------------------------------------------------
-// Cilindro verticale vs AABB (pareti) - collisione orizzontale
+// Cilindro verticale vs AABB (pareti, mobili, casse)
 // ---------------------------------------------------------------------------
 inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
                                 const CapsuleCollider &cap, const AABB &box,
@@ -289,33 +288,11 @@ inline void resolveFloorCeiling(Vec3 &camPos, Vec3 &camVel,
   }
 }
 
-inline void resolveRoomCollision(Vec3 &camPos, Vec3 &camVel,
-                                 const CapsuleCollider &cap,
-                                 const RoomGeometry &room) {
-  if (!isFiniteVec(camPos) || !isFiniteVec(camVel)) {
-    camPos = Vec3(0, 0, cap.eyeHeight);
-    camVel = Vec3(0, 0, 0);
-    return;
-  }
-  resolveFloorCeiling(camPos, camVel, cap, room);
-
-  for (const auto &w : room.walls) {
-    if (room.isFloorSlab(w) || room.isCeilingSlab(w))
-      continue;
-    resolveCylinderAABB(camPos, camVel, cap, w);
-  }
-
-  camPos.x = std::clamp(camPos.x, -100000.0, 100000.0);
-  camPos.y = std::clamp(camPos.y, -100000.0, 100000.0);
-  camPos.z =
-      std::clamp(camPos.z, cap.eyeHeight + 0.001, cap.eyeHeight + 100000.0);
-}
-
 } // namespace apartment
 } // namespace nqg
 
 // ============================================================================
-//  Physics modules (inclusi dopo le definizioni geometria)
+//  Physics modules
 // ============================================================================
 #include "nqg_air_physics.hpp"
 #include "nqg_continuum_physics.hpp"
@@ -511,7 +488,7 @@ public:
     camera.pitch = -0.10;
     camera.fovY = 65.0 * PI / 180.0;
 
-    // Popola solids con pareti della stanza
+    // Popola solids con pareti della stanza (tag mass = 1e9 per skip)
     for (const auto &w : room.walls) {
       continuum::RigidSolidElement s;
       s.pos = w.center;
@@ -617,6 +594,74 @@ public:
     air.windVelocity = currentWind;
   }
 
+  // ---------------------------------------------------------------------------
+  // COLLISIONE UNIFICATA: pareti + mobili + casse + acqua + sabbia
+  // Chiamare questa funzione ogni volta che la camera si muove (idealmente
+  // in sub-step da 5cm per evitare tunneling attraverso pareti sottili).
+  // ---------------------------------------------------------------------------
+  void resolvePlayerCollision(Vec3 &camPos, Vec3 &camVel,
+                              const CapsuleCollider &cap) const {
+    // Sanity
+    if (!apartment::isFiniteVec(camPos) || !apartment::isFiniteVec(camVel)) {
+      camPos = Vec3(0, 0, cap.eyeHeight);
+      camVel = Vec3(0, 0, 0);
+      return;
+    }
+
+    // 1. Pavimento + soffitto (soffitto solo dentro footprint stanza)
+    apartment::resolveFloorCeiling(camPos, camVel, cap, room);
+
+    // 2. Pareti
+    for (const auto &w : room.walls) {
+      if (room.isFloorSlab(w) || room.isCeilingSlab(w))
+        continue;
+      apartment::resolveCylinderAABB(camPos, camVel, cap, w);
+    }
+
+    // 3. Solidi: mobili, casse (skip wall-solid duplicati tag mass = 1e9)
+    for (const auto &s : solids) {
+      if (s.mass > 1e8)
+        continue; // pareti gia' gestite sopra
+      apartment::AABB box;
+      box.center = s.pos;
+      box.half = s.halfExtents();
+      apartment::resolveCylinderAABB(camPos, camVel, cap, box);
+    }
+
+    // 4. Acqua: se i piedi sono sotto il pelo libero, spingi su
+    if (water.isInsideBasin(camPos.x, camPos.y)) {
+      real h = water.evaluateHeight(camPos.x, camPos.y, simTime);
+      real footZ = cap.footZ(camPos.z);
+      if (footZ < h) {
+        camPos.z += (h - footZ);
+        if (camVel.z < 0)
+          camVel.z = 0;
+      }
+    }
+
+    // 5. Sabbia: superficie continua via height field
+    {
+      real h = sand.sampleHeight(camPos.x, camPos.y);
+      if (h > 0.001) {
+        real footZ = cap.footZ(camPos.z);
+        if (footZ < h) {
+          camPos.z += (h - footZ);
+          if (camVel.z < 0)
+            camVel.z = 0;
+        }
+      }
+    }
+
+    // 6. Clamp di sicurezza
+    camPos.x = std::clamp(camPos.x, -100000.0, 100000.0);
+    camPos.y = std::clamp(camPos.y, -100000.0, 100000.0);
+    camPos.z =
+        std::clamp(camPos.z, cap.eyeHeight + 0.001, cap.eyeHeight + 100000.0);
+  }
+
+  // -------------------------------------------------------------------------
+  // Intersezioni geometriche
+  // -------------------------------------------------------------------------
   static bool intersectSphere(const Vec3 &ro, const Vec3 &rd,
                               const Vec3 &center, real radius, real &tOut,
                               Vec3 &nOut) {

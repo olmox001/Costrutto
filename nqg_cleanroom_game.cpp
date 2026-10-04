@@ -3,7 +3,8 @@
 //  ---------------------------------------------------------------------------
 //  SPACE: tap=salto | hold=volo | 2xTap=FREE-FALL
 //  SHIFT: boost 10x
-//  FIX: soffitto si applica solo dentro la stanza
+//  Collisione: pareti + mobili + casse + acqua + sabbia, con substepping 5cm
+//  per evitare tunneling a velocita' elevate.
 // ============================================================================
 #include "nqg_cleanroom_engine.hpp"
 #include "nqg_matter_physics.hpp"
@@ -24,7 +25,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Avvio NQG Apartment su Globo Terrestre...\n";
 
   WindowConfig cfg;
-  cfg.title = "NQG Apartment on Earth - Real Scale";
+  cfg.title = "NQG Apartment on Earth - Unified Collision";
   cfg.windowWidth = 1280;
   cfg.windowHeight = 720;
   cfg.resizable = true;
@@ -67,6 +68,7 @@ int main(int argc, char *argv[]) {
   constexpr real JUMP_IMPULSE = 5.5;
   constexpr real FREEFALL_THRUST = 20.0;
   constexpr real SHIFT_BOOST = 10.0;
+  constexpr real COLLISION_STEP = 0.05; // 5 cm substep
 
   std::cout
       << "Appartamento: 12m x 10m x 3.2m con porta sud.\n"
@@ -80,6 +82,7 @@ int main(int argc, char *argv[]) {
     controlTime += dt;
     auto &im = app.input();
 
+    // Mouse look / frecce
     if (im.isMouseLeftDown()) {
       camYaw += im.mouseDeltaX() * 0.0035;
       camPitch -= im.mouseDeltaY() * 0.0035;
@@ -108,6 +111,7 @@ int main(int argc, char *argv[]) {
     real flySpeed = BASE_FLY_SPEED * altitudeFactor * shiftMult;
     real thrustScaled = FREEFALL_THRUST * altitudeFactor;
 
+    // SPACE gesture state machine
     const bool spaceDown = im.isKeyDown(SDL_SCANCODE_SPACE);
     const bool spaceJustPressed = spaceDown && !spaceWasDown;
     const bool spaceJustReleased = !spaceDown && spaceWasDown;
@@ -135,6 +139,11 @@ int main(int argc, char *argv[]) {
       }
     }
     spaceWasDown = spaceDown;
+
+    // -----------------------------------------------------------------------
+    // MOVIMENTO: calcola posizione desiderata, poi sub-step + collisione
+    // -----------------------------------------------------------------------
+    Vec3 oldPos = camPos;
 
     if (freefallMode) {
       Vec3 acc(0, 0, 0);
@@ -184,11 +193,32 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // Collisione: FIX - soffitto solo dentro stanza
-    apartment::resolveRoomCollision(camPos, camVel, playerBody, scene.room);
+    // Compute delta from movement
+    Vec3 delta = camPos - oldPos;
+    real moveLen = delta.norm();
+
+    // Substep: chunks of COLLISION_STEP (5 cm) each, collision after each
+    int nSub = 1;
+    if (std::isfinite(moveLen) && moveLen > COLLISION_STEP) {
+      nSub = int(std::ceil(moveLen / COLLISION_STEP));
+      if (nSub < 1)
+        nSub = 1;
+      if (nSub > 256)
+        nSub = 256; // hard cap safety
+    }
+
+    camPos = oldPos;
+    Vec3 subDelta = delta * (1.0 / real(nSub));
+    for (int i = 0; i < nSub; ++i) {
+      camPos = camPos + subDelta;
+      scene.resolvePlayerCollision(camPos, camVel, playerBody);
+    }
 
     Vec3 spawnTarget = camPos + lookDir * 2.2;
 
+    // -----------------------------------------------------------------------
+    // Azioni
+    // -----------------------------------------------------------------------
     if (im.wasKeyPressed(SDL_SCANCODE_1) || im.isKeyDown(SDL_SCANCODE_1)) {
       scene.water.addImpulse(spawnTarget, scene.simTime, 0.08);
       for (auto &w : scene.water.waves)
@@ -243,6 +273,7 @@ int main(int argc, char *argv[]) {
 
     scene.stepPhysics(dt);
 
+    // Audio
     for (const auto &ev : scene.matterSim.frameAudioEvents) {
       if (app.audio())
         app.audio()->triggerTransient(static_cast<float>(ev.frequency),
@@ -251,16 +282,20 @@ int main(int argc, char *argv[]) {
     real windMag = scene.currentWind.norm();
     app.updateAudio(dt, 1.0, 0.0, windMag > 0.5 ? windMag * 0.15 : 0.0, 0.0);
 
+    // Render
     Image frame = scene.render(renderW, renderH, camPos, camYaw, camPitch);
     app.renderFrame(frame);
 
+    // -----------------------------------------------------------------------
+    // HUD
+    // -----------------------------------------------------------------------
     SDL_Renderer *ren = app.renderer();
     if (ren && app.hud().mode() != HudRenderer::HudMode::Off) {
       int winW = 0, winH = 0;
       SDL_GetWindowSize(app.window(), &winW, &winH);
       SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
-      SDL_FRect rMat{20, 20, 430, 288};
+      SDL_FRect rMat{20, 20, 440, 308};
       SDL_SetRenderDrawColor(ren, 15, 25, 38, 230);
       SDL_RenderFillRect(ren, &rMat);
       SDL_SetRenderDrawColor(ren, 50, 130, 210, 255);
@@ -291,16 +326,17 @@ int main(int argc, char *argv[]) {
                                 camVel.norm());
       SDL_RenderDebugTextFormat(ren, 30, 210, "Vel. controllo: %.1f m/s",
                                 moveSpeed);
+      SDL_RenderDebugTextFormat(ren, 30, 228, "Substep collisione: %d", nSub);
       SDL_SetRenderDrawColor(ren, freefallMode ? 255 : 100,
                              freefallMode ? 180 : 220, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 228,
+      SDL_RenderDebugTextFormat(ren, 30, 246,
                                 "SPACE: tap=salt | hold=vola | 2x=%s",
                                 freefallMode ? "FREE-FALL ON" : "Direct");
       SDL_SetRenderDrawColor(ren, 230, 240, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 246,
+      SDL_RenderDebugTextFormat(ren, 30, 264,
                                 "Stanza 12x10x3.2m | Cap r=%.2f h=%.2f",
                                 playerBody.radius, playerBody.height);
-      SDL_RenderDebugTextFormat(ren, 30, 264, "Solidi: %zu | FPS: %.1f",
+      SDL_RenderDebugTextFormat(ren, 30, 282, "Solidi: %zu | FPS: %.1f",
                                 scene.solids.size(), app.fps());
 
       SDL_FRect rAir{static_cast<float>(winW - 360), 20, 340, 120};
