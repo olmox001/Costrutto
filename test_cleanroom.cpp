@@ -93,7 +93,7 @@ int main() {
     // Raggio puntato sulla prima sfera
     Vec3 sphCenter = scene.spheres[0].pos;
     Vec3 rdSph = (sphCenter - ro).normalized();
-    real tSph;
+    real tSph = 0;
     Vec3 nSph;
     bool hitSph = scene.intersectSphere(ro, rdSph, sphCenter, scene.spheres[0].radius, tSph, nSph);
     CHECK("C4b", hitSph && tSph > 0, "Intersezione sfera di prova: t = %.3f m", tSph);

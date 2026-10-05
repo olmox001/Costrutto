@@ -378,8 +378,8 @@
 
 #include "nqg_earth_environment.hpp"
 
-// La geometria della stanza (RoomGeometry, CapsuleCollider, AABB, ...) e'
-// definita nel namespace nqg::apartment all'interno di
+// La geometria della stanza (RoomGeometry, CapsuleCollider, SdfPart, ...) e'
+// rappresentata con SDF (nqg_sdf.hpp) nel namespace nqg::apartment all'interno di
 // nqg_cleanroom_engine.hpp. Per usarla:
 //   #include "nqg_cleanroom_engine.hpp"
 

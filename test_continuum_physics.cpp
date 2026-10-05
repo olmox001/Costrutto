@@ -5,6 +5,8 @@
 #include <iostream>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <string>
 
 using namespace nqg;
 using namespace nqg::continuum;
@@ -33,6 +35,8 @@ int main() {
   // 1. Acqua Continua: Onde di Gerstner, Snell, Fresnel e Beer-Lambert
   // --------------------------------------------------------------------------
   ContinuousWaterBody water;
+  water.initialFill(water.basinCenter.x - 2.0, water.basinCenter.x + 2.0,
+                    water.basinCenter.y - 2.0, water.basinCenter.y + 2.0, 0.45);
   real h0 = water.evaluateHeight(water.basinCenter.x, water.basinCenter.y, 0.0);
   CHECK(h0 > 0.40 && h0 < 0.55, "K1a", "Altezza pelo libero d'acqua ragionevole: h=" + std::to_string(h0) + " m");
 
@@ -121,7 +125,7 @@ int main() {
   // --------------------------------------------------------------------------
   QuantumWavepacketField qf;
   real lambdaC = qf.comptonWavelength();
-  CHECK(lambdaC > 1e-15 && lambdaC < 1e-10, "K5a", "Lunghezza d'onda di Compton dell'elettrone: lambda_C=" + std::to_string(lambdaC) + " m");
+  CHECK(lambdaC > 1e-15 && lambdaC < 1e-10, "K5a", "Lunghezza d'onda di Compton dell'elettrone: lambda_C=" + [&]{ char b[32]; std::snprintf(b, sizeof b, "%.3e", lambdaC); return std::string(b); }() + " m");
 
   real psiSqCenter = qf.evaluateDensity(qf.center);
   real psiSqFar = qf.evaluateDensity(qf.center + Vec3(1.0, 0, 0));

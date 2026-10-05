@@ -362,6 +362,9 @@
 # ---------------------------------------------------------------------------*/
 // ============================================================================
 //  nqg_continuum_physics.hpp
+//  SDF: RigidSolidElement e' ora definito da un Signed Distance Field
+//   (nqg_sdf.hpp). Rimossi OBB/SAT/vertici: ray casting = sphere tracing,
+//   contatti = campionamento di d(p), normali = gradiente analitico.
 //  FIX 2025e (dinamica + stabilita' + EM):
 //   - RigidSolidElement: sleeping (asleep/sleepTimer/wake()).
 //     I corpi a riposo non si integrano -> niente jitter perpetuo.
@@ -377,12 +380,14 @@
 #include "nqg_air_physics.hpp"
 #include "nqg_engine3d.hpp"
 #include "nqg_physics_core.hpp"
+#include "nqg_sdf.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <vector>
 
 namespace nqg {
@@ -1077,7 +1082,7 @@ public:
 // 4. SOLIDI RIGIDI
 // ============================================================================
 struct RigidSolidElement {
-  enum class Shape { Box, Cylinder, Sphere };
+  enum class Shape { Box, Cylinder, Sphere, Custom };
   Shape shape = Shape::Box;
   Vec3 pos = Vec3(-1.2, 3.2, 0.4);
   Vec3 vel = Vec3(0, 0, 0);
@@ -1119,7 +1124,76 @@ struct RigidSolidElement {
 
   using GroundHeightFn = std::function<real(real, real)>;
 
-  real volume() const { return size.x * size.y * size.z; }
+  // --------------------------------------------------------------------
+  //  Geometria SDF. `size` e' sempre l'inviluppo (bounding box locale):
+  //   Box: lati | Sphere: diametro (size.x) | Cylinder (asse z): diametro
+  //   (size.x) x altezza (size.z) | Custom: customField (size = inviluppo).
+  // --------------------------------------------------------------------
+  std::shared_ptr<const sdf::Field> customField;
+  real cornerRadius = 0.0; // arrotondamento spigoli (Box)
+
+  mutable std::shared_ptr<const sdf::Field> fld_;
+  mutable std::array<Vec3, 26> smp_{};
+  mutable Vec3 fldSize_ = Vec3(-1, -1, -1);
+  mutable Shape fldShape_ = Shape::Box;
+  mutable real fldRound_ = -1.0;
+  mutable const sdf::Field *fldCustom_ = nullptr;
+  mutable bool fldValid_ = false;
+
+  // Ricostruisce (se serve) il campo SDF e i punti di appoggio. Da chiamare
+  // prima di usare il solido da piu' thread (renderView lo fa).
+  void prepare() const {
+    const sdf::Field *cf = customField.get();
+    if (fldValid_ && fldShape_ == shape && fldRound_ == cornerRadius &&
+        fldCustom_ == cf && fldSize_.x == size.x && fldSize_.y == size.y &&
+        fldSize_.z == size.z)
+      return;
+    auto f = std::make_shared<sdf::Field>();
+    const Vec3 h = size * 0.5;
+    switch (shape) {
+    case Shape::Sphere:
+      f->setRoot(f->sphere(Vec3(0, 0, 0), std::min({h.x, h.y, h.z})));
+      break;
+    case Shape::Cylinder:
+      f->setRoot(f->cylinderZ(Vec3(0, 0, 0), std::min(h.x, h.y), h.z));
+      break;
+    case Shape::Custom:
+      if (cf) {
+        *f = *cf;
+        break;
+      }
+      [[fallthrough]];
+    default:
+      f->setRoot(f->box(Vec3(0, 0, 0), h, cornerRadius));
+      break;
+    }
+    fld_ = f;
+    smp_ = f->surfaceSamples();
+    fldShape_ = shape;
+    fldRound_ = cornerRadius;
+    fldCustom_ = cf;
+    fldSize_ = size;
+    fldValid_ = true;
+  }
+  const sdf::Field &field() const {
+    prepare();
+    return *fld_;
+  }
+
+  real volume() const {
+    switch (shape) {
+    case Shape::Sphere: {
+      const real r = 0.5 * std::min({size.x, size.y, size.z});
+      return (4.0 / 3.0) * PI * r * r * r;
+    }
+    case Shape::Cylinder: {
+      const real r = 0.5 * std::min(size.x, size.y);
+      return PI * r * r * size.z;
+    }
+    default:
+      return size.x * size.y * size.z;
+    }
+  }
   Vec3 halfExtents() const { return size * 0.5; }
   real boundRadius() const { return halfExtents().norm(); }
 
@@ -1131,6 +1205,16 @@ struct RigidSolidElement {
   Vec3 localInertiaDiag() const {
     if (mass <= 0.0)
       return Vec3(1, 1, 1);
+    if (shape == Shape::Sphere) {
+      const real r = 0.5 * std::min({size.x, size.y, size.z});
+      const real i = 0.4 * mass * r * r;
+      return Vec3(i, i, i);
+    }
+    if (shape == Shape::Cylinder) {
+      const real r = 0.5 * std::min(size.x, size.y), h = size.z;
+      const real it = mass * (3.0 * r * r + h * h) / 12.0;
+      return Vec3(it, it, 0.5 * mass * r * r);
+    }
     const real a = size.x, b = size.y, c = size.z;
     return Vec3(mass * (b * b + c * c) / 12.0, mass * (a * a + c * c) / 12.0,
                 mass * (a * a + b * b) / 12.0);
@@ -1148,23 +1232,33 @@ struct RigidSolidElement {
     return ex * tx + ey * ty + ez * tz;
   }
 
-  std::array<Vec3, 8> verticesWorld() const {
-    std::array<Vec3, 8> v;
-    const Vec3 h = halfExtents();
-    const Vec3 exH = ex * h.x, eyH = ey * h.y, ezH = ez * h.z;
-    int k = 0;
-    for (int sx = -1; sx <= 1; sx += 2)
-      for (int sy = -1; sy <= 1; sy += 2)
-        for (int sz = -1; sz <= 1; sz += 2)
-          v[k++] = pos + exH * real(sx) + eyH * real(sy) + ezH * real(sz);
-    return v;
+  // --- trasformazioni mondo <-> locale e interrogazioni SDF
+  Vec3 toLocal(const Vec3 &p) const {
+    const Vec3 d = p - pos;
+    return Vec3(d.dot(ex), d.dot(ey), d.dot(ez));
+  }
+  Vec3 dirToWorld(const Vec3 &v) const { return ex * v.x + ey * v.y + ez * v.z; }
+
+  // distanza con segno dal solido (mondo)
+  real distanceWorld(const Vec3 &p) const { return field().eval(toLocal(p)); }
+  // distanza + normale uscente (mondo)
+  real distanceGradWorld(const Vec3 &p, Vec3 &nWorld) const {
+    Vec3 g(0, 0, 1);
+    const real d = field().evalGrad(toLocal(p), g);
+    nWorld = dirToWorld(g);
+    return d;
+  }
+  bool containsPoint(const Vec3 &p, real margin = 0.0) const {
+    return distanceWorld(p) <= margin;
   }
 
-  bool containsPoint(const Vec3 &p) const {
-    const Vec3 d = p - pos;
-    const Vec3 h = halfExtents();
-    return std::abs(d.dot(ex)) <= h.x && std::abs(d.dot(ey)) <= h.y &&
-           std::abs(d.dot(ez)) <= h.z;
+  // Punti di superficie (mondo) ricavati dal campo: appoggio e contatto.
+  std::array<Vec3, 26> supportPointsWorld() const {
+    prepare();
+    std::array<Vec3, 26> v;
+    for (int k = 0; k < 26; ++k)
+      v[std::size_t(k)] = pos + dirToWorld(smp_[std::size_t(k)]);
+    return v;
   }
 
   void integrateOrientation(real dt) {
@@ -1216,39 +1310,10 @@ struct RigidSolidElement {
     return cachedHalfW;
   }
 
+  // Raggio vs box: sphere tracing sulla primitiva SDF Box.
   static bool intersectBox(const Vec3 &ro, const Vec3 &rd, const Vec3 &center,
                            const Vec3 &halfExt, real &tOut, Vec3 &nOut) {
-    Vec3 bMin = center - halfExt;
-    Vec3 bMax = center + halfExt;
-    auto safeDiv = [](real num, real den) {
-      if (std::abs(den) < 1e-9)
-        return num * (den >= 0 ? 1e9 : -1e9);
-      return num / den;
-    };
-    real t1 = safeDiv(bMin.x - ro.x, rd.x);
-    real t2 = safeDiv(bMax.x - ro.x, rd.x);
-    real t3 = safeDiv(bMin.y - ro.y, rd.y);
-    real t4 = safeDiv(bMax.y - ro.y, rd.y);
-    real t5 = safeDiv(bMin.z - ro.z, rd.z);
-    real t6 = safeDiv(bMax.z - ro.z, rd.z);
-    real tN = std::max({std::min(t1, t2), std::min(t3, t4), std::min(t5, t6)});
-    real tF = std::min({std::max(t1, t2), std::max(t3, t4), std::max(t5, t6)});
-    if (tN > tF || tF < 0.001)
-      return false;
-    tOut = tN > 0.001 ? tN : tF;
-    if (tOut < 0.001)
-      return false;
-    Vec3 hitP = ro + rd * tOut - center;
-    real dx = std::abs(hitP.x) / halfExt.x;
-    real dy = std::abs(hitP.y) / halfExt.y;
-    real dz = std::abs(hitP.z) / halfExt.z;
-    if (dx >= dy && dx >= dz)
-      nOut = Vec3(hitP.x > 0 ? 1.0 : -1.0, 0, 0);
-    else if (dy >= dz)
-      nOut = Vec3(0, hitP.y > 0 ? 1.0 : -1.0, 0);
-    else
-      nOut = Vec3(0, 0, hitP.z > 0 ? 1.0 : -1.0);
-    return true;
+    return sdf::raycastBox(ro, rd, center, halfExt, 0.0, 0.001, tOut, nOut);
   }
 
   // Pre-check ray-sphere (bounding). Veloce, sovra-inclusivo.
@@ -1263,117 +1328,234 @@ struct RigidSolidElement {
     return (-b + sq) <= 0; // sfera interamente dietro
   }
 
-  bool intersectOBB(const Vec3 &ro, const Vec3 &rd, real &tOut,
-                    Vec3 &nOut) const {
-    const Vec3 h = halfExtents();
+  // Ray casting contro il campo del solido (sphere tracing nel frame locale).
+  bool raycast(const Vec3 &ro, const Vec3 &rd, real &tOut, Vec3 &nOut) const {
     const Vec3 d = ro - pos;
     const Vec3 roL(d.dot(ex), d.dot(ey), d.dot(ez));
     const Vec3 rdL(rd.dot(ex), rd.dot(ey), rd.dot(ez));
-    auto safeDiv = [](real num, real den) {
-      if (std::abs(den) < 1e-9)
-        return num * (den >= 0 ? 1e9 : -1e9);
-      return num / den;
-    };
-    real t1 = safeDiv(-h.x - roL.x, rdL.x);
-    real t2 = safeDiv(h.x - roL.x, rdL.x);
-    real t3 = safeDiv(-h.y - roL.y, rdL.y);
-    real t4 = safeDiv(h.y - roL.y, rdL.y);
-    real t5 = safeDiv(-h.z - roL.z, rdL.z);
-    real t6 = safeDiv(h.z - roL.z, rdL.z);
-    real tN = std::max({std::min(t1, t2), std::min(t3, t4), std::min(t5, t6)});
-    real tF = std::min({std::max(t1, t2), std::max(t3, t4), std::max(t5, t6)});
-    if (tN > tF || tF < 0.001)
-      return false;
-    tOut = tN > 0.001 ? tN : tF;
-    if (tOut < 0.001)
-      return false;
-    const Vec3 hitL = roL + rdL * tOut;
-    const real dx = std::abs(hitL.x) / h.x;
-    const real dy = std::abs(hitL.y) / h.y;
-    const real dz = std::abs(hitL.z) / h.z;
     Vec3 nL;
-    if (dx >= dy && dx >= dz)
-      nL = Vec3(hitL.x > 0 ? 1.0 : -1.0, 0, 0);
-    else if (dy >= dz)
-      nL = Vec3(0, hitL.y > 0 ? 1.0 : -1.0, 0);
-    else
-      nL = Vec3(0, 0, hitL.z > 0 ? 1.0 : -1.0);
-    nOut = ex * nL.x + ey * nL.y + ez * nL.z;
+    if (!field().raycast(roL, rdL, 0.001, 1e30, tOut, nL))
+      return false;
+    nOut = dirToWorld(nL);
     return true;
   }
 
-  static bool obbOverlapSAT(const RigidSolidElement &A,
-                            const RigidSolidElement &B, Vec3 &colNormal,
-                            real &overlap) {
-    const Vec3 hA = A.halfExtents();
-    const Vec3 hB = B.halfExtents();
-    const Vec3 ax[3] = {A.ex, A.ey, A.ez};
-    const Vec3 bx[3] = {B.ex, B.ey, B.ez};
-    const real ha[3] = {hA.x, hA.y, hA.z};
-    const real hb[3] = {hB.x, hB.y, hB.z};
-    const Vec3 d = A.pos - B.pos;
-    const real tA[3] = {d.dot(A.ex), d.dot(A.ey), d.dot(A.ez)};
+  // Contatto sfera-solido: d(c) < r. Normale = gradiente, pen = r - d.
+  bool sphereContact(const Vec3 &c, real r, Vec3 &n, real &pen) const {
+    if ((c - pos).norm() > boundRadius() + r)
+      return false;
+    const real d = distanceGradWorld(c, n);
+    if (!(d < r))
+      return false;
+    pen = r - d;
+    return true;
+  }
 
-    real R[3][3], AbsR[3][3];
-    for (int i = 0; i < 3; ++i)
-      for (int j = 0; j < 3; ++j) {
-        R[i][j] = ax[i].dot(bx[j]);
-        AbsR[i][j] = std::abs(R[i][j]) + 1e-9;
+  // --------------------------------------------------------------------
+  //  Funzione di supporto ESATTA: max_{p in solido} dot(p - pos, dirW).
+  //  (Box arrotondato = Minkowski(box, sfera), Sfera, Cilindro: analitici;
+  //  Custom: massimo sui punti di superficie campionati.)
+  // --------------------------------------------------------------------
+  real supportExtent(const Vec3 &dirW) const {
+    prepare();
+    const Vec3 d(dirW.dot(ex), dirW.dot(ey), dirW.dot(ez));
+    const Vec3 h = size * 0.5;
+    switch (shape) {
+    case Shape::Sphere:
+      return std::min({h.x, h.y, h.z}) * d.norm();
+    case Shape::Cylinder:
+      return std::min(h.x, h.y) * std::sqrt(d.x * d.x + d.y * d.y) +
+             h.z * std::abs(d.z);
+    case Shape::Custom:
+      if (customField) {
+        real best = -1e30;
+        for (const Vec3 &q : smp_)
+          best = std::max(best, q.dot(d));
+        return best;
       }
+      [[fallthrough]];
+    default: {
+      const real rr = std::clamp(cornerRadius, 0.0, std::min({h.x, h.y, h.z}));
+      return std::abs(d.x) * (h.x - rr) + std::abs(d.y) * (h.y - rr) +
+             std::abs(d.z) * (h.z - rr) + rr * d.norm();
+    }
+    }
+  }
 
-    real minPen = 1e30;
-    Vec3 minAxis(0, 0, 1);
+  // Punto di supporto (mondo) nella direzione dirW.
+  Vec3 supportPointWorld(const Vec3 &dirW) const {
+    prepare();
+    const Vec3 d(dirW.dot(ex), dirW.dot(ey), dirW.dot(ez));
+    const Vec3 h = size * 0.5;
+    const real dn = std::max(d.norm(), 1e-12);
+    Vec3 q(0, 0, 0);
+    switch (shape) {
+    case Shape::Sphere:
+      q = d * (std::min({h.x, h.y, h.z}) / dn);
+      break;
+    case Shape::Cylinder: {
+      const real R = std::min(h.x, h.y);
+      const real rho = std::sqrt(d.x * d.x + d.y * d.y);
+      const real sz = d.z < 0 ? -1.0 : 1.0;
+      q = rho > 1e-12 ? Vec3(R * d.x / rho, R * d.y / rho, sz * h.z)
+                      : Vec3(0, 0, sz * h.z);
+      break;
+    }
+    case Shape::Custom:
+      if (customField) {
+        real best = -1e30;
+        for (const Vec3 &c : smp_)
+          if (c.dot(d) > best) {
+            best = c.dot(d);
+            q = c;
+          }
+        break;
+      }
+      [[fallthrough]];
+    default: {
+      const real rr = std::clamp(cornerRadius, 0.0, std::min({h.x, h.y, h.z}));
+      q = Vec3((d.x < 0 ? -1.0 : 1.0) * (h.x - rr),
+               (d.y < 0 ? -1.0 : 1.0) * (h.y - rr),
+               (d.z < 0 ? -1.0 : 1.0) * (h.z - rr)) +
+          d * (rr / dn);
+      break;
+    }
+    }
+    return pos + dirToWorld(q);
+  }
 
-    for (int i = 0; i < 3; ++i) {
-      const real ra = ha[i];
-      const real rb =
-          hb[0] * AbsR[i][0] + hb[1] * AbsR[i][1] + hb[2] * AbsR[i][2];
-      const real pen = ra + rb - std::abs(tA[i]);
-      if (pen <= 0)
-        return false;
-      if (pen < minPen) {
-        minPen = pen;
-        minAxis = ax[i] * (tA[i] >= 0 ? 1.0 : -1.0);
+  // quota (z) del punto piu' basso del solido, esatta
+  real lowestZ() const { return pos.z - supportExtent(Vec3(0, 0, -1)); }
+  real sphereRadius() const { return 0.5 * std::min({size.x, size.y, size.z}); }
+
+  // --------------------------------------------------------------------
+  //  Separating Axis Theorem con funzione di supporto: restituisce la
+  //  traslazione minima (MTV) che separa A da B. n = direzione in cui
+  //  spostare A (da B verso A), depth = penetrazione lungo n (negativa se
+  //  i corpi sono separati da un gap < margin). Un asse separatore trovato
+  //  e' una PROVA di non-sovrapposizione (valido per ogni forma, convessa o
+  //  no, perche' lavora sull'inviluppo convesso). Se i centri coincidono
+  //  (spawn nello stesso punto) il risultato e' comunque ben definito:
+  //  tie-break deterministico su +z.
+  // --------------------------------------------------------------------
+  static bool satMTV(const RigidSolidElement &A, const RigidSolidElement &B,
+                     real margin, Vec3 &nOut, real &depthOut) {
+    struct Ax {
+      Vec3 v;
+      real w;
+    };
+    Ax ax[17];
+    int na = 0;
+    auto add = [&](const Vec3 &v, real w) {
+      const real l = v.norm();
+      if (l < 1e-4)
+        return;
+      ax[na++] = {v * (1.0 / l), w};
+    };
+    add(Vec3(0, 0, 1), 1.0);
+    add(A.ex, 1.0);
+    add(A.ey, 1.0);
+    add(A.ez, 1.0);
+    add(B.ex, 1.0);
+    add(B.ey, 1.0);
+    add(B.ez, 1.0);
+    add(A.pos - B.pos, 1.02);
+    const Vec3 aa[3] = {A.ex, A.ey, A.ez};
+    const Vec3 bb[3] = {B.ex, B.ey, B.ez};
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)
+        add(aa[i].cross(bb[j]), 1.05);
+
+    real bestScore = 1e30, bestDepth = 0.0;
+    Vec3 bestN(0, 0, 1);
+    for (int k = 0; k < na; ++k) {
+      const Vec3 &a = ax[k].v;
+      const Vec3 na_ = a * -1.0;
+      const real pa = A.pos.dot(a), pb = B.pos.dot(a);
+      const real aMax = pa + A.supportExtent(a);
+      const real aMin = pa - A.supportExtent(na_);
+      const real bMax = pb + B.supportExtent(a);
+      const real bMin = pb - B.supportExtent(na_);
+      const real pushPos = bMax - aMin; // A spostato lungo +a
+      const real pushNeg = aMax - bMin; // A spostato lungo -a
+      real dep;
+      Vec3 dir;
+      if (pushPos <= pushNeg) {
+        dep = pushPos;
+        dir = a;
+      } else {
+        dep = pushNeg;
+        dir = na_;
+      }
+      if (dep <= -margin)
+        return false; // asse separatore
+      const real score = dep > 0 ? dep * ax[k].w : dep / ax[k].w;
+      if (score < bestScore - 1e-9) {
+        bestScore = score;
+        bestDepth = dep;
+        bestN = dir;
       }
     }
-    for (int j = 0; j < 3; ++j) {
-      const real ra =
-          ha[0] * AbsR[0][j] + ha[1] * AbsR[1][j] + ha[2] * AbsR[2][j];
-      const real rb = hb[j];
-      const real tB = d.dot(bx[j]);
-      const real pen = ra + rb - std::abs(tB);
-      if (pen <= 0)
-        return false;
-      if (pen < minPen) {
-        minPen = pen;
-        minAxis = bx[j] * (tB >= 0 ? 1.0 : -1.0);
+    nOut = bestN;
+    depthOut = bestDepth;
+    return true;
+  }
+
+  // Almeno un punto campione (superficie + interno + centro) di P e'
+  // dentro Q a meno di `margin`? Conferma per forme non-box.
+  static bool sampleInside(const RigidSolidElement &P,
+                           const RigidSolidElement &Q, real margin) {
+    P.prepare();
+    const real thr = margin - 1e-9;
+    if (Q.distanceWorld(P.pos) < thr)
+      return true;
+    for (const Vec3 &sLoc : P.smp_)
+      for (real f : {1.0, 0.5}) {
+        const Vec3 w = P.pos + P.dirToWorld(sLoc * f);
+        if (Q.distanceWorld(w) < thr)
+          return true;
       }
-    }
-    for (int i = 0; i < 3; ++i)
-      for (int j = 0; j < 3; ++j) {
-        Vec3 axis = ax[i].cross(bx[j]);
-        const real len2 = axis.norm2();
-        if (len2 < 1e-12)
-          continue;
-        const real invLen = 1.0 / std::sqrt(len2);
-        axis = axis * invLen;
-        const real ra = ha[0] * std::abs(axis.dot(ax[0])) +
-                        ha[1] * std::abs(axis.dot(ax[1])) +
-                        ha[2] * std::abs(axis.dot(ax[2]));
-        const real rb = hb[0] * std::abs(axis.dot(bx[0])) +
-                        hb[1] * std::abs(axis.dot(bx[1])) +
-                        hb[2] * std::abs(axis.dot(bx[2]));
-        const real tP = d.dot(axis);
-        const real pen = ra + rb - std::abs(tP);
-        if (pen <= 0)
+    return false;
+  }
+
+  // Sovrapposizione solido-solido.
+  //  - Sfera vs qualsiasi: ESATTA via SDF (d(centro) < r).
+  //  - Altrimenti: SAT/MTV (esatto per Box-Box), confermato dal campo SDF
+  //    per le forme curve/custom.
+  // La normale n punta da B verso A; overlap = penetrazione (negativa =
+  // gap residuo entro `margin`, utile per contatti di riposo stabili).
+  // Funziona anche con solidi COINCIDENTI (stessa posa): non dipende dal
+  // campionamento della sola superficie.
+  static bool sdfOverlap(const RigidSolidElement &A, const RigidSolidElement &B,
+                         Vec3 &colNormal, real &overlap, real margin = 0.0) {
+    if (A.shape == Shape::Sphere || B.shape == Shape::Sphere) {
+      Vec3 g(0, 0, 1);
+      if (A.shape == Shape::Sphere) {
+        const real d = B.distanceGradWorld(A.pos, g);
+        const real depth = A.sphereRadius() - d;
+        if (depth <= -margin)
           return false;
-        if (pen < minPen) {
-          minPen = pen;
-          minAxis = axis * (tP >= 0 ? 1.0 : -1.0);
-        }
+        colNormal = g;
+        overlap = depth;
+        return true;
       }
-    colNormal = minAxis;
-    overlap = minPen;
+      const real d = A.distanceGradWorld(B.pos, g);
+      const real depth = B.sphereRadius() - d;
+      if (depth <= -margin)
+        return false;
+      colNormal = g * -1.0;
+      overlap = depth;
+      return true;
+    }
+    Vec3 n;
+    real depth;
+    if (!satMTV(A, B, margin, n, depth))
+      return false;
+    const bool exact = A.shape == Shape::Box && B.shape == Shape::Box;
+    if (!exact && !sampleInside(A, B, margin) && !sampleInside(B, A, margin))
+      return false;
+    colNormal = n;
+    overlap = depth;
     return true;
   }
 
@@ -1383,22 +1565,32 @@ struct RigidSolidElement {
   };
 
   static Manifold buildManifold(const RigidSolidElement &A,
-                                const RigidSolidElement &B) {
+                                const RigidSolidElement &B,
+                                real margin = 1e-4,
+                                const Vec3 *nBtoA = nullptr) {
     Manifold m;
-    Vec3 buf[16];
+    Vec3 buf[64];
     int n = 0;
-    for (const Vec3 &v : A.verticesWorld())
-      if (B.containsPoint(v) && n < 16)
+    for (const Vec3 &v : A.supportPointsWorld())
+      if (B.containsPoint(v, margin) && n < 64)
         buf[n++] = v;
-    for (const Vec3 &v : B.verticesWorld())
-      if (A.containsPoint(v) && n < 16)
+    for (const Vec3 &v : B.supportPointsWorld())
+      if (A.containsPoint(v, margin) && n < 64)
         buf[n++] = v;
     if (n == 0) {
-      m.points[0] = (A.pos + B.pos) * 0.5;
+      if (nBtoA) {
+        // nessun campione dentro (spigolo-spigolo, forme curve): punto di
+        // contatto = media dei punti di supporto affacciati lungo la normale
+        const Vec3 pA = A.supportPointWorld(*nBtoA * -1.0);
+        const Vec3 pB = B.supportPointWorld(*nBtoA);
+        m.points[0] = (pA + pB) * 0.5;
+      } else {
+        m.points[0] = (A.pos + B.pos) * 0.5;
+      }
       m.count = 1;
       return m;
     }
-    Vec3 uniq[16];
+    Vec3 uniq[64];
     int un = 0;
     for (int i = 0; i < n; ++i) {
       bool dup = false;
@@ -1505,7 +1697,7 @@ struct RigidSolidElement {
       ex = ex0;
       ey = ey0;
       ez = ez0;
-      angVel = av0;
+      (void)av0;
       prevAddedMass = 0;
       return;
     }
@@ -1550,29 +1742,31 @@ private:
     const Vec3 half = halfExtents();
     const real hZ = std::abs(ex.z) * half.x + std::abs(ey.z) * half.y +
                     std::abs(ez.z) * half.z;
-    const real bottom = pos.z - hZ;
+    // punto piu' basso del campo SDF (punti di superficie campionati)
+    auto verts = supportPointsWorld();
+    real bottom = lowestZ(); // esatto (sfere/cilindri/forme custom non affondano)
+    for (const auto &v : verts)
+      bottom = std::min(bottom, v.z);
     if (bottom > groundZ + 1e-4)
       return;
     pos.z += (groundZ - bottom);
+    for (auto &v : verts)
+      v.z += (groundZ - bottom);
 
     const real mu = water.flow.liquid.mu;
     const real film = H.wet ? std::max(0.0, H.level - H.bedZ) : 0.0;
     const real rhoB = mass / std::max(volume(), 1e-9);
     const real D = std::sqrt(std::max(size.x * size.y, 1e-6));
 
-    auto verts = verticesWorld();
-    Vec3 contacts[8];
+    Vec3 contacts[26];
     int nc = 0;
     const real contactTol = 2e-3;
     for (const auto &v : verts)
       if (v.z <= groundZ + contactTol)
         contacts[nc++] = v;
     if (nc == 0) {
-      Vec3 lo = verts[0];
-      for (const auto &v : verts)
-        if (v.z < lo.z)
-          lo = v;
-      contacts[nc++] = lo;
+      // nessun campione a terra (es. sfera): punto di supporto esatto
+      contacts[nc++] = supportPointWorld(Vec3(0, 0, -1));
     }
 
     const real A = std::max(size.x * size.y, 1e-6);
@@ -1601,7 +1795,7 @@ private:
       angVel = angVel + applyInvInertia(r.cross(J));
     };
 
-    real bounce[8], acc[8][3];
+    real bounce[26], acc[26][3];
     for (int k = 0; k < nc; ++k) {
       acc[k][0] = acc[k][1] = acc[k][2] = 0.0;
       const real vn = relVel(contacts[k] - pos, dirs[0]);

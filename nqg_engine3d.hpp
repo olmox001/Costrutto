@@ -1176,37 +1176,8 @@ inline ContactImpulse solveContact(const Vec3 &vA, const Vec3 &vB,
   return r;
 }
 
-inline bool sphereBoxContact(const Vec3 &c, real r, const Vec3 &bc,
-                             const Vec3 &half, Vec3 &n, real &pen) {
-  const Vec3 d = c - bc;
-  const Vec3 q(std::clamp(d.x, -half.x, half.x),
-               std::clamp(d.y, -half.y, half.y),
-               std::clamp(d.z, -half.z, half.z));
-  const Vec3 diff = d - q;
-  const real dist2 = diff.dot(diff);
-  if (dist2 >= r * r)
-    return false;
-  if (dist2 > 1e-18) {
-    const real dist = std::sqrt(dist2);
-    n = diff * (1.0 / dist);
-    pen = r - dist;
-    return true;
-  }
-  const real px = half.x - std::abs(d.x);
-  const real py = half.y - std::abs(d.y);
-  const real pz = half.z - std::abs(d.z);
-  if (px <= py && px <= pz) {
-    n = Vec3(d.x >= 0 ? 1.0 : -1.0, 0, 0);
-    pen = px + r;
-  } else if (py <= pz) {
-    n = Vec3(0, d.y >= 0 ? 1.0 : -1.0, 0);
-    pen = py + r;
-  } else {
-    n = Vec3(0, 0, d.z >= 0 ? 1.0 : -1.0);
-    pen = pz + r;
-  }
-  return true;
-}
+// NOTA: sphereBoxContact (contatto sfera-box a facce) rimosso: i contatti
+// sfera-solido usano ora il campo SDF (vedi nqg_sdf.hpp, RigidSolidElement).
 
 } // namespace engine
 } // namespace nqg

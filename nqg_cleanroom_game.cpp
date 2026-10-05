@@ -407,8 +407,8 @@ int main(int argc, char *argv[]) {
 
   // --- FPS: 320x240 e' 4x piu' veloce di 640x480 ---
   // Se hai una GPU veloce e vuoi piu' dettaglio, alza a 480x360 o 640x480.
-  int renderW = 320;
-  int renderH = 240;
+  int renderW = 480;
+  int renderH = 360;
 
   // --- Campo EM di esempio: due solidi carichi (attrazione Coulomb) ---
   // Attivalo/commentalo per testare.
@@ -601,8 +601,7 @@ int main(int argc, char *argv[]) {
       box.albedo = {0.88f, 0.88f, 0.82f};
       box.metallic = 0.2;
       box.roughness = 0.3;
-      scene.solids.push_back(box);
-      scene.solids.back().refreshWorldHalf();
+      scene.addSolid(box); // nasce sempre senza compenetrazioni
     }
     if (im.wasKeyPressed(SDL_SCANCODE_G)) {
       zeroGravity = !zeroGravity;
@@ -670,9 +669,9 @@ int main(int argc, char *argv[]) {
           ren, 30, 84, "In stanza: %s | In spillway: %s",
           scene.room.insideXY(camPos) ? "SI" : "NO",
           scene.water.isInsideSpillway(camPos.x, camPos.y) ? "SI" : "NO");
-      SDL_RenderDebugTextFormat(ren, 30, 102, "Alt: %.1f m | giro: %.5f (n=%ld)",
-                                scene.currentAltitude,
-                                globe.revolutionFraction(), globe.turns);
+      SDL_RenderDebugTextFormat(
+          ren, 30, 102, "Alt: %.1f m | giro: %.5f (n=%ld)",
+          scene.currentAltitude, globe.revolutionFraction(), globe.turns);
       SDL_RenderDebugTextFormat(ren, 30, 120, "Gravita': %.4f m/s^2",
                                 zeroGravity ? 0.0 : scene.currentGravity);
       SDL_RenderDebugTextFormat(ren, 30, 138, "Pressione: %.0f Pa",

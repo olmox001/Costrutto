@@ -362,6 +362,12 @@
 # ---------------------------------------------------------------------------*/
 // ============================================================================
 //  nqg_cleanroom_engine.hpp
+//  SDF (nqg_sdf.hpp): tutta la geometria e' ora Signed Distance Field.
+//   - RoomGeometry: pareti = primitive SDF Box, shell = CSG (unione) usata
+//     per la collisione del giocatore (capsula) senza AABB.
+//   - Raggi/ombre/rifrazione: sphere tracing sui solidi (RigidSolidElement).
+//   - Contatti solido-solido / sfera-solido: campionamento di d(p).
+//   - sampleBed: raggio verticale sul campo; AO da sceneDistance().
 //  FIX 2025e:
 //   - EM: resetForces() prima di Coulomb + Lorentz (prima la Lorentz
 //     sovrascriveva la Coulomb -> forze spurie/deriva).
@@ -380,6 +386,7 @@
 #include "nqg_earth_environment.hpp"
 #include "nqg_engine3d.hpp"
 #include "nqg_physics_core.hpp"
+#include "nqg_sdf.hpp"
 
 #include <algorithm>
 #include <array>
@@ -414,7 +421,8 @@ inline Vec3 safeNormalize(const Vec3 &v, const Vec3 &fb = Vec3(0, 0, 1)) {
   return Vec3(v.x * inv, v.y * inv, v.z * inv);
 }
 
-struct AABB {
+// Parte di stanza = primitiva SDF Box (centro, semi-lati) + materiale.
+struct SdfPart {
   Vec3 center = Vec3(0, 0, 0);
   Vec3 half = Vec3(0.5, 0.5, 0.5);
   Rgb albedo = {0.85f, 0.85f, 0.82f};
@@ -438,7 +446,8 @@ struct RoomGeometry {
   real wallT = 0.20;
   real doorX0 = -1.0, doorX1 = 1.0;
   real doorZ1 = 2.20;
-  std::vector<AABB> walls;
+  std::vector<SdfPart> walls;
+  sdf::Field shell; // CSG: unione di tutte le primitive Box della stanza
 
   RoomGeometry() { build(); }
 
@@ -451,179 +460,69 @@ struct RoomGeometry {
     const real hy = 0.5 * (yMax - yMin);
     const real hz = 0.5 * (zMax - zMin);
     const real T = wallT;
+    auto add = [&](const Vec3 &c, const Vec3 &h, Rgb alb, real rough,
+                   real metal) {
+      SdfPart a;
+      a.center = c;
+      a.half = h;
+      a.albedo = alb;
+      a.roughness = rough;
+      a.metallic = metal;
+      walls.push_back(a);
+    };
+    const Rgb wallCol = {0.88f, 0.86f, 0.82f};
+    // Pavimento / soffitto
+    add(Vec3(cx, cy, zMin - T * 0.5), Vec3(hx + 2 * T, hy + 2 * T, T * 0.5),
+        {0.78f, 0.76f, 0.72f}, 0.65, 0.0);
+    add(Vec3(cx, cy, zMax + T * 0.5), Vec3(hx + 2 * T, hy + 2 * T, T * 0.5),
+        {0.92f, 0.92f, 0.90f}, 0.88, 0.05);
+    // Muri nord, est, ovest
+    add(Vec3(cx, yMax + T * 0.5, cz), Vec3(hx + T, T * 0.5, hz), wallCol, 0.80,
+        0.05);
+    add(Vec3(xMax + T * 0.5, cy, cz), Vec3(T * 0.5, hy + T, hz), wallCol, 0.80,
+        0.05);
+    add(Vec3(xMin - T * 0.5, cy, cz), Vec3(T * 0.5, hy + T, hz), wallCol, 0.80,
+        0.05);
+    // Muro sud con porta: due pilastri + architrave
+    add(Vec3(0.5 * (xMin + doorX0), yMin - T * 0.5, cz),
+        Vec3(0.5 * (doorX0 - xMin), T * 0.5, hz), wallCol, 0.80, 0.05);
+    add(Vec3(0.5 * (doorX1 + xMax), yMin - T * 0.5, cz),
+        Vec3(0.5 * (xMax - doorX1), T * 0.5, hz), wallCol, 0.80, 0.05);
+    add(Vec3(0.5 * (doorX0 + doorX1), yMin - T * 0.5, 0.5 * (doorZ1 + zMax)),
+        Vec3(0.5 * (doorX1 - doorX0), T * 0.5, 0.5 * (zMax - doorZ1)), wallCol,
+        0.80, 0.05);
 
-    // Pavimento
-    {
-      AABB a;
-      a.center = Vec3(cx, cy, zMin - T * 0.5);
-      a.half = Vec3(hx + 2 * T, hy + 2 * T, T * 0.5);
-      a.albedo = {0.78f, 0.76f, 0.72f};
-      a.roughness = 0.65;
-      a.metallic = 0.0;
-      walls.push_back(a);
+    // Campo SDF globale della stanza (CSG: unione delle primitive)
+    shell = sdf::Field();
+    int rootIdx = -1;
+    for (const auto &w : walls) {
+      const int id = shell.box(w.center, w.half);
+      rootIdx = rootIdx < 0 ? id : shell.unite(rootIdx, id);
     }
-    // Soffitto
-    {
-      AABB a;
-      a.center = Vec3(cx, cy, zMax + T * 0.5);
-      a.half = Vec3(hx + 2 * T, hy + 2 * T, T * 0.5);
-      a.albedo = {0.92f, 0.92f, 0.90f};
-      a.roughness = 0.88;
-      walls.push_back(a);
-    }
-    // Muro nord (y = yMax)
-    {
-      AABB a;
-      a.center = Vec3(cx, yMax + T * 0.5, cz);
-      a.half = Vec3(hx + T, T * 0.5, hz);
-      a.albedo = {0.88f, 0.86f, 0.82f};
-      a.roughness = 0.80;
-      walls.push_back(a);
-    }
-    // Muro est
-    {
-      AABB a;
-      a.center = Vec3(xMax + T * 0.5, cy, cz);
-      a.half = Vec3(T * 0.5, hy + T, hz);
-      a.albedo = {0.88f, 0.86f, 0.82f};
-      a.roughness = 0.80;
-      walls.push_back(a);
-    }
-    // Muro ovest
-    {
-      AABB a;
-      a.center = Vec3(xMin - T * 0.5, cy, cz);
-      a.half = Vec3(T * 0.5, hy + T, hz);
-      a.albedo = {0.88f, 0.86f, 0.82f};
-      a.roughness = 0.80;
-      walls.push_back(a);
-    }
-    // Muro sud con porta
-    {
-      real sx = 0.5 * (xMin + doorX0), shx = 0.5 * (doorX0 - xMin);
-      AABB a;
-      a.center = Vec3(sx, yMin - T * 0.5, cz);
-      a.half = Vec3(shx, T * 0.5, hz);
-      a.albedo = {0.88f, 0.86f, 0.82f};
-      a.roughness = 0.80;
-      walls.push_back(a);
-    }
-    {
-      real sx = 0.5 * (doorX1 + xMax), shx = 0.5 * (xMax - doorX1);
-      AABB a;
-      a.center = Vec3(sx, yMin - T * 0.5, cz);
-      a.half = Vec3(shx, T * 0.5, hz);
-      a.albedo = {0.88f, 0.86f, 0.82f};
-      a.roughness = 0.80;
-      walls.push_back(a);
-    }
-    {
-      real sx = 0.5 * (doorX0 + doorX1), shx = 0.5 * (doorX1 - doorX0);
-      real sz = 0.5 * (doorZ1 + zMax), shz = 0.5 * (zMax - doorZ1);
-      AABB a;
-      a.center = Vec3(sx, yMin - T * 0.5, sz);
-      a.half = Vec3(shx, T * 0.5, shz);
-      a.albedo = {0.88f, 0.86f, 0.82f};
-      a.roughness = 0.80;
-      walls.push_back(a);
-    }
+    shell.setRoot(rootIdx);
   }
 
-  bool isFloorSlab(const AABB &a) const {
+  bool isFloorSlab(const SdfPart &a) const {
     return (a.center.z + a.half.z) <= zMin + 1e-6;
   }
-  bool isCeilingSlab(const AABB &a) const {
+  bool isCeilingSlab(const SdfPart &a) const {
     return (a.center.z - a.half.z) >= zMax - 1e-6;
   }
   bool insideXY(const Vec3 &p) const {
     return p.x >= xMin && p.x <= xMax && p.y >= yMin && p.y <= yMax;
   }
+  // distanza con segno dalla struttura della stanza
+  real distance(const Vec3 &p) const { return shell.eval(p); }
 };
 
-inline bool resolveCylinderAABB(Vec3 &camPos, Vec3 &camVel,
-                                const CapsuleCollider &cap, const AABB &box,
-                                real margin = 0.005) {
-  const real footZ = cap.footZ(camPos.z);
-  const real headZ = cap.headZ(camPos.z);
-  const real boxZ0 = box.center.z - box.half.z;
-  const real boxZ1 = box.center.z + box.half.z;
-  if (headZ <= boxZ0 || footZ >= boxZ1)
-    return false;
-
-  const real boxX0 = box.center.x - box.half.x;
-  const real boxX1 = box.center.x + box.half.x;
-  const real boxY0 = box.center.y - box.half.y;
-  const real boxY1 = box.center.y + box.half.y;
-
-  const real px = std::clamp(camPos.x, boxX0, boxX1);
-  const real py = std::clamp(camPos.y, boxY0, boxY1);
-  const real dx = camPos.x - px;
-  const real dy = camPos.y - py;
-  const real dist2 = dx * dx + dy * dy;
-  const real r = cap.radius + margin;
-  if (dist2 >= r * r)
-    return false;
-
-  const real dist = std::sqrt(dist2 > 1e-12 ? dist2 : 1e-12);
-  Vec3 n;
-  real push;
-  if (dist > 1e-5) {
-    n = Vec3(dx / dist, dy / dist, 0.0);
-    push = r - dist;
-  } else {
-    real dxL = camPos.x - boxX0, dxR = boxX1 - camPos.x;
-    real dyL = camPos.y - boxY0, dyR = boxY1 - camPos.y;
-    real minD = std::min({dxL, dxR, dyL, dyR});
-    if (minD == dxL) {
-      n = Vec3(-1, 0, 0);
-      push = dxL + r;
-    } else if (minD == dxR) {
-      n = Vec3(1, 0, 0);
-      push = dxR + r;
-    } else if (minD == dyL) {
-      n = Vec3(0, -1, 0);
-      push = dyL + r;
-    } else {
-      n = Vec3(0, 1, 0);
-      push = dyR + r;
-    }
-  }
-  camPos = camPos + n * push;
-  const real vn = camVel.dot(n);
-  if (vn < 0)
-    camVel = camVel - n * vn;
-  return true;
-}
-
-inline void resolveFloorCeiling(Vec3 &camPos, Vec3 &camVel,
-                                const CapsuleCollider &cap,
-                                const RoomGeometry &room) {
-  const real footZ0 = cap.footZ(camPos.z);
-  if (footZ0 < room.zMin) {
-    camPos.z += (room.zMin - footZ0);
-    if (camVel.z < 0)
-      camVel.z = 0;
-  }
-  const real footZ = cap.footZ(camPos.z);
-  const real headZ = cap.headZ(camPos.z);
-  const real roofTop = room.zMax + room.wallT;
-  if (footZ >= room.zMax) {
-    const real margin = 2.0 * room.wallT;
-    const bool overRoof =
-        camPos.x > room.xMin - margin && camPos.x < room.xMax + margin &&
-        camPos.y > room.yMin - margin && camPos.y < room.yMax + margin;
-    if (overRoof && footZ < roofTop && camVel.z <= 0) {
-      camPos.z += (roofTop - footZ);
-      if (camVel.z < 0)
-        camVel.z = 0;
-    }
-  } else if (room.insideXY(camPos)) {
-    if (headZ > room.zMax) {
-      camPos.z -= (headZ - room.zMax);
-      if (camVel.z > 0)
-        camVel.z = 0;
-    }
-  }
+// Collisione capsula-stanza: campionamento della shell SDF lungo l'asse
+// del giocatore (sostituisce resolveCylinderAABB + resolveFloorCeiling).
+inline bool resolveCapsuleRoom(Vec3 &camPos, Vec3 &camVel,
+                               const CapsuleCollider &cap,
+                               const RoomGeometry &room) {
+  return sdf::resolveCapsule(
+      camPos, camVel, cap.radius, cap.eyeHeight, cap.height,
+      [&](const Vec3 &p, Vec3 &n) { return room.shell.evalGrad(p, n); }, 1e-6);
 }
 
 } // namespace apartment
@@ -642,9 +541,9 @@ inline void resolveFloorCeiling(Vec3 &camPos, Vec3 &camVel,
 namespace nqg {
 namespace cleanroom {
 
-using apartment::AABB;
 using apartment::CapsuleCollider;
 using apartment::RoomGeometry;
+using apartment::SdfPart;
 using engine::blackbody;
 using engine::Camera;
 using engine::Image;
@@ -732,14 +631,22 @@ struct PhysicalSphere {
 
   real inertia() const { return 0.4 * mass * radius * radius; }
 
+  using GroundFn = std::function<real(real, real)>;
+
+  // windVel: velocita' locale del vento (nullptr = aria ferma o air.wind).
+  // ground: quota del terreno (sabbia ecc.), nullptr = piano z = 0.
   void step(real dt, const AirProperties &air, real gravityMag = 9.80665,
-            continuum::ContinuousWaterBody *water = nullptr) {
+            continuum::ContinuousWaterBody *water = nullptr,
+            const Vec3 *windVel = nullptr,
+            const GroundFn &ground = GroundFn()) {
     if (dt <= 0)
       return;
     const int n = std::clamp(int(std::ceil(dt / 0.004)), 1, 32);
     const real h = dt / n;
     const Vec3 pos0 = pos;
     Vec3 reaction(0, 0, 0);
+    const Vec3 airShift =
+        windVel ? (air.windVelocity - *windVel) : Vec3(0, 0, 0);
 
     for (int k = 0; k < n; ++k) {
       continuum::HydroResult H;
@@ -748,7 +655,9 @@ struct PhysicalSphere {
       const real frac = std::clamp(H.submergedFraction, 0.0, 1.0);
       Vec3 fD, fB;
       real re;
-      air.computeAerodynamicForces(radius, mass, pos, vel, fD, fB, re);
+      // drag aerodinamico rispetto al vento locale
+      air.computeAerodynamicForces(radius, mass, pos, vel + airShift, fD, fB,
+                                   re, gravityMag);
       lastFDrag = fD * (1.0 - frac);
       lastFBuoyancy = fB * (1.0 - frac);
       lastReynolds = re;
@@ -774,7 +683,7 @@ struct PhysicalSphere {
         omega = omega * (1.0 / (1.0 + 4.0 * frac * h));
       }
       pos = pos + vel * h;
-      resolveFloor(h, H, F.z, water);
+      resolveGround(h, H, F.z, water, ground);
     }
     if (!(engine::isFinite(pos) && engine::isFinite(vel) &&
           engine::isFinite(omega))) {
@@ -791,19 +700,36 @@ struct PhysicalSphere {
                     Hf.submergedVolume - prevSubmerged, reaction.x, reaction.y);
       prevSubmerged = Hf.submergedVolume;
     }
-    air.computeAerodynamicForces(radius, mass, pos, vel, lastFDrag,
-                                 lastFBuoyancy, lastReynolds);
   }
 
 private:
-  void resolveFloor(real h, const continuum::HydroResult &H, real netFz,
-                    const continuum::ContinuousWaterBody *water) {
-    if (pos.z - radius > 1e-4)
+  void resolveGround(real h, const continuum::HydroResult &H, real netFz,
+                     const continuum::ContinuousWaterBody *water,
+                     const GroundFn &ground) {
+    real gz = ground ? ground(pos.x, pos.y) : 0.0;
+    if (!std::isfinite(gz) || gz < 0.0)
+      gz = 0.0;
+    if (pos.z - radius > gz + 0.08)
+      return; // lontano dal terreno
+    Vec3 n(0, 0, 1);
+    if (ground && gz > 1e-6) {
+      const real e = 0.04;
+      const real dgx =
+          (ground(pos.x + e, pos.y) - ground(pos.x - e, pos.y)) / (2.0 * e);
+      const real dgy =
+          (ground(pos.x, pos.y + e) - ground(pos.x, pos.y - e)) / (2.0 * e);
+      n = Vec3(-dgx, -dgy, 1.0).normalized();
+    }
+    const real dist = (pos.z - gz) * n.z; // distanza dal piano tangente
+    const real pen = radius - dist;
+    if (pen < -1e-4)
       return;
-    pos.z = radius;
+    if (pen > 0.0)
+      pos = pos + n * pen;
+
     const real mu = water ? water->flow.liquid.mu : 1.0e-3;
-    const real film = H.wet ? std::max(0.0, H.level) : 0.0;
-    const real vn = vel.z;
+    const real film = H.wet ? std::max(0.0, H.film) : 0.0;
+    const real vn = vel.dot(n);
     real e = restitution;
     if (film > 0 && vn < 0) {
       const real rhoB = mass / ((4.0 / 3.0) * PI * radius * radius * radius);
@@ -817,13 +743,14 @@ private:
       if (-vn < 0.05)
         e = 0;
       jn = mass * (-(1.0 + e) * vn);
-      vel.z = -e * vn;
+      vel = vel + n * (-(1.0 + e) * vn);
     }
-    const real normalAccel = std::max(0.0, -netFz) / mass;
+    const real normalAccel = std::max(0.0, -netFz) / mass * std::max(n.z, 0.0);
 
-    const Vec3 rv(0, 0, -radius);
+    const Vec3 rv = n * (-radius);
     const Vec3 vc = vel + omega.cross(rv);
-    const real sp = std::sqrt(vc.x * vc.x + vc.y * vc.y);
+    const Vec3 vt = vc - n * vc.dot(n);
+    const real sp = vt.norm();
     if (sp > 1e-9 && jn > 0) {
       real muS = mu_s, muK = mu_k;
       if (film > 0) {
@@ -838,29 +765,29 @@ private:
       const real invEff =
           (1.0 / mass) * (1.0 + radius * radius * mass / inertia());
       const real jt = contact::coulombImpulse(sp / invEff, jn, muS, muK);
-      const Vec3 t(vc.x / sp, vc.y / sp, 0);
-      const Vec3 imp = t * (-jt);
+      const Vec3 imp = vt * (-jt / sp);
       vel = vel + imp * (1.0 / mass);
       omega = omega + rv.cross(imp) * (1.0 / inertia());
     }
 
     const real d = contact::rollingDeceleration(rolling, normalAccel) * h;
-    const real vt = std::sqrt(vel.x * vel.x + vel.y * vel.y);
-    if (vt > 1e-9) {
-      const real f = std::max(0.0, 1.0 - d / vt);
-      vel.x *= f;
-      vel.y *= f;
-      omega.x *= f;
-      omega.y *= f;
+    Vec3 vT = vel - n * vel.dot(n);
+    const real vts = vT.norm();
+    Vec3 wT = omega - n * omega.dot(n);
+    if (vts > 1e-9) {
+      const real f = std::max(0.0, 1.0 - d / vts);
+      vel = n * vel.dot(n) + vT * f;
+      omega = n * omega.dot(n) + wT * f;
     } else {
-      const real wt = std::sqrt(omega.x * omega.x + omega.y * omega.y);
-      if (wt > 1e-9) {
-        const real f = std::max(0.0, 1.0 - d / (radius * wt));
-        omega.x *= f;
-        omega.y *= f;
+      const real wts = wT.norm();
+      if (wts > 1e-9) {
+        const real f = std::max(0.0, 1.0 - d / (radius * wts));
+        omega = n * omega.dot(n) + wT * f;
       }
     }
-    omega.z *= 1.0 / (1.0 + 0.5 * h);
+    // smorzamento dello spin attorno alla normale
+    const real wn = omega.dot(n);
+    omega = omega - n * (wn * (1.0 - 1.0 / (1.0 + 0.5 * h)));
   }
 };
 
@@ -1046,11 +973,17 @@ public:
         continue;
       if (std::abs(y - b.pos.y) > hh.y)
         continue;
-      if (z1 > 2.0) {
+      // quota reale della sommita' dal campo SDF: raggio verticale
+      real tTop;
+      Vec3 nTop;
+      if (!b.raycast(Vec3(x, y, z1 + 0.01), Vec3(0, 0, -1), tTop, nTop))
+        continue;
+      const real zTop = z1 + 0.01 - tTop;
+      if (zTop > 2.0) {
         s.solid = true;
         s.z = fluid::ShallowFlow::SOLID_Z;
       } else {
-        s.z = std::max(s.z, z1);
+        s.z = std::max(s.z, zTop);
       }
     }
     if (!s.solid) {
@@ -1100,7 +1033,9 @@ public:
   }
 
   void resolvePlayerCollision(Vec3 &camPos, Vec3 &camVel,
-                              const CapsuleCollider &cap) const {
+                              const CapsuleCollider &cap) {
+    const Vec3 vIn =
+        camVel; // velocita' prima dei vincoli (per spingere le sfere)
     if (!apartment::isFiniteVec(camPos) || !apartment::isFiniteVec(camVel)) {
       camPos = Vec3(0, 0, cap.eyeHeight);
       camVel = Vec3(0, 0, 0);
@@ -1108,14 +1043,20 @@ public:
     }
     constexpr real FLAT_RADIUS = 300.0;
     if (camPos.norm2() < FLAT_RADIUS * FLAT_RADIUS) {
-      apartment::resolveFloorCeiling(camPos, camVel, cap, room);
-      for (const auto &s : solids) {
+      // stanza: shell SDF (pareti, pavimento, soffitto, tetto)
+      apartment::resolveCapsuleRoom(camPos, camVel, cap, room);
+      // solidi liberi (i primi room.walls.size() sono le pareti, gia' nella
+      // shell): campo SDF orientato di ciascun solido
+      for (std::size_t i = room.walls.size(); i < solids.size(); ++i) {
+        const auto &s = solids[i];
         if (s.isRoomSlab)
           continue;
-        apartment::AABB box;
-        box.center = s.pos;
-        box.half = s.halfW();
-        apartment::resolveCylinderAABB(camPos, camVel, cap, box);
+        if ((camPos - s.pos).norm() > s.boundRadius() + cap.height + 1.0)
+          continue;
+        sdf::resolveCapsule(
+            camPos, camVel, cap.radius, cap.eyeHeight, cap.height,
+            [&](const Vec3 &p, Vec3 &n) { return s.distanceGradWorld(p, n); },
+            0.005);
       }
       const real h = sand.sampleHeight(camPos.x, camPos.y);
       if (h > 0.001) {
@@ -1126,6 +1067,23 @@ public:
             camVel.z = 0;
         }
       }
+    }
+    // Il giocatore (capsula cinematica) spinge le sfere: fuori dalla capsula
+    // e velocita' normale almeno pari a quella del giocatore.
+    for (auto &sp : spheres) {
+      const real foot = cap.footZ(camPos.z);
+      const real z0 = foot + cap.radius, z1 = foot + cap.height - cap.radius;
+      const Vec3 axisP(camPos.x, camPos.y, std::clamp(sp.pos.z, z0, z1));
+      const Vec3 d = sp.pos - axisP;
+      const real dist = d.norm();
+      const real minD = sp.radius + cap.radius;
+      if (dist >= minD)
+        continue;
+      const Vec3 n = dist > 1e-9 ? d * (1.0 / dist) : Vec3(1, 0, 0);
+      sp.pos = sp.pos + n * (minD - dist);
+      const real rel = (vIn - sp.vel).dot(n);
+      if (rel > 0.0)
+        sp.vel = sp.vel + n * (rel * 1.2);
     }
     const Vec3 C(0, 0, -earth::planet::R_E);
     const Vec3 r = camPos - C;
@@ -1259,6 +1217,34 @@ public:
             std::clamp(surf.albedo.b * float(shade), 0.0f, 1.0f)};
   }
 
+  // ---- SDF di scena: unione dei campi di tutti i solidi e delle sfere ----
+  bool enableAO = true;
+  real aoStrength = 0.9;
+
+  real sceneDistance(const Vec3 &p, real cutoff = 1e9) const {
+    real d = 1e9;
+    for (const auto &s : solids) {
+      if ((p - s.pos).norm() - s.boundRadius() > std::min(d, cutoff))
+        continue;
+      d = std::min(d, s.distanceWorld(p));
+    }
+    for (const auto &sp : spheres)
+      d = std::min(d, (p - sp.pos).norm() - sp.radius);
+    return d;
+  }
+
+  // Occlusione ambientale: campiona d(p + n*h) lungo la normale.
+  real ambientOcclusion(const Vec3 &pos, const Vec3 &n) const {
+    real occ = 0.0, w = 1.0;
+    for (int i = 0; i < 4; ++i) {
+      const real h = 0.04 + 0.11 * i;
+      const real d = sceneDistance(pos + n * h, h + 0.5);
+      occ += std::max(0.0, h - d) * w;
+      w *= 0.7;
+    }
+    return std::clamp(1.0 - aoStrength * 2.2 * occ, 0.15, 1.0);
+  }
+
   // Shadow ray con bounding-sphere cull.
   bool isInShadow(const Vec3 &pos, const Vec3 &lightDir, real maxDist) const {
     Vec3 ro = pos + lightDir * 0.005;
@@ -1267,10 +1253,16 @@ public:
         continue;
       real t;
       Vec3 n;
-      if (s.intersectOBB(ro, lightDir, t, n)) {
+      if (s.raycast(ro, lightDir, t, n)) {
         if (t < maxDist)
           return true;
       }
+    }
+    for (const auto &sp : spheres) {
+      real t;
+      Vec3 n;
+      if (intersectSphere(ro, lightDir, sp.pos, sp.radius, t, n) && t < maxDist)
+        return true;
     }
     return false;
   }
@@ -1328,6 +1320,72 @@ public:
     return col;
   }
 
+  // Shading opaco condiviso: usato sia per le superfici viste direttamente
+  // sia per il fondo visto attraverso l'acqua (stesso AO, luci, ombre, nebbia).
+  Rgb shadeOpaque(const Vec3 &hitPos, const Vec3 &normal, const Rgb &hitAlbedo,
+                  real metallic, real roughness, const Vec3 &viewDir,
+                  real tDist, std::size_t nLights) const {
+    Rgb lit = {0.0f, 0.0f, 0.0f};
+    real hemi = 0.5 * (normal.z + 1.0);
+    Rgb ambient = {
+        float(cachedAmbientGround.r * (1.0 - hemi) + cachedAmbientSky.r * hemi),
+        float(cachedAmbientGround.g * (1.0 - hemi) + cachedAmbientSky.g * hemi),
+        float(cachedAmbientGround.b * (1.0 - hemi) +
+              cachedAmbientSky.b * hemi)};
+    const real ao = (enableAO && hitPos.norm2() < 2500.0)
+                        ? ambientOcclusion(hitPos, normal)
+                        : 1.0;
+    lit.r += float(hitAlbedo.r * ambient.r * ao);
+    lit.g += float(hitAlbedo.g * ambient.g * ao);
+    lit.b += float(hitAlbedo.b * ambient.b * ao);
+    for (std::size_t li = 0; li < nLights; ++li) {
+      const auto &L = lighting.lights[li];
+      if (!L.active)
+        continue;
+      Vec3 toLight;
+      real dist = 1e6, atten = 1.0;
+      if (L.type == LightSource::Type::Directional) {
+        toLight = L.direction * (-1.0);
+        dist = 1000.0;
+        atten = 1.0;
+      } else {
+        toLight = L.position - hitPos;
+        dist = toLight.norm();
+        if (dist > 1e-4)
+          toLight = toLight * (1.0 / dist);
+        atten = 1.0 / (1.0 + 0.12 * dist + 0.03 * dist * dist);
+      }
+      // nDotL PRIMA della shadow ray
+      const real nDotL = std::max(0.0, normal.dot(toLight));
+      if (nDotL <= 0.0)
+        continue;
+      if (isInShadow(hitPos, toLight, dist))
+        continue;
+      const Rgb &lCol = cachedLightColors[li];
+      const Vec3 halfVec = apartment::safeNormalize(toLight + viewDir);
+      const real nDotH = std::max(0.0, normal.dot(halfVec));
+      const real specPower = std::max(2.0, (1.0 - roughness) * 128.0);
+      const real spec = std::pow(nDotH, specPower);
+      const real vDotH = std::max(0.0, viewDir.dot(halfVec));
+      const real f0 = 0.04 * (1.0 - metallic) + metallic;
+      const real fresnel = f0 + (1.0 - f0) * std::pow(1.0 - vDotH, 5.0);
+      const real diffFactor = (1.0 - metallic) * nDotL * atten;
+      const real specFactor = spec * fresnel * atten * 1.5;
+      lit.r += float(hitAlbedo.r * lCol.r * diffFactor + lCol.r * specFactor);
+      lit.g += float(hitAlbedo.g * lCol.g * diffFactor + lCol.g * specFactor);
+      lit.b += float(hitAlbedo.b * lCol.b * diffFactor + lCol.b * specFactor);
+    }
+    const real effScat = effectiveScattering();
+    const real ext = effScat * tDist;
+    const real transmission = std::exp(-ext);
+    const real inScatter = 1.0 - transmission;
+    const Rgb haze = skyColor(viewDir * -1.0);
+    lit.r = float(lit.r * transmission + haze.r * inScatter * 0.9);
+    lit.g = float(lit.g * transmission + haze.g * inScatter * 0.9);
+    lit.b = float(lit.b * transmission + haze.b * inScatter * 0.9);
+    return lit;
+  }
+
   Rgb traceRay(const Vec3 &ro, const Vec3 &rd) const {
     const std::size_t nLights = cachedLightColors.size();
 
@@ -1351,7 +1409,7 @@ public:
         continue;
       real tBox;
       Vec3 nBox;
-      if (s.intersectOBB(ro, rd, tBox, nBox)) {
+      if (s.raycast(ro, rd, tBox, nBox)) {
         if (tBox < tHit && std::isfinite(tBox)) {
           tHit = tBox;
           normal = nBox;
@@ -1362,6 +1420,21 @@ public:
           hitWater = false;
           hitQuantum = false;
         }
+      }
+    }
+    for (const auto &sp : spheres) {
+      real tSph;
+      Vec3 nSph;
+      if (intersectSphere(ro, rd, sp.pos, sp.radius, tSph, nSph) &&
+          tSph < tHit && std::isfinite(tSph)) {
+        tHit = tSph;
+        normal = nSph;
+        hitAlbedo = sp.albedo;
+        metallic = sp.metallic;
+        roughness = sp.roughness;
+        hitSomething = true;
+        hitWater = false;
+        hitQuantum = false;
       }
     }
     real tW = -1.0, dW = 0.0;
@@ -1497,22 +1570,27 @@ public:
 
       Rgb belowCol = {0.55f, 0.65f, 0.75f};
       if (hasRefr) {
+        // Il fondo visto sott'acqua e' la STESSA superficie che si vede
+        // fuori dall'acqua: stessi solidi (lastre del pavimento incluse),
+        // stessa sabbia, stessa Terra con terreno e griglia, stesso shading.
         const Vec3 subOrigin = hitPos + refrDir * 1e-4;
         real tSub = 1e9;
         Vec3 nSub(0, 0, 1);
         Rgb albSub{0.5f, 0.5f, 0.5f};
+        real metSub = 0.0, rouSub = 0.5;
         bool subValid = false;
         for (const auto &s : solids) {
-          if (s.isRoomSlab)
-            continue;
           if (s.raySphereCull(subOrigin, refrDir))
             continue;
           real tBox;
           Vec3 nBox;
-          if (s.intersectOBB(subOrigin, refrDir, tBox, nBox) && tBox < tSub) {
+          if (s.raycast(subOrigin, refrDir, tBox, nBox) && tBox < tSub &&
+              std::isfinite(tBox)) {
             tSub = tBox;
             nSub = nBox;
             albSub = s.albedo;
+            metSub = s.metallic;
+            rouSub = s.roughness;
             subValid = true;
           }
         }
@@ -1525,6 +1603,8 @@ public:
             tSub = tSph;
             nSub = nSph;
             albSub = sp.albedo;
+            metSub = sp.metallic;
+            rouSub = sp.roughness;
             subValid = true;
           }
         }
@@ -1535,59 +1615,37 @@ public:
             tSub = tSn;
             nSub = nSn;
             albSub = {0.86f, 0.74f, 0.44f};
+            metSub = 0.0;
+            rouSub = 0.88;
             subValid = true;
           }
         }
         {
-          real tF;
-          Vec3 nF;
-          if (intersectFloor(subOrigin, refrDir, tF, nF) && tF < tSub) {
-            const Vec3 floorHit = subOrigin + refrDir * tF;
-            if (room.insideXY(floorHit))
-              albSub = floorTexture(floorHit);
-            else
-              albSub = terrainAlbedoAt(floorHit);
-            tSub = tF;
-            nSub = nF;
+          real tE;
+          Vec3 nE;
+          real latE, lonE;
+          if (intersectEarth(subOrigin, refrDir, tE, nE, latE, lonE) &&
+              tE < tSub && std::isfinite(tE)) {
+            auto surf = globe.terrain.sample(latE, lonE, 0.0);
+            const real detail = terrainDetail(latE, lonE);
+            const real shade = std::clamp(1.0 + 0.008 * detail, 0.6, 1.4);
+            albSub.r = std::clamp(surf.albedo.r * float(shade), 0.0f, 1.0f);
+            albSub.g = std::clamp(surf.albedo.g * float(shade), 0.0f, 1.0f);
+            albSub.b = std::clamp(surf.albedo.b * float(shade), 0.0f, 1.0f);
+            metSub = 0.0;
+            rouSub = std::min(1.0, surf.roughness * 1.8);
+            const real lw =
+                0.08 + std::clamp(200.0 / std::max(1.0, tE), 0.0, 0.5);
+            overlayGrid(albSub, latE, lonE, lw);
+            tSub = tE;
+            nSub = nE;
             subValid = true;
           }
         }
         if (subValid) {
           const Vec3 subHit = subOrigin + refrDir * tSub;
-          const real hemi = 0.5 * (nSub.z + 1.0);
-          const Rgb amb = {float(cachedAmbientGround.r * (1.0 - hemi) +
-                                 cachedAmbientSky.r * hemi),
-                           float(cachedAmbientGround.g * (1.0 - hemi) +
-                                 cachedAmbientSky.g * hemi),
-                           float(cachedAmbientGround.b * (1.0 - hemi) +
-                                 cachedAmbientSky.b * hemi)};
-          Rgb litSub = {albSub.r * amb.r, albSub.g * amb.g, albSub.b * amb.b};
-          for (std::size_t li = 0; li < nLights; ++li) {
-            const auto &L = lighting.lights[li];
-            if (!L.active)
-              continue;
-            Vec3 toLight;
-            real dist = 1e6, atten = 1.0;
-            if (L.type == LightSource::Type::Directional) {
-              toLight = L.direction * (-1.0);
-            } else {
-              toLight = L.position - subHit;
-              dist = toLight.norm();
-              if (dist > 1e-4)
-                toLight = toLight * (1.0 / dist);
-              atten = 1.0 / (1.0 + 0.12 * dist + 0.03 * dist * dist);
-            }
-            // nDotL PRIMA della shadow ray (skip)
-            const real nDotL = std::max(0.0, nSub.dot(toLight));
-            if (nDotL <= 0.0)
-              continue;
-            if (isInShadow(subHit, toLight, dist))
-              continue;
-            const Rgb &lCol = cachedLightColors[li];
-            litSub.r += float(albSub.r * lCol.r * nDotL * atten);
-            litSub.g += float(albSub.g * lCol.g * nDotL * atten);
-            litSub.b += float(albSub.b * lCol.b * nDotL * atten);
-          }
+          const Rgb litSub = shadeOpaque(subHit, nSub, albSub, metSub, rouSub,
+                                         refrDir * -1.0, tSub, nLights);
           const Vec3 trans =
               water.beerLambertTransmission(2.0 * std::max(tSub, 0.0));
           belowCol = {float(litSub.r * trans.x), float(litSub.g * trans.y),
@@ -1626,61 +1684,8 @@ public:
               float(litWater.b * transmission + haze.b * inScatter)};
     }
 
-    Rgb lit = {0.0f, 0.0f, 0.0f};
-    real hemi = 0.5 * (normal.z + 1.0);
-    Rgb ambient = {
-        float(cachedAmbientGround.r * (1.0 - hemi) + cachedAmbientSky.r * hemi),
-        float(cachedAmbientGround.g * (1.0 - hemi) + cachedAmbientSky.g * hemi),
-        float(cachedAmbientGround.b * (1.0 - hemi) +
-              cachedAmbientSky.b * hemi)};
-    lit.r += hitAlbedo.r * ambient.r;
-    lit.g += hitAlbedo.g * ambient.g;
-    lit.b += hitAlbedo.b * ambient.b;
-    for (std::size_t li = 0; li < nLights; ++li) {
-      const auto &L = lighting.lights[li];
-      if (!L.active)
-        continue;
-      Vec3 toLight;
-      real dist = 1e6, atten = 1.0;
-      if (L.type == LightSource::Type::Directional) {
-        toLight = L.direction * (-1.0);
-        dist = 1000.0;
-        atten = 1.0;
-      } else {
-        toLight = L.position - hitPos;
-        dist = toLight.norm();
-        if (dist > 1e-4)
-          toLight = toLight * (1.0 / dist);
-        atten = 1.0 / (1.0 + 0.12 * dist + 0.03 * dist * dist);
-      }
-      // nDotL PRIMA della shadow ray
-      const real nDotL = std::max(0.0, normal.dot(toLight));
-      if (nDotL <= 0.0)
-        continue;
-      if (isInShadow(hitPos, toLight, dist))
-        continue;
-      const Rgb &lCol = cachedLightColors[li];
-      const Vec3 halfVec = apartment::safeNormalize(toLight + viewDir);
-      const real nDotH = std::max(0.0, normal.dot(halfVec));
-      const real specPower = std::max(2.0, (1.0 - roughness) * 128.0);
-      const real spec = std::pow(nDotH, specPower);
-      const real vDotH = std::max(0.0, viewDir.dot(halfVec));
-      const real f0 = 0.04 * (1.0 - metallic) + metallic;
-      const real fresnel = f0 + (1.0 - f0) * std::pow(1.0 - vDotH, 5.0);
-      const real diffFactor = (1.0 - metallic) * nDotL * atten;
-      const real specFactor = spec * fresnel * atten * 1.5;
-      lit.r += float(hitAlbedo.r * lCol.r * diffFactor + lCol.r * specFactor);
-      lit.g += float(hitAlbedo.g * lCol.g * diffFactor + lCol.g * specFactor);
-      lit.b += float(hitAlbedo.b * lCol.b * diffFactor + lCol.b * specFactor);
-    }
-    const real effScat = effectiveScattering();
-    const real ext = effScat * tHit;
-    const real transmission = std::exp(-ext);
-    const real inScatter = 1.0 - transmission;
-    const Rgb haze = skyColor(rd);
-    lit.r = float(lit.r * transmission + haze.r * inScatter * 0.9);
-    lit.g = float(lit.g * transmission + haze.g * inScatter * 0.9);
-    lit.b = float(lit.b * transmission + haze.b * inScatter * 0.9);
+    Rgb lit = shadeOpaque(hitPos, normal, hitAlbedo, metallic, roughness,
+                          viewDir, tHit, nLights);
     if (hitQuantum) {
       const real qDens = quantumField.evaluateDensity(hitPos);
       const real qAlpha = std::min(0.5, qDens * 0.5);
@@ -1717,6 +1722,8 @@ public:
     if (cachedLightColors.size() != lighting.lights.size())
       refreshLightCache();
 
+    for (const auto &sol : solids)
+      sol.prepare(); // cache SDF pronte prima dei thread di rendering
     Image img(width, height);
     const Vec3 f = apartment::safeNormalize(fwd, Vec3(0, 1, 0));
     Vec3 right = f.cross(camUp);
@@ -1760,48 +1767,105 @@ public:
       for (auto &s : solids) {
         Vec3 n;
         real pen;
-        const Vec3 half = s.halfW();
-        if (!engine::sphereBoxContact(sp.pos, sp.radius, s.pos, half, n, pen))
+        if (!s.sphereContact(sp.pos, sp.radius, n, pen))
           continue;
+        const bool dyn = !s.isStatic;
         const real invS = 1.0 / sp.mass;
-        const real invB = s.isStatic ? 0.0 : 1.0 / s.mass;
-        const real tot = invS + invB;
-        pen = std::min(pen, 0.15);
-        sp.pos = sp.pos + n * (pen * invS / tot);
-        if (!s.isStatic)
-          s.pos = s.pos - n * (pen * invB / tot);
-        const Vec3 rv = n * (-sp.radius);
-        const Vec3 vcA = sp.vel + sp.omega.cross(rv);
-        const Vec3 vr = vcA - s.vel;
+        const real invB = dyn ? 1.0 / s.mass : 0.0;
+        const real tot0 = invS + invB;
+        const Vec3 p = sp.pos - n * (sp.radius - 0.5 * pen);
+        const Vec3 rB = p - s.pos;
+        auto kB = [&](const Vec3 &d) {
+          return dyn ? d.dot(s.applyInvInertia(rB.cross(d)).cross(rB)) : 0.0;
+        };
+        sp.pos = sp.pos + n * (pen * invS / tot0);
+        if (dyn) {
+          s.pos = s.pos - n * (pen * invB / tot0);
+          if (pen * invB / tot0 > 1e-4)
+            s.wake();
+        }
+        const Vec3 rS = n * (-sp.radius);
+        const Vec3 vS = sp.vel + sp.omega.cross(rS);
+        const Vec3 vB = dyn ? s.pointVelocity(p) : Vec3(0, 0, 0);
+        const Vec3 vr = vS - vB;
         const real vn = vr.dot(n);
         if (vn >= 0)
           continue;
         real e = std::min(sp.restitution, s.restitution);
         if (-vn < 0.2)
           e = 0;
-        const real jn = -(1.0 + e) * vn / tot;
+        const real jn = -(1.0 + e) * vn / (invS + invB + kB(n));
         sp.vel = sp.vel + n * (jn * invS);
-        if (!s.isStatic) {
-          s.vel = s.vel - n * (jn * invB);
-          if (std::abs(jn) * invB > 0.05)
+        if (dyn) {
+          if (jn * invB > 0.01)
             s.wake();
+          s.applyImpulseAtPoint(n * (-jn), p);
         }
         const Vec3 vt = vr - n * vn;
         const real vts = vt.norm();
         if (vts > 1e-9) {
           const real inertiaInv = 1.0 / sp.inertia();
-          const real invEff = invS + invB + sp.radius * sp.radius * inertiaInv;
+          const Vec3 td = vt * (1.0 / vts);
+          const real kt =
+              invS + invB + sp.radius * sp.radius * inertiaInv + kB(td);
           const real muS = contact::combineFriction(sp.mu_s, s.mu_s);
           const real muK = contact::combineFriction(sp.mu_k, s.mu_k);
-          const real jt = contact::coulombImpulse(vts / invEff, jn, muS, muK);
-          const Vec3 imp = vt * (-jt / vts);
+          const real jt = contact::coulombImpulse(vts / kt, jn, muS, muK);
+          const Vec3 imp = td * (-jt);
           sp.vel = sp.vel + imp * invS;
-          if (!s.isStatic)
-            s.vel = s.vel - imp * invB;
-          sp.omega = sp.omega + rv.cross(imp) * inertiaInv;
+          sp.omega = sp.omega + rS.cross(imp) * inertiaInv;
+          if (dyn)
+            s.applyImpulseAtPoint(imp * -1.0, p);
         }
       }
     }
+  }
+
+  void collideSpheresWithSpheres() {
+    for (std::size_t i = 0; i < spheres.size(); ++i)
+      for (std::size_t j = i + 1; j < spheres.size(); ++j) {
+        auto &A = spheres[i];
+        auto &B = spheres[j];
+        Vec3 d = A.pos - B.pos;
+        const real dist = d.norm();
+        const real minD = A.radius + B.radius;
+        if (dist >= minD)
+          continue;
+        const Vec3 n = dist > 1e-9 ? d * (1.0 / dist) : Vec3(0, 0, 1);
+        const real pen = minD - dist;
+        const real invA = 1.0 / A.mass, invB = 1.0 / B.mass;
+        const real tot = invA + invB;
+        A.pos = A.pos + n * (pen * invA / tot);
+        B.pos = B.pos - n * (pen * invB / tot);
+        const Vec3 rA = n * (-A.radius), rB = n * B.radius;
+        const Vec3 vr =
+            (A.vel + A.omega.cross(rA)) - (B.vel + B.omega.cross(rB));
+        const real vn = vr.dot(n);
+        if (vn >= 0)
+          continue;
+        real e = std::min(A.restitution, B.restitution);
+        if (-vn < 0.2)
+          e = 0;
+        const real jn = -(1.0 + e) * vn / tot;
+        A.vel = A.vel + n * (jn * invA);
+        B.vel = B.vel - n * (jn * invB);
+        const Vec3 vt = vr - n * vn;
+        const real vts = vt.norm();
+        if (vts > 1e-9) {
+          const real iA = 1.0 / A.inertia(), iB = 1.0 / B.inertia();
+          const Vec3 td = vt * (1.0 / vts);
+          const real kt =
+              tot + A.radius * A.radius * iA + B.radius * B.radius * iB;
+          const real muS = contact::combineFriction(A.mu_s, B.mu_s);
+          const real muK = contact::combineFriction(A.mu_k, B.mu_k);
+          const real jt = contact::coulombImpulse(vts / kt, jn, muS, muK);
+          const Vec3 imp = td * (-jt);
+          A.vel = A.vel + imp * invA;
+          B.vel = B.vel - imp * invB;
+          A.omega = A.omega + rA.cross(imp) * iA;
+          B.omega = B.omega - rB.cross(imp) * iB;
+        }
+      }
   }
 
   static void prepareContact(continuum::RigidSolidElement &A,
@@ -1896,6 +1960,135 @@ public:
     }
   }
 
+  // ------------------------------------------------------------------
+  //  ANTI-PENETRAZIONE: i solidi non possono mai restare sovrapposti.
+  // ------------------------------------------------------------------
+  using GroundFn = continuum::RigidSolidElement::GroundHeightFn;
+
+  real groundHeightAt(real x, real y) const {
+    real gz = 0.0;
+    const real sh = sand.sampleHeight(x, y);
+    if (std::isfinite(sh) && sh > gz)
+      gz = sh;
+    return gz;
+  }
+
+  // Il solido `c` e' libero (nessuna sovrapposizione con altri solidi, ne'
+  // sotto il terreno) con un gap di sicurezza `margin`?
+  bool isSolidPlacementFree(const continuum::RigidSolidElement &c,
+                            real margin = 0.003) const {
+    if (c.lowestZ() < groundHeightAt(c.pos.x, c.pos.y) - 1e-6)
+      return false;
+    for (const auto &o : solids) {
+      if ((c.pos - o.pos).norm() > c.boundRadius() + o.boundRadius() + margin)
+        continue;
+      Vec3 n;
+      real ov;
+      if (continuum::RigidSolidElement::sdfOverlap(c, o, n, ov, margin))
+        return false;
+    }
+    return true;
+  }
+
+  // Inserisce un solido garantendo che NASCA senza compenetrazioni: se il
+  // punto richiesto e' occupato (anche da un solido identico nello stesso
+  // punto) cerca la posizione libera piu' vicina (prima in alto, poi
+  // in anelli laterali). Restituisce l'indice del solido inserito.
+  int addSolid(continuum::RigidSolidElement s) {
+    s.wake();
+    s.refreshWorldHalf();
+    const Vec3 p0 = s.pos;
+    const real step =
+        std::max(0.05, 0.5 * std::min({s.size.x, s.size.y, s.size.z}));
+    auto fitGround = [&](continuum::RigidSolidElement &c) {
+      const real g = groundHeightAt(c.pos.x, c.pos.y);
+      const real lz = c.lowestZ();
+      if (lz < g)
+        c.pos.z += (g - lz);
+    };
+    continuum::RigidSolidElement cand = s;
+    bool found = false;
+    for (int lift = 0; lift <= 60 && !found; ++lift) {
+      for (int ring = 0; ring <= 4 && !found; ++ring) {
+        const int nDir = ring == 0 ? 1 : 6 * ring;
+        for (int a = 0; a < nDir && !found; ++a) {
+          const real ang = 2.0 * PI * real(a) / real(nDir);
+          cand = s;
+          cand.pos = p0 + Vec3(std::cos(ang) * ring * step,
+                               std::sin(ang) * ring * step, lift * step);
+          fitGround(cand);
+          if (isSolidPlacementFree(cand)) {
+            found = true;
+            s = cand;
+          }
+        }
+      }
+    }
+    s.refreshWorldHalf();
+    solids.push_back(s);
+    return int(solids.size()) - 1;
+  }
+
+  // Proiezione posizionale a punto fisso: separa COMPLETAMENTE ogni coppia
+  // sovrapposta (correzione piena, nessuno slop, ripartita per massa
+  // inversa; i corpi statici non si muovono) e alza i corpi sotto il
+  // terreno. Itera fino a che non resta nessuna penetrazione.
+  void resolvePenetrations(const GroundFn &groundFn, int maxIter = 64) {
+    const real skin = 1.0e-5; // gap lasciato dopo la separazione
+    for (int it = 0; it < maxIter; ++it) {
+      bool moved = false;
+      for (std::size_t i = 0; i < solids.size(); ++i) {
+        for (std::size_t j = i + 1; j < solids.size(); ++j) {
+          auto &A = solids[i];
+          auto &B = solids[j];
+          if (A.isStatic && B.isStatic)
+            continue;
+          if ((A.pos - B.pos).norm() > A.boundRadius() + B.boundRadius())
+            continue;
+          Vec3 n;
+          real depth;
+          if (!continuum::RigidSolidElement::sdfOverlap(A, B, n, depth, 0.0))
+            continue;
+          const real invA = A.isStatic ? 0.0 : 1.0 / A.mass;
+          const real invB = B.isStatic ? 0.0 : 1.0 / B.mass;
+          const real invSum = invA + invB;
+          if (invSum < 1e-15)
+            continue;
+          const real corr = depth + skin;
+          const real dA = corr * invA / invSum;
+          const real dB = corr * invB / invSum;
+          if (!A.isStatic) {
+            A.pos = A.pos + n * dA;
+            if (dA > 1e-4)
+              A.wake();
+          }
+          if (!B.isStatic) {
+            B.pos = B.pos - n * dB;
+            if (dB > 1e-4)
+              B.wake();
+          }
+          moved = true;
+        }
+      }
+      if (groundFn) {
+        for (auto &s : solids) {
+          if (s.isStatic)
+            continue;
+          const real g = groundFn(s.pos.x, s.pos.y);
+          const real lz = s.lowestZ();
+          if (std::isfinite(g) && lz < g) {
+            s.pos.z += (g - lz);
+            if (s.vel.z < 0)
+              s.vel.z = 0;
+            moved = true;
+          }
+        }
+      }
+      if (!moved)
+        break;
+    }
+  }
+
   void stepPhysics(real dt) {
     if (dt <= 0 || !std::isfinite(dt))
       return;
@@ -1932,6 +2125,11 @@ public:
       const Vec3 he = s.halfExtents();
       minHalf = std::min({minHalf, he.x, he.y, he.z});
     }
+    for (const auto &sp : spheres) {
+      maxLinSpeed = std::max(maxLinSpeed, sp.vel.norm());
+      maxAngSpeed = std::max(maxAngSpeed, sp.omega.norm());
+      minHalf = std::min(minHalf, sp.radius);
+    }
     int nSub = 1;
     {
       const real dtLinTarget =
@@ -1946,18 +2144,30 @@ public:
     std::vector<Contact> contacts;
     contacts.reserve(solids.size() * 2);
 
-    const int SOLVER_ITERS = 16; // era 8
-    const real baumgarte = 0.3;  // era 0.5
-    const real slop = 1.0e-2;    // era 5e-3
+    const int SOLVER_ITERS = 16;
+    const real contactMargin = 2.0e-3; // contatti "speculativi" di riposo
 
-    continuum::RigidSolidElement::GroundHeightFn groundFn =
-        [this](real x, real y) -> real {
-      real gz = 0.0;
-      const real sh = sand.sampleHeight(x, y);
-      if (std::isfinite(sh) && sh > gz)
-        gz = sh;
-      return gz;
+    GroundFn groundFn = [this](real x, real y) -> real {
+      return groundHeightAt(x, y);
     };
+
+    // Limite anti-tunneling: nessun corpo percorre piu' di meta' del proprio
+    // semi-lato minimo per sotto-passo (neanche oltre il tetto di 16
+    // sotto-passi).
+    for (auto &s : solids) {
+      if (s.isStatic || s.asleep)
+        continue;
+      const Vec3 he = s.halfExtents();
+      const real vmax =
+          0.5 * std::max(std::min({he.x, he.y, he.z}), 1e-3) / dtSub;
+      const real vn = s.vel.norm();
+      if (vn > vmax)
+        s.vel = s.vel * (vmax / vn);
+    }
+
+    // Stato iniziale pulito: spawn / spinte esterne non devono lasciare
+    // alcuna compenetrazione prima di integrare.
+    resolvePenetrations(groundFn);
 
     for (int sub = 0; sub < nSub; ++sub) {
       for (auto &s : solids)
@@ -1973,20 +2183,21 @@ public:
             continue;
           if ((A.isStatic || A.asleep) && (B.isStatic || B.asleep))
             continue;
-          const real rA = A.size.norm() * 0.5;
-          const real rB = B.size.norm() * 0.5;
-          if ((A.pos - B.pos).norm() > rA + rB)
+          if ((A.pos - B.pos).norm() >
+              A.boundRadius() + B.boundRadius() + contactMargin)
             continue;
           Vec3 n;
           real overlap;
-          if (!continuum::RigidSolidElement::obbOverlapSAT(A, B, n, overlap))
+          if (!continuum::RigidSolidElement::sdfOverlap(A, B, n, overlap,
+                                                        contactMargin))
             continue;
           Contact c;
           c.i = int(i);
           c.j = int(j);
           c.normal = n;
           c.overlap = overlap;
-          c.manifold = continuum::RigidSolidElement::buildManifold(A, B);
+          c.manifold = continuum::RigidSolidElement::buildManifold(
+              A, B, contactMargin, &n);
           if (c.manifold.count == 0)
             continue;
           prepareContact(A, B, c);
@@ -2006,37 +2217,23 @@ public:
         }
       }
 
-      for (std::size_t i = 0; i < solids.size(); ++i) {
-        for (std::size_t j = i + 1; j < solids.size(); ++j) {
-          auto &A = solids[i];
-          auto &B = solids[j];
-          if (A.isStatic && B.isStatic)
-            continue;
-          if ((A.isStatic || A.asleep) && (B.isStatic || B.asleep))
-            continue;
-          Vec3 n;
-          real overlap;
-          if (!continuum::RigidSolidElement::obbOverlapSAT(A, B, n, overlap))
-            continue;
-          if (overlap <= slop)
-            continue;
-          const real invA = A.isStatic ? 0.0 : 1.0 / A.mass;
-          const real invB = B.isStatic ? 0.0 : 1.0 / B.mass;
-          const real invSum = invA + invB;
-          if (invSum < 1e-12)
-            continue;
-          const Vec3 corr = n * (baumgarte * (overlap - slop));
-          if (!A.isStatic)
-            A.pos = A.pos + corr * (invA / invSum);
-          if (!B.isStatic)
-            B.pos = B.pos - corr * (invB / invSum);
-        }
-      }
-    }
+      // Garanzia finale del sotto-passo: zero penetrazione.
+      resolvePenetrations(groundFn);
 
-    for (auto &s : spheres)
-      s.step(dt, air, currentGravity, &water);
-    collideSpheresWithSolids();
+      // Sfere: stesso sotto-passo dei solidi (niente tunneling), vento
+      // locale, terreno/sabbia, urti con solidi e fra sfere.
+      for (auto &sp : spheres) {
+        const real vmax = 0.5 * sp.radius / dtSub;
+        const real vn = sp.vel.norm();
+        if (vn > vmax)
+          sp.vel = sp.vel * (vmax / vn);
+        const Vec3 wv = wind.evaluateVelocity(sp.pos, simTime);
+        sp.step(dtSub, air, currentGravity, &water, &wv, groundFn);
+      }
+      collideSpheresWithSolids();
+      collideSpheresWithSpheres();
+      collideSpheresWithSolids();
+    }
 
     matterSim.gravity = gravityVec;
     matterSim.step(dt, air);
