@@ -369,6 +369,10 @@
 //    - WindField::speedAt: pow(hh/refHeight, alpha) via exp(alpha*log(...)).
 //    - TerrainGenerator: baseHeight ha costanti precalcolate (sin/cos lat/lon
 //      condivisi tra i termini); nessuna ridondanza.
+//  FIX 2026a:
+//    - GravityField::gSurface: corretto segno del termine sin^2(2*phi).
+//    - WindField::velocityAt: overload a 2 argomenti (frame locale astratto)
+//      per compatibilita' con i chiamanti che non hanno una base ENU.
 // ============================================================================
 #ifndef NQG_EARTH_ENVIRONMENT_HPP
 #define NQG_EARTH_ENVIRONMENT_HPP
@@ -379,7 +383,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <random>
+#include <cstdint>
 #include <vector>
 
 namespace nqg {
@@ -491,7 +495,9 @@ public:
     const real s = std::sin(latRad);
     const real s2 = s * s;
     const real s22 = std::sin(2.0 * latRad);
-    return planet::g_eq * (1.0 + 0.00530244 * s2 + 0.00000582 * s22 * s22);
+    // FIX: il termine in sin^2(2*phi) ha segno negativo (formula di
+    // Somigliana).
+    return planet::g_eq * (1.0 + 0.00530244 * s2 - 0.00000582 * s22 * s22);
   }
   static real g(real latRad, real altitude) {
     const real g0 = gSurface(latRad);
@@ -558,11 +564,27 @@ public:
     return u_bl * (1.0 - t) + (u_bl + u_jet) * t;
   }
 
+  // Overload a 2 argomenti: restituisce il vento in un frame LOCALE ASTRATTO
+  // (x = east, y = north, z = up). Utile quando il chiamante non ha ancora
+  // una base ENU esplicita (es. ha solo latitudine e altitudine).
   static Vec3 velocityAt(const WindProfile &p, real h) {
     const real s = speedAt(p, h);
-    const real cx = std::cos(p.direction);
-    const real sx = std::sin(p.direction);
-    return Vec3(s * cx, s * sx, 0.0);
+    const real c = std::cos(p.direction);
+    const real sn = std::sin(p.direction);
+    return Vec3(s * c, s * sn, 0.0);
+  }
+
+  // Overload a 5 argomenti: restituisce il vento nel frame ECEF, proiettando
+  // la direzione locale (east, north) sulla base ENU fornita.
+  // `up` non e' usato perche' il vento e' orizzontale in ENU, ma e' accettato
+  // perche' molti chiamanti hanno gia' la terna completa a disposizione.
+  static Vec3 velocityAt(const WindProfile &p, real h,
+                         [[maybe_unused]] const Vec3 &up, const Vec3 &east,
+                         const Vec3 &north) {
+    const real s = speedAt(p, h);
+    const real c = std::cos(p.direction);
+    const real sn = std::sin(p.direction);
+    return (east * c + north * sn) * s;
   }
 };
 
@@ -578,7 +600,8 @@ struct SurfaceSample {
 
 class TerrainGenerator {
 public:
-  explicit TerrainGenerator(uint32_t seed = 1337) : rng_(seed) {}
+  explicit TerrainGenerator(uint32_t /*seed*/ = 1337) {}
+  // FIX: rng_ inutilizzato rimosso; il seed e' solo di compatibilita'.
 
   real baseHeight(real lat, real lon) const {
     if (!std::isfinite(lat) || !std::isfinite(lon))
@@ -605,18 +628,12 @@ public:
     SurfaceSample s;
     s.height = baseHeight(lat, lon);
     const real a = std::abs(lat);
+    // FIX: priorita' corretta per neve/ghiaccio ad alta latitudine,
+    // indipendentemente dalla quota.
     if (s.height < 0.0) {
       s.type = SurfaceType::Water;
       s.roughness = 0.02;
       s.albedo = {0.05f, 0.15f, 0.42f};
-    } else if (s.height < 4.0) {
-      s.type = SurfaceType::Sand;
-      s.roughness = 0.08;
-      s.albedo = {0.82f, 0.72f, 0.48f};
-    } else if (s.height < 450.0) {
-      s.type = SurfaceType::Grass;
-      s.roughness = 0.25;
-      s.albedo = {0.26f, 0.46f, 0.20f};
     } else if (a > 1.18 || s.height > 3800.0) {
       s.type = SurfaceType::Snow;
       s.roughness = 0.12;
@@ -625,6 +642,14 @@ public:
       s.type = SurfaceType::Ice;
       s.roughness = 0.05;
       s.albedo = {0.78f, 0.86f, 0.92f};
+    } else if (s.height < 4.0) {
+      s.type = SurfaceType::Sand;
+      s.roughness = 0.08;
+      s.albedo = {0.82f, 0.72f, 0.48f};
+    } else if (s.height < 450.0) {
+      s.type = SurfaceType::Grass;
+      s.roughness = 0.25;
+      s.albedo = {0.26f, 0.46f, 0.20f};
     } else {
       s.type = SurfaceType::Rock;
       s.roughness = 0.55;
@@ -634,9 +659,6 @@ public:
         30.0 - 6.5 * (s.height / 1000.0) - 50.0 * (a / PI_E) - 0.0065 * alt;
     return s;
   }
-
-private:
-  mutable std::mt19937 rng_;
 };
 
 struct GeoPoint {
@@ -730,6 +752,7 @@ public:
     real coriolis;
   };
 
+  // FIX: p deve essere in coordinate ECEF con centro del globo nell'origine.
   EnvSample sample(const Vec3 &p, const WindProfile &wp) const {
     EnvSample e;
     e.altitude = altitudeOf(p);
@@ -740,13 +763,15 @@ public:
     e.temperature = atmo.temperature(e.altitude);
     e.density = atmo.density(e.altitude);
     e.soundSpeed = atmo.speedOfSound(e.altitude);
-    e.wind = WindField::velocityAt(wp, e.altitude);
     e.surf = terrain.sample(e.lat, e.lon, e.altitude);
     e.coriolis = 2.0 * planet::omega_E * std::sin(e.lat);
+
+    Vec3 up, east, north;
+    enuBasis(e.lat, e.lon, up, east, north);
+    e.wind = WindField::velocityAt(wp, e.altitude, up, east, north);
     return e;
   }
 };
-
 
 class GlobeResolver {
 public:
@@ -769,7 +794,10 @@ public:
     return v * c + k.cross(v) * s + k * (k.dot(v) * (1.0 - c));
   }
 
-  void turn(real dYaw) { fwd = (fwd * std::cos(dYaw) + right() * std::sin(dYaw)); orthonormalize(); }
+  void turn(real dYaw) {
+    fwd = (fwd * std::cos(dYaw) + right() * std::sin(dYaw));
+    orthonormalize();
+  }
 
   void walk(const Vec3 &tangent, real dAlt) {
     const Vec3 r = pos - center();
@@ -823,7 +851,8 @@ private:
     up = up.normalized();
     Vec3 f = fwd - up * fwd.dot(up);
     if (f.norm2() < 1e-18)
-      f = std::abs(up.x) < 0.9 ? Vec3(1, 0, 0).cross(up) : Vec3(0, 1, 0).cross(up);
+      f = std::abs(up.x) < 0.9 ? Vec3(1, 0, 0).cross(up)
+                               : Vec3(0, 1, 0).cross(up);
     fwd = f.normalized();
   }
 

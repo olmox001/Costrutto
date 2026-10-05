@@ -7,5 +7,6 @@ test_engine3d
 test_matter_physics
 test_nqg_core
 test_window_sdl3
-NQG_CleanRoom.app/Contents/MacOS/NQG_CleanRoom
+Costrutto.app
 test_sdf
+diff.txt

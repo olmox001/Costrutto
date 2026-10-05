@@ -1,5 +1,7 @@
 CXX = clang++
+
 CXXFLAGS = -O2 -std=c++17 -Wall -Wextra -pthread
+
 LDFLAGS = -framework Cocoa $(shell pkg-config --cflags --libs sdl3)
 
 TARGETS = test_nqg_core test_engine3d test_window_sdl3 test_cleanroom \
@@ -39,10 +41,39 @@ nqg_sample_game: nqg_sample_game.cpp nqg_window_sdl3.hpp nqg_engine3d.hpp nqg_ph
 nqg_cleanroom_game: nqg_cleanroom_game.cpp $(COMMON_HDRS) nqg_window_sdl3.hpp
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) nqg_cleanroom_game.cpp -o nqg_cleanroom_game
 
-app: nqg_cleanroom_game
-	mkdir -p NQG_CleanRoom.app/Contents/MacOS
-	cp nqg_cleanroom_game NQG_CleanRoom.app/Contents/MacOS/NQG_CleanRoom
-	chmod +x NQG_CleanRoom.app/Contents/MacOS/NQG_CleanRoom
+app: nqg_cleanroom_game icon.icns
+	mkdir -p Costrutto.app/Contents/MacOS
+	mkdir -p Costrutto.app/Contents/Resources
+
+	cp nqg_cleanroom_game Costrutto.app/Contents/MacOS/NQG_CleanRoom
+	cp icon.icns Costrutto.app/Contents/Resources/icon.icns
+
+	chmod +x Costrutto.app/Contents/MacOS/NQG_CleanRoom
+
+	printf '%s\n' \
+	'<?xml version="1.0" encoding="UTF-8"?>' \
+	'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	'<plist version="1.0">' \
+	'<dict>' \
+	'	<key>CFBundleDisplayName</key>' \
+	'	<string>NQG CleanRoom</string>' \
+	'	<key>CFBundleExecutable</key>' \
+	'	<string>NQG_CleanRoom</string>' \
+	'	<key>CFBundleIdentifier</key>' \
+	'	<string>com.nqg.cleanroom</string>' \
+	'	<key>CFBundleIconFile</key>' \
+	'	<string>icon.icns</string>' \
+	'	<key>CFBundleName</key>' \
+	'	<string>NQG CleanRoom</string>' \
+	'	<key>CFBundlePackageType</key>' \
+	'	<string>APPL</string>' \
+	'	<key>CFBundleVersion</key>' \
+	'	<string>1.0</string>' \
+	'	<key>CFBundleShortVersionString</key>' \
+	'	<string>1.0</string>' \
+	'</dict>' \
+	'</plist>' \
+	> Costrutto.app/Contents/Info.plist
 
 test: all
 	./test_nqg_core
@@ -61,6 +92,6 @@ run_cleanroom: nqg_cleanroom_game
 
 clean:
 	rm -f $(TARGETS)
-	rm -rf NQG_CleanRoom.app
+	rm -rf Costrutto.app
 
 .PHONY: all test run run_cleanroom clean

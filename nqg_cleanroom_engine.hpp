@@ -378,6 +378,12 @@
 //   - Wake dei solidi addormentati quando un altro corpo li colpisce.
 //   - sampleBed/resolvePlayer/collideSpheres usano halfW() (const-safe).
 //   - traceRay: skip shadow-ray per luci dietro la superficie.
+//  FIX 2026a:
+//   - updateEnvironment usa il WindProfile membro (prima era dead code):
+//     aggiornato con currentLatitude e riutilizzato per velocityAt().
+//   - Nota di coerenza: tutta la fisica di scena gira nel frame locale ENU
+//     centrato in homeECEF, dove z = up. gravityVec = (0,0,-g) e' quindi
+//     gia' corretto (nessuna conversione a -up richiesta).
 // ============================================================================
 
 #ifndef NQG_CLEANROOM_ENGINE_HPP
@@ -987,11 +993,24 @@ public:
       }
     }
     if (!s.solid) {
+      // pavimento (lastra, piastrelle): impermeabile, liscio. Fuori dalla
+      // stanza il fondo e' terreno: scabro, ritiene l'acqua e la assorbe.
+      const real m = 2.0 * room.wallT;
+      const bool onSlab = x >= room.xMin - m && x <= room.xMax + m &&
+                          y >= room.yMin - m && y <= room.yMax + m;
+      if (!onSlab) {
+        s.manning = 0.15;     // flusso laminare su erba/suolo: n alto
+        s.infil = 8.0e-5;     // m/s (suolo sabbioso-limoso)
+        s.retention = 2.0e-3; // m (depressioni, erba)
+      }
       const real sh = sand.sampleHeight(x, y);
       if (sh > s.z)
         s.z = sh;
-      if (sh > 0.001)
-        s.manning = 0.035;
+      if (sh > 0.001) {
+        s.manning = 0.05;
+        s.infil = 2.0e-4; // sabbia: molto permeabile
+        s.retention = 8.0e-4;
+      }
     }
     return s;
   }
@@ -1021,10 +1040,15 @@ public:
     air.temperatureK = currentTemperature;
     air.scatteringCoeff = effectiveScattering();
     currentGravity = globe.grav.g(currentLatitude, currentAltitude);
+    // Frame locale ENU (z = up): "giu'" e' gia' -Z locale.
     gravityVec =
         zeroGravityEnabled ? Vec3(0, 0, 0) : Vec3(0, 0, -currentGravity);
-    const Vec3 localWind = earth::WindField::velocityAt(
-        earth::WindField::profileFor(0.15, currentLatitude), currentAltitude);
+    // FIX: aggiorna e riusa il profilo di vento membro (prima era dead code).
+    // Il vettore restituito dall'overload a 2 argomenti e' gia' nel frame
+    // locale (east, north, up), coerente con curlWind e gravityVec.
+    windProfile = earth::WindField::profileFor(0.15, currentLatitude);
+    const Vec3 localWind =
+        earth::WindField::velocityAt(windProfile, currentAltitude);
     Vec3 curlWind = wind.evaluateVelocity(lastObserverPos, simTime);
     real blend = std::clamp(currentAltitude / 2000.0, 0.0, 1.0);
     currentWind = curlWind * (1.0 - blend) + localWind * blend;
@@ -1108,20 +1132,6 @@ public:
                            camVel, dt, playerSubmerged);
   }
 
-  void notifyPlayerInWater(const Vec3 &camPos, const CapsuleCollider &cap,
-                           real speed) {
-    if (!(speed > 0.0) || !apartment::isFiniteVec(camPos))
-      return;
-    const real foot = cap.footZ(camPos.z);
-    if (!water.isInsideBasin(camPos.x, camPos.y))
-      return;
-    const real level = water.surfaceHeight(camPos.x, camPos.y);
-    if (!(foot < level))
-      return;
-    const real amp = std::clamp(speed * 0.02, 0.005, 0.06);
-    water.addImpulse(Vec3(camPos.x, camPos.y, level), simTime, amp);
-  }
-
   static bool intersectSphere(const Vec3 &ro, const Vec3 &rd,
                               const Vec3 &center, real radius, real &tOut,
                               Vec3 &nOut) {
@@ -1159,16 +1169,27 @@ public:
     const real R = earth::planet::R_E;
     const Vec3 C(0, 0, -R);
     Vec3 oc = ro - C;
-    real b = oc.dot(rd);
-    real c = oc.dot(oc) - R * R;
-    real disc = b * b - c;
+    const real b = oc.dot(rd);
+    // c = (|oc|-R)(|oc|+R): niente cancellazione catastrofica vicino al suolo
+    const real ocN = oc.norm();
+    const real c = (ocN - R) * (ocN + R);
+    const real disc = b * b - c;
     if (disc < 0 || !std::isfinite(disc))
       return false;
-    real sq = std::sqrt(disc);
-    real t = -b - sq;
-    if (t < 0.001)
-      t = -b + sq;
-    if (t < 0.001)
+    const real sq = std::sqrt(disc);
+    // radici stabili: q = -(b + sgn(b) sq),  t0 = q,  t1 = c/q
+    const real q = -(b + (b >= 0.0 ? sq : -sq));
+    real ta = q, tb = q != 0.0 ? c / q : q;
+    if (ta > tb)
+      std::swap(ta, tb);
+    // Un film d'acqua puo' essere spesso meno di 1 mm: la soglia dev'essere
+    // minuscola, altrimenti si scarta la radice vicina e si prende il lato
+    // opposto del pianeta (pixel neri sui bordi del film).
+    constexpr real TMIN = 1e-7;
+    real t = ta;
+    if (t < TMIN)
+      t = tb;
+    if (t < TMIN)
       return false;
     Vec3 hitLocal = ro + rd * t;
     Vec3 hitECEF = localToECEF(hitLocal);
@@ -1437,7 +1458,7 @@ public:
         hitQuantum = false;
       }
     }
-    real tW = -1.0, dW = 0.0;
+    real tW = -1.0, dW = 0.0, waterDepth = -1.0;
     Vec3 nW;
     if (water.intersectWater(ro, rd, simTime, tW, nW, dW)) {
       if (tW < tHit && std::isfinite(tW)) {
@@ -1446,6 +1467,7 @@ public:
         hitSomething = true;
         hitWater = true;
         hitQuantum = false;
+        waterDepth = dW;
       }
     }
     real tS;
@@ -1501,6 +1523,7 @@ public:
           metallic = 0.0;
           roughness = std::min(1.0, surf.roughness * 1.8);
           hitWater = (surf.type == earth::SurfaceType::Water);
+          waterDepth = -1.0; // il mare terrestre non e' il film del solutore
           real lw = 0.08 + std::clamp(200.0 / std::max(1.0, tE), 0.0, 0.5);
           overlayGrid(hitAlbedo, latHit, lonHit, lw);
           tHit = tE;
@@ -1671,10 +1694,19 @@ public:
         specSum.g += float(lCol.g * spec * 2.5);
         specSum.b += float(lCol.b * spec * 2.5);
       }
+      // Riva: a profondita' -> 0 il film non riflette ne' assorbe e la vista
+      // deve raccordarsi in modo continuo col fondo asciutto (niente linea).
+      const real filmBlend =
+          waterDepth >= 0.0 ? std::clamp(waterDepth / 0.003, 0.0, 1.0) : 1.0;
+      const real wb = filmBlend * filmBlend * (3.0 - 2.0 * filmBlend);
+      const real Fb = F * wb;
       Rgb litWater;
-      litWater.r = float(belowCol.r * (1.0 - F) + reflCol.r * F + specSum.r);
-      litWater.g = float(belowCol.g * (1.0 - F) + reflCol.g * F + specSum.g);
-      litWater.b = float(belowCol.b * (1.0 - F) + reflCol.b * F + specSum.b);
+      litWater.r =
+          float(belowCol.r * (1.0 - Fb) + reflCol.r * Fb + specSum.r * wb);
+      litWater.g =
+          float(belowCol.g * (1.0 - Fb) + reflCol.g * Fb + specSum.g * wb);
+      litWater.b =
+          float(belowCol.b * (1.0 - Fb) + reflCol.b * Fb + specSum.b * wb);
       const real ext = effectiveScattering() * tHit;
       const real transmission = std::exp(-ext);
       const real inScatter = 1.0 - transmission;

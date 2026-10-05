@@ -64,6 +64,73 @@ int main() {
   CHECK(hitW && tW_hit > 0.0, "K1f", "Intersezione analitica raggio-pelo d'acqua continuo: t=" + std::to_string(tW_hit));
 
   // --------------------------------------------------------------------------
+  // 1b. Onde FISICHE: velocita' sqrt(g h), riva continua, infiltrazione
+  // --------------------------------------------------------------------------
+  {
+    ContinuousWaterBody pool;
+    pool.setBedProvider([](real x, real y) {
+      fluid::BedSample b;
+      if (std::abs(x) > 3.05 || std::abs(y) > 3.05) {
+        b.solid = true;
+        b.z = fluid::ShallowFlow::SOLID_Z;
+      }
+      return b;
+    });
+    pool.initialFill(-3.0, 3.0, -3.0, 3.0, 0.5);
+    pool.addImpulse(Vec3(0, 0, 0.5), 0.0, 0.05);
+    const real eta0 = pool.surfaceHeight(1.5, 0.0);
+    real tArrive = -1.0;
+    for (int i = 0; i < 300 && tArrive < 0; ++i) {
+      pool.step(0.01);
+      if (std::abs(pool.surfaceHeight(1.5, 0.0) - eta0) > 2e-4)
+        tArrive = 0.01 * (i + 1);
+    }
+    const real cTh = std::sqrt(9.80665 * 0.5);
+    CHECK(tArrive > 0.35 * 1.5 / cTh && tArrive < 1.6 * 1.5 / cTh, "K1g",
+          "Onda fisica: arrivo a 1.5 m dopo t=" + std::to_string(tArrive) +
+              " s (c teorica " + std::to_string(cTh) + " m/s)");
+    const real v0 = pool.totalVolume();
+    for (int i = 0; i < 100; ++i)
+      pool.step(0.01);
+    CHECK(std::abs(pool.totalVolume() - v0) < 1e-6 * v0 + 1e-9, "K1h",
+          "Volume conservato dopo l'impulso e la propagazione");
+
+    // riva: profondita' continua (nessun salto sul bordo)
+    ContinuousWaterBody beach;
+    beach.initialFill(-1.0, 1.0, -1.0, 1.0, 0.02);
+    real maxJump = 0.0, prev = beach.depthAt(-1.5, 0.0);
+    real prevS = 0.0;
+    for (real x = -1.4; x < -0.6; x += 0.01) {
+      auto s = beach.flow.sample(x, 0.0);
+      const real d = s.wet ? s.depth : 0.0;
+      maxJump = std::max(maxJump, std::abs(d - prevS));
+      prevS = d;
+    }
+    (void)prev;
+    CHECK(maxJump < 0.004, "K1i",
+          "Riva continua: salto massimo di profondita' per cm = " +
+              std::to_string(maxJump) + " m");
+
+    // infiltrazione: il terreno permeabile assorbe l'acqua e il fronte si ferma
+    ContinuousWaterBody soil;
+    soil.setBedProvider([](real x, real y) {
+      (void)x;
+      (void)y;
+      fluid::BedSample b;
+      b.infil = 1e-3;
+      b.retention = 1e-3;
+      return b;
+    });
+    soil.addVolume(0, 0, 0.3, 0.01);
+    const real vs0 = soil.totalVolume();
+    for (int i = 0; i < 400; ++i)
+      soil.step(0.05);
+    CHECK(soil.totalVolume() < 0.2 * vs0, "K1j",
+          "Infiltrazione: volume " + std::to_string(vs0) + " -> " +
+              std::to_string(soil.totalVolume()) + " m^3 (fronte fermo)");
+  }
+
+  // --------------------------------------------------------------------------
   // 2. Vento Continuo: Divergenza Nulla div(u) = 0 (Curl-Noise)
   // --------------------------------------------------------------------------
   ContinuousWindField wind;

@@ -442,21 +442,6 @@ public:
   real displacedVolume = 0.0; // volume dei corpi immersi iniettato nell'anello
   real simTime_ = 0.0;
 
-  struct SurfaceWave {
-    Vec3 origin{0, 0, 0};
-    real amplitude = 0.0;
-    real omega = 0.0;
-    real phase = 0.0;
-    real birth = 0.0;
-  };
-  struct Ripple {
-    Vec3 origin{0, 0, 0};
-    real birth = 0.0;
-    real amplitude = 0.0;
-  };
-  std::vector<SurfaceWave> waves;
-  std::vector<Ripple> ripples;
-
   ContinuousWaterBody() : flow(0.1, 128, 128, 0.0, 0.0) {}
 
   void setBedProvider(fluid::ShallowFlow::BedFn fn) {
@@ -479,25 +464,9 @@ public:
     flow.step(dt);
     updateVolume();
     simTime_ += dt;
-    if (!ripples.empty()) {
-      const real tLim = simTime_ - 3.0;
-      ripples.erase(
-          std::remove_if(ripples.begin(), ripples.end(),
-                         [&](const Ripple &r) { return r.birth < tLim; }),
-          ripples.end());
-    }
-    if (!waves.empty()) {
-      const real tLim = simTime_ - 6.0;
-      waves.erase(
-          std::remove_if(waves.begin(), waves.end(),
-                         [&](const SurfaceWave &w) { return w.birth < tLim; }),
-          waves.end());
-    }
   }
   void clear() {
     flow.clear();
-    waves.clear();
-    ripples.clear();
     waterVolume = 0.0;
     displacedVolume = 0.0;
     simTime_ = 0.0;
@@ -529,47 +498,11 @@ public:
     return s.wet ? s.eta : -1e9;
   }
 
-  real waveElevation(real x, real y, real time) const {
-    if (ripples.empty() && waves.empty())
-      return 0.0;
-    real dh = 0.0;
-    for (const auto &r : ripples) {
-      const real age = time - r.birth;
-      if (age < 0.0 || age > 3.0)
-        continue;
-      const real dx = x - r.origin.x;
-      const real dy = y - r.origin.y;
-      const real dist = std::sqrt(dx * dx + dy * dy);
-      const real front = age * 1.6;
-      const real d = dist - front;
-      const real sigma = 0.10 + 0.08 * age;
-      const real env =
-          std::exp(-(d * d) / (2.0 * sigma * sigma)) * std::exp(-1.5 * age);
-      dh += r.amplitude * env * std::cos(d * 28.0 - age * 6.0);
-    }
-    for (const auto &w : waves) {
-      const real age = time - w.birth;
-      if (age < 0.0 || age > 6.0)
-        continue;
-      const real dx = x - w.origin.x;
-      const real dy = y - w.origin.y;
-      const real dist = std::sqrt(dx * dx + dy * dy);
-      const real env = std::exp(-dist * dist / 4.0) * std::exp(-0.4 * age);
-      dh += w.amplitude * env * std::sin(w.omega * age - dist * 3.5 + w.phase);
-    }
-    return dh;
-  }
-
-  real surfaceHeightVisual(real x, real y, real time) const {
+  // La quota della superficie e' SOLO quella del solutore di flusso: le onde
+  // (tuffi, oggetti, vento) sono onde vere del campo eta, non decorazioni.
+  real surfaceHeightVisual(real x, real y, real) const {
     auto s = flow.sample(x, y);
-    if (!s.wet)
-      return -1e9;
-    const real pinThr =
-        flow.liquid.sigma * (1.0 - std::cos(flow.liquid.contactAngle));
-    const real specificThickness = std::max(
-        1e-4, std::sqrt(2.0 * pinThr / (flow.liquid.rho * flow.gravity)));
-    const real rippleFactor = std::clamp(s.depth / specificThickness, 0.0, 1.0);
-    return s.eta + waveElevation(x, y, time) * rippleFactor;
+    return s.wet ? s.eta : -1e9;
   }
   real evaluateHeight(real x, real y, real time) const {
     return surfaceHeightVisual(x, y, time);
@@ -595,18 +528,28 @@ public:
     return Vec3(-dhdx, -dhdy, 1.0).normalized();
   }
 
+  // Quota di superficie estesa: acqua dove c'e', altrimenti il fondo (la riva
+  // scende in modo continuo sul fondo). Nei solidi (pareti) usa il centro.
+  real surfaceOrBed(real x, real y, real fallback) const {
+    auto s = flow.sample(x, y);
+    if (s.wet)
+      return s.eta;
+    const real b = flow.bedAt(x, y);
+    return b > 0.5 * fluid::ShallowFlow::SOLID_Z ? fallback : b;
+  }
+
   Vec3 evaluateNormalVisual(real x, real y, real time) const {
-    const real eps = std::max(0.03, 0.5 * flow.dx);
-    const real inv2e = 1.0 / (2.0 * eps);
-    const real hL = surfaceHeightVisual(x - eps, y, time);
-    const real hR = surfaceHeightVisual(x + eps, y, time);
-    const real hD = surfaceHeightVisual(x, y - eps, time);
-    const real hU = surfaceHeightVisual(x, y + eps, time);
-    if (hL < -1e8 || hR < -1e8 || hD < -1e8 || hU < -1e8)
-      return evaluateNormal(x, y, time);
-    const real dhdx = (hR - hL) * inv2e;
-    const real dhdy = (hU - hD) * inv2e;
-    return Vec3(-dhdx, -dhdy, 1.0).normalized();
+    auto c = flow.sample(x, y);
+    if (!c.wet)
+      return Vec3(0, 0, 1);
+    const real e = std::max(0.5 * flow.dx, 0.03);
+    const real inv2e = 1.0 / (2.0 * e);
+    const real hL = surfaceOrBed(x - e, y, c.eta);
+    const real hR = surfaceOrBed(x + e, y, c.eta);
+    const real hD = surfaceOrBed(x, y - e, c.eta);
+    const real hU = surfaceOrBed(x, y + e, c.eta);
+    (void)time;
+    return Vec3(-(hR - hL) * inv2e, -(hU - hD) * inv2e, 1.0).normalized();
   }
 
   real currentLevel() const {
@@ -619,37 +562,21 @@ public:
              std::abs(y - basinCenter.y) <= half);
   }
 
-  void addImpulse(const Vec3 &pos, real time, real amplitude) {
+  // Perturbazione fisica della superficie (volume conservato): l'onda e'
+  // propagata dal solutore (velocita' sqrt(g h), riflessione, attrito).
+  void addImpulse(const Vec3 &pos, real /*time*/, real amplitude) {
     if (!std::isfinite(amplitude) || amplitude <= 0.0)
       return;
     auto s = flow.sample(pos.x, pos.y);
     if (!s.wet)
       return;
-    const real depth = std::max(0.01, s.depth);
-    const real amp = std::min(amplitude, 0.5 * depth);
-
-    SurfaceWave w;
-    w.origin = pos;
-    w.amplitude = amp;
-    w.omega = std::sqrt(flow.gravity / depth);
-    w.phase = 0.0;
-    w.birth = time;
-    waves.push_back(w);
-
-    Ripple r;
-    r.origin = pos;
-    r.birth = time;
-    r.amplitude = amp;
-    ripples.push_back(r);
-
-    if (waves.size() > 24)
-      waves.erase(waves.begin(), waves.begin() + (waves.size() - 24));
-    if (ripples.size() > 32)
-      ripples.erase(ripples.begin(), ripples.begin() + (ripples.size() - 32));
+    const real amp = std::min(amplitude, 0.5 * s.depth);
+    flow.addDisturbance(pos.x, pos.y, std::max(0.06, 1.2 * flow.dx), amp);
   }
 
   bool intersectWater(const Vec3 &ro, const Vec3 &rd, real time, real &tOut,
                       Vec3 &nOut, real &depthOut) const {
+    (void)time;
     if (!flow.hasWet)
       return false;
     real tN = 0.001, tF = 1e30;
@@ -673,7 +600,7 @@ public:
       s = flow.sample(p.x, p.y);
       if (!s.wet)
         return false;
-      etaUsed = s.eta + waveElevation(p.x, p.y, time);
+      etaUsed = s.eta;
       return p.z < etaUsed;
     };
 
@@ -1044,35 +971,59 @@ public:
 
   bool intersectSand(const Vec3 &ro, const Vec3 &rd, real &tOut,
                      Vec3 &nOut) const {
-    if (std::abs(rd.z) < 1e-6)
+    // Intervallo del raggio dentro la scatola [griglia] x [0, hMax].
+    const real half = 0.5 * GRID_N * gridSpacing;
+    real hMax = 0.0;
+    for (const auto &row : height)
+      for (real v : row)
+        hMax = std::max(hMax, v);
+    if (hMax <= 0.005)
       return false;
-    real tFloor = -ro.z / rd.z;
-    if (tFloor < 0.01)
+    real t0 = 0.01, t1 = 1e30;
+    auto slab = [&](real o, real d, real lo, real hi) {
+      if (std::abs(d) < 1e-12)
+        return o >= lo && o <= hi;
+      real a = (lo - o) / d, b = (hi - o) / d;
+      if (a > b)
+        std::swap(a, b);
+      t0 = std::max(t0, a);
+      t1 = std::min(t1, b);
+      return t0 <= t1;
+    };
+    if (!slab(ro.x, rd.x, sandCenter.x - half, sandCenter.x + half) ||
+        !slab(ro.y, rd.y, sandCenter.y - half, sandCenter.y + half) ||
+        !slab(ro.z, rd.z, 0.0, hMax + 1e-3))
       return false;
-    real tTop = (0.9 - ro.z) / rd.z;
-    real tMin = std::max(0.01, std::min(tFloor, tTop));
-    real tMax = std::max(0.01, std::max(tFloor, tTop));
-    const int STEPS = 8;
-    real dt = (tMax - tMin) / STEPS;
-    real tPrev = tMin;
-    Vec3 pPrev = ro + rd * tPrev;
-    real hPrev = sampleHeight(pPrev.x, pPrev.y);
-    real diffPrev = pPrev.z - hPrev;
-    for (int s = 1; s <= STEPS; ++s) {
-      real tCurr = tMin + s * dt;
-      Vec3 pCurr = ro + rd * tCurr;
-      real hCurr = sampleHeight(pCurr.x, pCurr.y);
-      real diffCurr = pCurr.z - hCurr;
-      if (diffPrev >= 0.0 && diffCurr <= 0.0 && hCurr > 0.005) {
-        real frac = diffPrev / (diffPrev - diffCurr + 1e-9);
-        real tExact = tPrev + frac * (tCurr - tPrev);
-        Vec3 pHit = ro + rd * tExact;
-        tOut = tExact;
-        nOut = evaluateNormal(pHit.x, pHit.y);
+    // passo <= mezza cella lungo il raggio (campo bilineare: nessuna banda)
+    const real stepLen = 0.4 * gridSpacing;
+    const int steps = std::clamp(int(std::ceil((t1 - t0) / stepLen)), 2, 512);
+    const real dt = (t1 - t0) / steps;
+    real tPrev = t0;
+    Vec3 pp = ro + rd * tPrev;
+    real dPrev = pp.z - sampleHeight(pp.x, pp.y);
+    for (int s = 1; s <= steps; ++s) {
+      const real tc = t0 + s * dt;
+      const Vec3 pc = ro + rd * tc;
+      const real dCur = pc.z - sampleHeight(pc.x, pc.y);
+      if (dPrev >= 0.0 && dCur <= 0.0) {
+        real lo = tPrev, hi = tc;
+        for (int b = 0; b < 12; ++b) {
+          const real mid = 0.5 * (lo + hi);
+          const Vec3 pm = ro + rd * mid;
+          if (pm.z - sampleHeight(pm.x, pm.y) > 0.0)
+            lo = mid;
+          else
+            hi = mid;
+        }
+        const Vec3 ph = ro + rd * hi;
+        if (sampleHeight(ph.x, ph.y) <= 0.002)
+          return false;
+        tOut = hi;
+        nOut = evaluateNormal(ph.x, ph.y);
         return true;
       }
-      tPrev = tCurr;
-      diffPrev = diffCurr;
+      tPrev = tc;
+      dPrev = dCur;
     }
     return false;
   }

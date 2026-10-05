@@ -1312,6 +1312,11 @@ struct BedSample {
   real z = 0;
   real manning = 0.012;
   bool solid = false;
+  // Interazione col fondo (acqua che si ferma): infiltrazione (m/s, terreno
+  // permeabile) e ritenzione (m, accumulo nelle depressioni di rugosita':
+  // un film piu' sottile non scorre piu' ma resta intrappolato/assorbito).
+  real infil = 0.0;
+  real retention = 2.0e-4;
 };
 
 class ShallowFlow {
@@ -1323,6 +1328,7 @@ public:
   struct Cell {
     real h = 0, b = 0, u = 0, v = 0, n = 0.012;
     real tu = 0, tv = 0, fx = 0, fy = 0, s = 1, k = 0;
+    real inf = 0.0, ret = 2.0e-4;
     bool solid = false;
   };
   struct Tile {
@@ -1422,6 +1428,8 @@ public:
         c.solid = s.solid;
         c.b = s.solid ? SOLID_Z : s.z;
         c.n = s.manning;
+        c.inf = s.infil;
+        c.ret = s.retention;
         if (c.solid) {
           c.h = 0;
           c.u = c.v = 0;
@@ -1598,6 +1606,29 @@ public:
     return applied * dx * dx;
   }
 
+  // Perturbazione localizzata della superficie (goccia, tuffo): profilo
+  // "cappello messicano" a integrale nullo -> volume conservato. L'onda poi
+  // si propaga con le equazioni del flusso (c = sqrt(g h)), si riflette su
+  // pareti e solidi e si smorza per attrito: nessuna onda procedurale.
+  void addDisturbance(real x, real y, real sigma, real amp) {
+    if (!std::isfinite(amp) || amp == 0.0)
+      return;
+    sigma = std::max(sigma, dx);
+    const int ic = cellIndexX(x), jc = cellIndexY(y);
+    const int rc = int(std::ceil(4.0 * sigma / dx)) + 1;
+    for (int j = jc - rc; j <= jc + rc; ++j)
+      for (int i = ic - rc; i <= ic + rc; ++i) {
+        Cell *c = at(i, j);
+        if (!c || c->solid || c->h <= hDry)
+          continue;
+        const real ddx = centerX(i) - x, ddy = centerY(j) - y;
+        const real q = (ddx * ddx + ddy * ddy) / (sigma * sigma);
+        const real prof = (1.0 - q) * std::exp(-0.5 * q);
+        c->h = std::max(0.0, c->h + amp * prof);
+        markWet(i, j, c->h);
+      }
+  }
+
   void addMomentum(real x, real y, real radius, real px, real py) {
     if (!std::isfinite(px) || !std::isfinite(py))
       return;
@@ -1635,11 +1666,17 @@ public:
     const int i0 = int(std::floor(fi)), j0 = int(std::floor(fj));
     const real fx = fi - i0, fy = fj - j0;
     Sample s;
+    // Ricostruzione bilineare CONTINUA su tutte le celle fluide (asciutte
+    // incluse, con h = 0 e eta = fondo): la profondita' scende a 0 in modo
+    // continuo verso la linea di riva. Prima si usavano solo le celle
+    // bagnate con soglia binaria -> riva a gradini, normali discontinue e
+    // linee scure/segmentate sui bordi. Le celle solide (pareti) restano
+    // escluse e i pesi rinormalizzati.
     real w = 0, eta = 0, dep = 0, bd = 0, uu = 0, vv = 0;
     for (int dj = 0; dj < 2; ++dj)
       for (int di = 0; di < 2; ++di) {
         const Cell *c = at(i0 + di, j0 + dj);
-        if (!c || c->solid || c->h <= visibleDepth)
+        if (!c || c->solid)
           continue;
         const real wt = (di ? fx : 1 - fx) * (dj ? fy : 1 - fy);
         const Cell *e = at(i0 + di + 1, j0 + dj);
@@ -1655,9 +1692,11 @@ public:
       }
     if (w < 0.5)
       return s;
+    s.depth = dep / w;
+    if (!(s.depth > visibleDepth))
+      return s;
     s.wet = true;
     s.eta = eta / w;
-    s.depth = dep / w;
     s.bed = bd / w;
     s.u = uu / w;
     s.v = vv / w;
@@ -2188,10 +2227,20 @@ private:
         c.h = 0;
     });
 
-    const real fm = filmMin();
+    const real fmGlobal = filmMin();
     const real dAbs = absorbRate * dt;
     each([&](int, int, Cell &c) {
-      if (c.solid || c.h <= 0.0 || c.h >= fm)
+      if (c.solid || c.h <= 0.0)
+        return;
+      // infiltrazione nel terreno permeabile (Darcy, tasso costante)
+      if (c.inf > 0.0) {
+        const real di = std::min(c.h, c.inf * dt);
+        c.h -= di;
+        absorbedVolume += di * dx * dx;
+      }
+      // film sotto la ritenzione di superficie: intrappolato/assorbito
+      const real fm = std::max(fmGlobal, c.ret);
+      if (c.h <= 0.0 || c.h >= fm)
         return;
       const real d = std::min(c.h, dAbs);
       c.h -= d;

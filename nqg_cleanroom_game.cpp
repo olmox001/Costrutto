@@ -434,7 +434,6 @@ int main(int argc, char *argv[]) {
   double spacePressTime = 0.0;
   double lastTapTime = -100.0;
   double controlTime = 0.0;
-  double lastRippleTime = -1.0;
 
   constexpr double TAP_MAX_DURATION = 0.25;
   constexpr double DOUBLE_TAP_WINDOW = 0.40;
@@ -444,7 +443,6 @@ int main(int argc, char *argv[]) {
   constexpr real FREEFALL_THRUST = 20.0;
   constexpr real SHIFT_BOOST = 10.0;
   constexpr real COLLISION_STEP = 0.05;
-  constexpr double RIPPLE_INTERVAL = 0.10;
 
   std::cout
       << "Appartamento: 12m x 10m x 3.2m con porta sud.\n"
@@ -574,17 +572,16 @@ int main(int argc, char *argv[]) {
     }
     camPos = globe.pos;
 
-    real actualMove = (camPos - oldPos).norm();
-    real actualSpeed = actualMove / std::max(0.001, dt);
-    if (actualSpeed > 0.3 && controlTime - lastRippleTime > RIPPLE_INTERVAL) {
-      scene.notifyPlayerInWater(camPos, playerBody, actualSpeed);
-      lastRippleTime = controlTime;
-    }
+    (void)oldPos;
+    // Il giocatore sposta e trascina l'acqua DAVVERO: volume immerso e
+    // quantita' di moto vanno nel solutore di flusso (onde fisiche).
+    scene.couplePlayer(camPos, camVel, playerBody, dt);
 
     Vec3 spawnTarget = camPos + lookDir * 2.2;
 
     if (im.wasKeyPressed(SDL_SCANCODE_1) || im.isKeyDown(SDL_SCANCODE_1)) {
-      scene.water.addImpulse(spawnTarget, scene.simTime, 0.08);
+      // getto d'acqua: 4 L/s versati nel punto indicato (volume reale)
+      scene.water.addVolume(spawnTarget.x, spawnTarget.y, 0.12, 0.004 * dt);
       if (app.audio())
         app.audio()->triggerTransient(320.0f, 0.45f, 22.0f);
     }
@@ -684,8 +681,8 @@ int main(int argc, char *argv[]) {
       SDL_RenderDebugTextFormat(
           ren, 30, 210, "Acqua livello: %.3f m (vol %.2f m^3)",
           scene.water.currentLevel(), scene.water.waterVolume);
-      SDL_RenderDebugTextFormat(ren, 30, 228, "Ripples attivi: %zu",
-                                scene.water.ripples.size());
+      SDL_RenderDebugTextFormat(ren, 30, 228, "Celle bagnate: %zu",
+                                scene.water.wetCells());
 
       // Stato sleeping/EM dei solidi
       int nAsleep = 0, nAwake = 0;
