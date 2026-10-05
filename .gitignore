@@ -1,1 +1,10 @@
 .DS_Store
+nqg_cleanroom_game
+nqg_sample_game
+test_cleanroom
+test_continuum_physics
+test_engine3d
+test_matter_physics
+test_nqg_core
+test_window_sdl3
+NQG_CleanRoom.app/Contents/MacOS/NQG_CleanRoom

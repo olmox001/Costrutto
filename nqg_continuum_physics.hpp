@@ -433,7 +433,8 @@ public:
   real addedMassCoeffSphere = 0.5;
 
   Vec3 basinCenter = Vec3(0, 0, 0);
-  real waterVolume = 0.0;
+  real waterVolume = 0.0;     // acqua reale (netta del volume spostato)
+  real displacedVolume = 0.0; // volume dei corpi immersi iniettato nell'anello
   real simTime_ = 0.0;
 
   struct SurfaceWave {
@@ -451,11 +452,7 @@ public:
   std::vector<SurfaceWave> waves;
   std::vector<Ripple> ripples;
 
-  ContinuousWaterBody() : flow(0.1, 128, 128, 0.0, 0.0) {
-    const real half = 3.0;
-    initialFill(basinCenter.x - half, basinCenter.x + half,
-                basinCenter.y - half, basinCenter.y + half, 0.45);
-  }
+  ContinuousWaterBody() : flow(0.1, 128, 128, 0.0, 0.0) {}
 
   void setBedProvider(fluid::ShallowFlow::BedFn fn) {
     flow.bed = std::move(fn);
@@ -475,7 +472,7 @@ public:
 
   void step(real dt) {
     flow.step(dt);
-    waterVolume = flow.totalVolume();
+    updateVolume();
     simTime_ += dt;
     if (!ripples.empty()) {
       const real tLim = simTime_ - 3.0;
@@ -497,16 +494,23 @@ public:
     waves.clear();
     ripples.clear();
     waterVolume = 0.0;
+    displacedVolume = 0.0;
     simTime_ = 0.0;
   }
   void initialFill(real xa, real xb, real ya, real yb, real depth) {
     flow.fillRect(xa, xb, ya, yb, depth);
-    waterVolume = flow.totalVolume();
+    updateVolume();
+  }
+  void initialFillVolume(real xa, real xb, real ya, real yb, real volume) {
+    flow.fillVolume(xa, xb, ya, yb, volume);
+    updateVolume();
   }
   void addVolume(real x, real y, real radius, real volume) {
     flow.addVolume(x, y, radius, volume);
-    waterVolume = flow.totalVolume();
+    updateVolume();
   }
+
+  void updateVolume() { waterVolume = flow.totalVolume() - displacedVolume; }
 
   real density() const { return flow.liquid.rho; }
   real totalVolume() const { return flow.totalVolume(); }
@@ -555,7 +559,12 @@ public:
     auto s = flow.sample(x, y);
     if (!s.wet)
       return -1e9;
-    return s.eta + waveElevation(x, y, time);
+    const real pinThr =
+        flow.liquid.sigma * (1.0 - std::cos(flow.liquid.contactAngle));
+    const real specificThickness = std::max(
+        1e-4, std::sqrt(2.0 * pinThr / (flow.liquid.rho * flow.gravity)));
+    const real rippleFactor = std::clamp(s.depth / specificThickness, 0.0, 1.0);
+    return s.eta + waveElevation(x, y, time) * rippleFactor;
   }
   real evaluateHeight(real x, real y, real time) const {
     return surfaceHeightVisual(x, y, time);
@@ -858,9 +867,10 @@ public:
   void couple(real cx, real cy, real hx, real hy, bool circular, real dVolume,
               real px, real py) {
     const real margin = 1.5 * flow.dx;
-    flow.addVolumeRing(cx, cy, hx, hy, circular, margin, dVolume);
+    displacedVolume +=
+        flow.addVolumeRing(cx, cy, hx, hy, circular, margin, dVolume);
     flow.addMomentum(cx, cy, std::max(hx, hy) + 2.0 * flow.dx, px, py);
-    waterVolume = flow.totalVolume();
+    updateVolume();
   }
 
   real couplePlayer(const Vec3 &pos, real radius, real footZ, real height,
@@ -1546,7 +1556,7 @@ private:
     pos.z += (groundZ - bottom);
 
     const real mu = water.flow.liquid.mu;
-    const real film = H.wet ? std::max(0.0, H.level) : 0.0;
+    const real film = H.wet ? std::max(0.0, H.level - H.bedZ) : 0.0;
     const real rhoB = mass / std::max(volume(), 1e-9);
     const real D = std::sqrt(std::max(size.x * size.y, 1e-6));
 
@@ -1565,68 +1575,79 @@ private:
       contacts[nc++] = lo;
     }
 
-    const Vec3 n(0, 0, 1);
-    const real inv_nc = 1.0 / real(nc);
-    const real jGravShare = std::max(0.0, -netFz) * h * inv_nc;
+    const real A = std::max(size.x * size.y, 1e-6);
+    const real vtsEst =
+        std::max(std::sqrt(vel.x * vel.x + vel.y * vel.y), 1e-3);
+    real fw = 1.0;
+    if (film > 0 && mu_s > 0) {
+      const real pEst = std::max(-netFz, mass * 1e-3) / A;
+      fw = std::clamp(
+          contact::wetFrictionCoefficient(mu_s, film, 2e-5, mu, vtsEst, pEst,
+                                          std::max(size.x, size.y)) /
+              mu_s,
+          0.0, 1.0);
+    }
+    const real muS = mu_s * fw, muK = mu_k * fw;
+    const real invM = 1.0 / mass;
+    const Vec3 dirs[3] = {Vec3(0, 0, 1), Vec3(1, 0, 0), Vec3(0, 1, 0)};
+    auto kEff = [&](const Vec3 &r, const Vec3 &d) {
+      return invM + d.dot(applyInvInertia(r.cross(d)).cross(r));
+    };
+    auto relVel = [&](const Vec3 &r, const Vec3 &d) {
+      return (vel + angVel.cross(r)).dot(d);
+    };
+    auto applyJ = [&](const Vec3 &r, const Vec3 &J) {
+      vel = vel + J * invM;
+      angVel = angVel + applyInvInertia(r.cross(J));
+    };
 
-    const int ITER = 4;
-    for (int it = 0; it < ITER; ++it) {
+    real bounce[8], acc[8][3];
+    for (int k = 0; k < nc; ++k) {
+      acc[k][0] = acc[k][1] = acc[k][2] = 0.0;
+      const real vn = relVel(contacts[k] - pos, dirs[0]);
+      real e = restitution;
+      if (-vn < 0.05)
+        e = 0;
+      if (film > 0 && vn < 0) {
+        const real St = contact::stokesNumber(rhoB, vn, D, mu);
+        const real ew = contact::wetRestitution(restitution, St);
+        const real w = std::clamp(film / 1e-3, 0.0, 1.0);
+        e = restitution * (1.0 - w) + ew * w;
+      }
+      bounce[k] = vn < 0 ? -e * vn : 0.0;
+    }
+
+    for (int it = 0; it < 8; ++it)
       for (int k = 0; k < nc; ++k) {
         const Vec3 r = contacts[k] - pos;
-        const Vec3 vC = vel + angVel.cross(r);
-        const real vn = vC.z;
-        const Vec3 rxn = r.cross(n);
-        const Vec3 irxn = applyInvInertia(rxn);
-        const real K = (mass > 0.0 ? 1.0 / mass : 0.0) + n.dot(irxn.cross(r));
-
-        real jn = 0;
-        if (vn < 0 && K > 1e-12) {
-          real e = restitution;
-          if (-vn < 0.05)
-            e = 0;
-          if (film > 0 && vn < 0) {
-            const real St = contact::stokesNumber(rhoB, vn, D, mu);
-            const real ew = contact::wetRestitution(restitution, St);
-            const real w = std::clamp(film / 1e-3, 0.0, 1.0);
-            e = restitution * (1.0 - w) + ew * w;
-          }
-          jn = -(1.0 + e) * vn / K;
+        const real Kn = kEff(r, dirs[0]);
+        if (Kn > 1e-12) {
+          real lam = (bounce[k] - relVel(r, dirs[0])) / Kn;
+          const real nj = std::max(acc[k][0] + lam, 0.0);
+          lam = nj - acc[k][0];
+          acc[k][0] = nj;
+          applyJ(r, dirs[0] * lam);
         }
-        jn += jGravShare;
-
-        if (jn > 0) {
-          const Vec3 Jn = n * jn;
-          vel = vel + Jn * (1.0 / mass);
-          angVel = angVel + applyInvInertia(r.cross(Jn));
-        }
-
-        const Vec3 vC2 = vel + angVel.cross(r);
-        const real vts = std::sqrt(vC2.x * vC2.x + vC2.y * vC2.y);
-        if (vts > 1e-7 && jn > 0) {
-          real muS = mu_s, muK = mu_k;
-          if (film > 0) {
-            const real A = std::max(size.x * size.y, 1e-6);
-            const real p = jn / (h * A);
-            const real mw = contact::wetFrictionCoefficient(
-                mu_s, film, 2e-5, mu, vts, p, std::max(size.x, size.y));
-            const real f = mu_s > 0 ? mw / mu_s : 1.0;
-            muS *= f;
-            muK *= f;
-          }
-          const Vec3 t(-vC2.x / vts, -vC2.y / vts, 0);
-          const Vec3 rxt = r.cross(t);
-          const Vec3 irxt = applyInvInertia(rxt);
-          const real Kt =
-              (mass > 0.0 ? 1.0 / mass : 0.0) + t.dot(irxt.cross(r));
-          if (Kt > 1e-12) {
-            const real jtStick = vts / Kt;
-            const real jt = contact::coulombImpulse(jtStick, jn, muS, muK);
-            const Vec3 Jt = t * jt;
-            vel = vel + Jt * (1.0 / mass);
-            angVel = angVel + applyInvInertia(r.cross(Jt));
-          }
+        for (int a = 1; a < 3; ++a) {
+          const real Kt = kEff(r, dirs[a]);
+          if (Kt < 1e-12)
+            continue;
+          real nt = acc[k][a] - relVel(r, dirs[a]) / Kt;
+          if (std::abs(nt) > muS * acc[k][0])
+            nt = std::copysign(muK * acc[k][0], nt);
+          const real lam = nt - acc[k][a];
+          acc[k][a] = nt;
+          applyJ(r, dirs[a] * lam);
         }
       }
+
+    real Jtot = 0.0;
+    for (int k = 0; k < nc; ++k)
+      Jtot += acc[k][0];
+    if (Jtot > 0.0) {
+      const real iz = applyInvInertia(Vec3(0, 0, 1)).z;
+      const real dwMax = muK * Jtot * 0.25 * D * iz;
+      angVel.z -= std::clamp(angVel.z, -dwMax, dwMax);
     }
 
     if (rolling > 0.0 && mass > 0.0) {

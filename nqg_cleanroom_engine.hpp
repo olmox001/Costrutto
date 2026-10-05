@@ -820,7 +820,6 @@ private:
       vel.z = -e * vn;
     }
     const real normalAccel = std::max(0.0, -netFz) / mass;
-    jn += mass * normalAccel * h;
 
     const Vec3 rv(0, 0, -radius);
     const Vec3 vc = vel + omega.cross(rv);
@@ -920,6 +919,11 @@ public:
     Vec3 normal = Vec3(0, 0, 1);
     real overlap = 0.0;
     continuum::RigidSolidElement::Manifold manifold;
+    struct Pt {
+      real jn = 0, jt1 = 0, jt2 = 0, bounce = 0;
+    };
+    Pt pt[4];
+    Vec3 t1, t2;
   };
 
   CleanRoomScene() {
@@ -997,8 +1001,8 @@ public:
 
     water.setBedProvider([this](real x, real y) { return sampleBed(x, y); });
     water.basinCenter = Vec3(0.0, 0.0, 0.0);
-    water.initialFill(room.xMin + 0.05, room.xMax - 0.05, room.yMin + 0.05,
-                      room.yMax - 0.05, 0.15);
+    water.initialFillVolume(room.xMin + 0.05, room.xMax - 0.05,
+                            room.yMin + 0.05, room.yMax - 0.05, 6.0);
     water.setLiquidTemperature(293.15);
 
     PhysicalSphere s;
@@ -1072,8 +1076,6 @@ public:
   }
 
   void updateEnvironment() {
-    real alt = lastObserverPos.z;
-    currentAltitude = alt;
     Vec3 obsECEF = localToECEF(lastObserverPos);
     earth::EarthGlobe::ecefToLatLon(obsECEF, currentLatitude, currentLongitude,
                                     currentAltitude);
@@ -1088,10 +1090,8 @@ public:
     currentGravity = globe.grav.g(currentLatitude, currentAltitude);
     gravityVec =
         zeroGravityEnabled ? Vec3(0, 0, 0) : Vec3(0, 0, -currentGravity);
-    earth::WindProfile wp = earth::WindField::profileFor(
-        std::min(1.0, std::max(0.0, 0.15)), homeLat);
-    Vec3 atmoWind = earth::WindField::velocityAt(wp, currentAltitude);
-    Vec3 localWind(atmoWind.x, atmoWind.y, atmoWind.z);
+    const Vec3 localWind = earth::WindField::velocityAt(
+        earth::WindField::profileFor(0.15, currentLatitude), currentAltitude);
     Vec3 curlWind = wind.evaluateVelocity(lastObserverPos, simTime);
     real blend = std::clamp(currentAltitude / 2000.0, 0.0, 1.0);
     currentWind = curlWind * (1.0 - blend) + localWind * blend;
@@ -1106,19 +1106,20 @@ public:
       camVel = Vec3(0, 0, 0);
       return;
     }
-    apartment::resolveFloorCeiling(camPos, camVel, cap, room);
-    for (const auto &s : solids) {
-      if (s.isRoomSlab)
-        continue;
-      apartment::AABB box;
-      box.center = s.pos;
-      box.half = s.halfW();
-      apartment::resolveCylinderAABB(camPos, camVel, cap, box);
-    }
-    {
-      real h = sand.sampleHeight(camPos.x, camPos.y);
+    constexpr real FLAT_RADIUS = 300.0;
+    if (camPos.norm2() < FLAT_RADIUS * FLAT_RADIUS) {
+      apartment::resolveFloorCeiling(camPos, camVel, cap, room);
+      for (const auto &s : solids) {
+        if (s.isRoomSlab)
+          continue;
+        apartment::AABB box;
+        box.center = s.pos;
+        box.half = s.halfW();
+        apartment::resolveCylinderAABB(camPos, camVel, cap, box);
+      }
+      const real h = sand.sampleHeight(camPos.x, camPos.y);
       if (h > 0.001) {
-        real footZ = cap.footZ(camPos.z);
+        const real footZ = cap.footZ(camPos.z);
         if (footZ < h) {
           camPos.z += (h - footZ);
           if (camVel.z < 0)
@@ -1126,10 +1127,17 @@ public:
         }
       }
     }
-    camPos.x = std::clamp(camPos.x, -100000.0, 100000.0);
-    camPos.y = std::clamp(camPos.y, -100000.0, 100000.0);
-    if (camPos.z < cap.eyeHeight + 0.001)
-      camPos.z = cap.eyeHeight + 0.001;
+    const Vec3 C(0, 0, -earth::planet::R_E);
+    const Vec3 r = camPos - C;
+    const real rho = r.norm();
+    const real minR = earth::planet::R_E + cap.eyeHeight + 0.001;
+    if (rho < minR) {
+      const Vec3 u = rho > 1e-9 ? r * (1.0 / rho) : Vec3(0, 0, 1);
+      camPos = C + u * minR;
+      const real vn = camVel.dot(u);
+      if (vn < 0)
+        camVel = camVel - u * vn;
+    }
   }
 
   void couplePlayer(const Vec3 &camPos, const Vec3 &camVel,
@@ -1693,8 +1701,16 @@ public:
 
   Image render(int width, int height, const Vec3 &camEye = Vec3(0, -3, 1.7),
                real yaw = 0, real pitch = 0) const {
+    const Vec3 f(std::sin(yaw) * std::cos(pitch),
+                 std::cos(yaw) * std::cos(pitch), std::sin(pitch));
+    return renderView(width, height, camEye, f, Vec3(0, 0, 1));
+  }
+
+  Image renderView(int width, int height, const Vec3 &camEye, const Vec3 &fwd,
+                   const Vec3 &camUp) const {
     lastObserverPos = camEye;
-    currentAltitude = camEye.z;
+    currentAltitude =
+        (camEye - Vec3(0, 0, -earth::planet::R_E)).norm() - earth::planet::R_E;
     real hGeo = earth::StandardAtmosphere::geopotential(currentAltitude);
     currentDensity = globe.atmo.density(hGeo);
 
@@ -1702,11 +1718,8 @@ public:
       refreshLightCache();
 
     Image img(width, height);
-    Vec3 f(std::sin(yaw) * std::cos(pitch), std::cos(yaw) * std::cos(pitch),
-           std::sin(pitch));
-    f = apartment::safeNormalize(f, Vec3(0, 1, 0));
-    Vec3 worldUp(0, 0, 1);
-    Vec3 right = f.cross(worldUp);
+    const Vec3 f = apartment::safeNormalize(fwd, Vec3(0, 1, 0));
+    Vec3 right = f.cross(camUp);
     if (right.norm2() < 1e-12)
       right = Vec3(1, 0, 0);
     else
@@ -1791,85 +1804,95 @@ public:
     }
   }
 
+  static void prepareContact(continuum::RigidSolidElement &A,
+                             continuum::RigidSolidElement &B, Contact &c) {
+    const Vec3 &n = c.normal;
+    const Vec3 a = std::abs(n.x) < 0.9 ? Vec3(1, 0, 0) : Vec3(0, 1, 0);
+    c.t1 = n.cross(a).normalized();
+    c.t2 = n.cross(c.t1);
+    const real e = std::min(A.restitution, B.restitution);
+    for (int k = 0; k < c.manifold.count; ++k) {
+      const Vec3 &p = c.manifold.points[k];
+      const Vec3 vA = A.isStatic ? Vec3(0, 0, 0) : A.pointVelocity(p);
+      const Vec3 vB = B.isStatic ? Vec3(0, 0, 0) : B.pointVelocity(p);
+      const real vn = (vA - vB).dot(n);
+      if (vn < -0.05) {
+        if (!A.isStatic)
+          A.wake();
+        if (!B.isStatic)
+          B.wake();
+      }
+      c.pt[k] = Contact::Pt();
+      c.pt[k].bounce = vn < -0.5 ? -e * vn : 0.0;
+    }
+  }
+
   static void solveContactPoint(continuum::RigidSolidElement &A,
                                 continuum::RigidSolidElement &B, const Vec3 &p,
-                                const Vec3 &n, real restitution, real muS,
-                                real muK) {
-    (void)muS;
-
+                                const Vec3 &n, const Vec3 &t1, const Vec3 &t2,
+                                Contact::Pt &pt, real muS, real muK) {
     const bool sA = A.isStatic, sB = B.isStatic;
     if (sA && sB)
       return;
-
-    const Vec3 rA = p - A.pos;
-    const Vec3 rB = p - B.pos;
+    const Vec3 rA = p - A.pos, rB = p - B.pos;
     const Vec3 zero(0, 0, 0);
-    const Vec3 vA = sA ? zero : A.vel + A.angVel.cross(rA);
-    const Vec3 vB = sB ? zero : B.vel + B.angVel.cross(rB);
-    const Vec3 vRel = vA - vB;
-    const real vn = vRel.dot(n);
+    auto relVel = [&](const Vec3 &d) {
+      const Vec3 vA = sA ? zero : A.pointVelocity(p);
+      const Vec3 vB = sB ? zero : B.pointVelocity(p);
+      return (vA - vB).dot(d);
+    };
+    auto kEff = [&](const Vec3 &d) {
+      real k = 0;
+      if (!sA)
+        k += 1.0 / A.mass + d.dot(A.applyInvInertia(rA.cross(d)).cross(rA));
+      if (!sB)
+        k += 1.0 / B.mass + d.dot(B.applyInvInertia(rB.cross(d)).cross(rB));
+      return k;
+    };
+    auto applyJ = [&](const Vec3 &J) {
+      if (!sA) {
+        A.vel = A.vel + J * (1.0 / A.mass);
+        A.angVel = A.angVel + A.applyInvInertia(rA.cross(J));
+      }
+      if (!sB) {
+        B.vel = B.vel - J * (1.0 / B.mass);
+        B.angVel = B.angVel - B.applyInvInertia(rB.cross(J));
+      }
+    };
 
-    // Wake se urto significativo
-    if (vn < -0.05) {
-      if (!sA && A.asleep)
-        A.wake();
-      if (!sB && B.asleep)
-        B.wake();
-    }
-
-    const Vec3 wA = sA ? zero : A.applyInvInertia(rA.cross(n));
-    const Vec3 wB = sB ? zero : B.applyInvInertia(rB.cross(n));
-    const real kA = sA ? 0.0 : (1.0 / A.mass) + n.dot(wA.cross(rA));
-    const real kB = sB ? 0.0 : (1.0 / B.mass) + n.dot(wB.cross(rB));
-    const real K = kA + kB;
-    if (K < 1e-12)
+    const real Kn = kEff(n);
+    if (Kn < 1e-12)
       return;
+    real lam = (pt.bounce - relVel(n)) / Kn;
+    const real nj = std::max(pt.jn + lam, 0.0);
+    lam = nj - pt.jn;
+    pt.jn = nj;
+    applyJ(n * lam);
 
-    real e = restitution;
-    if (vn > -0.5)
-      e = 0.0;
-    real jn = -(1.0 + e) * vn / K;
-    if (jn < 0.0)
-      jn = 0.0;
-
-    const Vec3 J = n * jn;
-    if (!sA) {
-      A.vel = A.vel + J * (1.0 / A.mass);
-      A.angVel = A.angVel + A.applyInvInertia(rA.cross(J));
+    real *accT[2] = {&pt.jt1, &pt.jt2};
+    const Vec3 *dirT[2] = {&t1, &t2};
+    for (int a = 0; a < 2; ++a) {
+      const real Kt = kEff(*dirT[a]);
+      if (Kt < 1e-12)
+        continue;
+      real nt = *accT[a] - relVel(*dirT[a]) / Kt;
+      if (std::abs(nt) > muS * pt.jn)
+        nt = std::copysign(muK * pt.jn, nt);
+      const real l = nt - *accT[a];
+      *accT[a] = nt;
+      applyJ(*dirT[a] * l);
     }
-    if (!sB) {
-      B.vel = B.vel - J * (1.0 / B.mass);
-      B.angVel = B.angVel - B.applyInvInertia(rB.cross(J));
-    }
 
-    const Vec3 vA2 = sA ? zero : A.vel + A.angVel.cross(rA);
-    const Vec3 vB2 = sB ? zero : B.vel + B.angVel.cross(rB);
-    const Vec3 vRel2 = vA2 - vB2;
-    Vec3 vT = vRel2 - n * vRel2.dot(n);
-    const real vt = vT.norm();
-    if (vt < 1e-6)
-      return;
-    const Vec3 t = vT * (1.0 / vt);
-
-    const Vec3 wtA = sA ? zero : A.applyInvInertia(rA.cross(t));
-    const Vec3 wtB = sB ? zero : B.applyInvInertia(rB.cross(t));
-    const real ktA = sA ? 0.0 : (1.0 / A.mass) + t.dot(wtA.cross(rA));
-    const real ktB = sB ? 0.0 : (1.0 / B.mass) + t.dot(wtB.cross(rB));
-    const real Kt = ktA + ktB;
-    if (Kt < 1e-12)
-      return;
-
-    real jt = -vt / Kt;
-    const real jMax = muK * jn;
-    jt = std::clamp(jt, -jMax, jMax);
-    const Vec3 Jt = t * jt;
-    if (!sA) {
-      A.vel = A.vel + Jt * (1.0 / A.mass);
-      A.angVel = A.angVel + A.applyInvInertia(rA.cross(Jt));
-    }
-    if (!sB) {
-      B.vel = B.vel - Jt * (1.0 / B.mass);
-      B.angVel = B.angVel - B.applyInvInertia(rB.cross(Jt));
+    const Vec3 w = (sA ? zero : A.angVel) - (sB ? zero : B.angVel);
+    const real kRot = (sA ? 0.0 : n.dot(A.applyInvInertia(n))) +
+                      (sB ? 0.0 : n.dot(B.applyInvInertia(n)));
+    if (kRot > 1e-12) {
+      const real lim = muK * pt.jn * 0.05;
+      const real l = std::clamp(-w.dot(n) / kRot, -lim, lim);
+      if (!sA)
+        A.angVel = A.angVel + A.applyInvInertia(n * l);
+      if (!sB)
+        B.angVel = B.angVel - B.applyInvInertia(n * l);
     }
   }
 
@@ -1966,6 +1989,7 @@ public:
           c.manifold = continuum::RigidSolidElement::buildManifold(A, B);
           if (c.manifold.count == 0)
             continue;
+          prepareContact(A, B, c);
           contacts.push_back(c);
         }
       }
@@ -1976,10 +2000,9 @@ public:
           auto &B = solids[c.j];
           const real muS = contact::combineFriction(A.mu_s, B.mu_s);
           const real muK = contact::combineFriction(A.mu_k, B.mu_k);
-          const real e = std::min(A.restitution, B.restitution);
           for (int k = 0; k < c.manifold.count; ++k)
-            solveContactPoint(A, B, c.manifold.points[k], c.normal, e, muS,
-                              muK);
+            solveContactPoint(A, B, c.manifold.points[k], c.normal, c.t1, c.t2,
+                              c.pt[k], muS, muK);
         }
       }
 

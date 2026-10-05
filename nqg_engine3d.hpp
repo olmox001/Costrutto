@@ -523,7 +523,7 @@ inline Rgb blackbody(real T) {
 // ===================================================== capacita' osservatore
 struct ObserverCapacity {
   real fs = 30;
-  real Bs = 4e8;
+  real Bs = 1e9;
   int width = 1280, height = 720;
   real Cops = 5e10;
   real memBytes = 64e6;

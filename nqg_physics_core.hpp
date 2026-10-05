@@ -1351,6 +1351,10 @@ public:
   real smagorinsky = 0.16;
   real speedLimit = 30.0;
   int maxSubsteps = 24;
+  real absorbRate = 4.0e-4;
+  real volumeBudget = 60.0;
+  std::size_t maxTiles = 4096;
+  real absorbedVolume = 0.0;
   real lastMaxWave = 1.0, lastMaxDepth = 0.0;
   bool hasWet = false;
   real bxMin = 0, bxMax = 0, byMin = 0, byMax = 0, bzMin = 0, bzMax = 0;
@@ -1459,11 +1463,71 @@ public:
         c->h = depth;
         markWet(i, j, depth);
       }
+    updateBounds();
+  }
+
+  // Riempie [xa,xb]x[ya,yb] con un VOLUME (m^3): bisezione sulla quota di
+  // superficie libera eta tale che sum max(0, eta - b) * dx^2 = volume.
+  void fillVolume(real xa, real xb, real ya, real yb, real volume) {
+    if (!(volume > 0.0) || !std::isfinite(volume))
+      return;
+    volume = std::min(volume, std::max(0.0, volumeBudget - totalVolume()));
+    if (volume <= 0.0)
+      return;
+    const int i0 = cellIndexX(xa), i1 = cellIndexX(xb);
+    const int j0 = cellIndexY(ya), j1 = cellIndexY(yb);
+    for (int tj = std::max(0, j0 >> SH); tj <= (j1 >> SH); ++tj)
+      for (int ti = std::max(0, i0 >> SH); ti <= (i1 >> SH); ++ti)
+        ensureTile(ti, tj);
+    std::vector<Cell *> sel;
+    std::vector<std::pair<int, int>> idx;
+    real bMin = 1e30, bMax = -1e30;
+    for (int j = j0; j <= j1; ++j)
+      for (int i = i0; i <= i1; ++i) {
+        Cell *c = at(i, j);
+        if (!c || c->solid)
+          continue;
+        sel.push_back(c);
+        idx.emplace_back(i, j);
+        bMin = std::min(bMin, c->b);
+        bMax = std::max(bMax, c->b);
+      }
+    if (sel.empty())
+      return;
+    const real cellA = dx * dx;
+    auto volumeAt = [&](real eta) {
+      real v = 0;
+      for (const Cell *c : sel)
+        if (eta > c->b)
+          v += eta - c->b;
+      return v * cellA;
+    };
+    real lo = bMin, hi = bMax + volume / (real(sel.size()) * cellA) + 1e-3;
+    for (int it = 0; it < 64; ++it) {
+      const real mid = 0.5 * (lo + hi);
+      if (volumeAt(mid) < volume)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    const real eta = hi;
+    for (std::size_t q = 0; q < sel.size(); ++q) {
+      const real h = std::max(0.0, eta - sel[q]->b);
+      sel[q]->h = h;
+      if (h > 0.0)
+        markWet(idx[q].first, idx[q].second, h);
+    }
+    updateBounds();
   }
 
   void addVolume(real x, real y, real radius, real volume) {
     if (!(volume != 0.0) || !std::isfinite(volume))
       return;
+    if (volume > 0.0) {
+      volume = std::min(volume, volumeBudget - totalVolume());
+      if (volume <= 0.0)
+        return;
+    }
     const int ic = cellIndexX(x), jc = cellIndexY(y);
     const int rc = int(std::ceil(radius / dx)) + 1;
     std::vector<Cell *> sel;
@@ -1489,10 +1553,16 @@ public:
     }
   }
 
-  void addVolumeRing(real cx, real cy, real hx, real hy, bool circular,
+  // Ritorna il volume realmente applicato alle celle (con segno).
+  real addVolumeRing(real cx, real cy, real hx, real hy, bool circular,
                      real margin, real volume) {
     if (!(volume != 0.0) || !std::isfinite(volume))
-      return;
+      return 0.0;
+    if (volume > 0.0) {
+      volume = std::min(volume, volumeBudget - totalVolume());
+      if (volume <= 0.0)
+        return 0.0;
+    }
     const real ox = hx + margin, oy = hy + margin;
     const int i0 = cellIndexX(cx - ox), i1 = cellIndexX(cx + ox);
     const int j0 = cellIndexY(cy - oy), j1 = cellIndexY(cy + oy);
@@ -1517,10 +1587,15 @@ public:
         sel.push_back(c);
       }
     if (sel.empty())
-      return;
+      return 0.0;
     const real dh = volume / (real(sel.size()) * dx * dx);
-    for (Cell *c : sel)
+    real applied = 0.0;
+    for (Cell *c : sel) {
+      const real h0 = c->h;
       c->h = std::max(0.0, c->h + std::max(dh, -0.5 * c->h));
+      applied += c->h - h0;
+    }
+    return applied * dx * dx;
   }
 
   void addMomentum(real x, real y, real radius, real px, real py) {
@@ -1632,10 +1707,17 @@ public:
       substep(dt);
       t += dt;
     }
+    if (++pruneCounter >= 30) {
+      pruneCounter = 0;
+      compact();
+    }
     updateBounds();
   }
 
+  real filmMin() const { return 0.5 * puddleThickness(liquid, gravity); }
+
 private:
+  int pruneCounter = 0;
   std::deque<Tile> tiles;
   std::vector<Tile *> dir;
   std::vector<Tile *> run;
@@ -1660,6 +1742,11 @@ private:
     smagorinsky = o.smagorinsky;
     speedLimit = o.speedLimit;
     maxSubsteps = o.maxSubsteps;
+    absorbRate = o.absorbRate;
+    volumeBudget = o.volumeBudget;
+    maxTiles = o.maxTiles;
+    absorbedVolume = o.absorbedVolume;
+    pruneCounter = 0;
     lastMaxWave = o.lastMaxWave;
     lastMaxDepth = o.lastMaxDepth;
     hasWet = o.hasWet;
@@ -1730,13 +1817,60 @@ private:
   }
 
   void growHalo() {
-    for (std::size_t k = 0; k < tiles.size(); ++k) {
+    if (tiles.size() >= maxTiles)
+      return;
+    const std::size_t n0 = tiles.size();
+    for (std::size_t k = 0; k < n0; ++k) {
       if (!tiles[k].wet)
         continue;
       const int ti = tiles[k].ti, tj = tiles[k].tj;
-      for (int dj = -1; dj <= 1; ++dj)
-        for (int di = -1; di <= 1; ++di)
-          ensureTile(ti + di, tj + dj);
+      bool W = false, E = false, S = false, N = false;
+      for (int q = 0; q < T; ++q) {
+        W = W || tiles[k].c[std::size_t(q) * T].h > hDry;
+        E = E || tiles[k].c[std::size_t(q) * T + T - 1].h > hDry;
+        S = S || tiles[k].c[std::size_t(q)].h > hDry;
+        N = N || tiles[k].c[std::size_t(T - 1) * T + q].h > hDry;
+      }
+      if (W)
+        ensureTile(ti - 1, tj);
+      if (E)
+        ensureTile(ti + 1, tj);
+      if (S)
+        ensureTile(ti, tj - 1);
+      if (N)
+        ensureTile(ti, tj + 1);
+      if (W && S)
+        ensureTile(ti - 1, tj - 1);
+      if (E && S)
+        ensureTile(ti + 1, tj - 1);
+      if (W && N)
+        ensureTile(ti - 1, tj + 1);
+      if (E && N)
+        ensureTile(ti + 1, tj + 1);
+    }
+  }
+
+  void compact() {
+    std::deque<Tile> keep;
+    bool dropped = false;
+    for (Tile &t : tiles) {
+      if (t.wet || t.run) {
+        keep.push_back(std::move(t));
+        continue;
+      }
+      dropped = true;
+      for (const Cell &c : t.c)
+        if (!c.solid)
+          absorbedVolume += c.h * dx * dx;
+    }
+    if (!dropped)
+      return;
+    tiles.swap(keep);
+    run.clear();
+    dir.assign(std::size_t(TX) * TY, nullptr);
+    for (Tile &t : tiles) {
+      t.run = false;
+      dir[std::size_t(t.tj) * TX + t.ti] = &t;
     }
   }
 
@@ -2052,6 +2186,20 @@ private:
       c.h -= dt / dx * ((fxe - c.fx) + (fyn - c.fy));
       if (c.h < 1e-9 || c.solid)
         c.h = 0;
+    });
+
+    const real fm = filmMin();
+    const real dAbs = absorbRate * dt;
+    each([&](int, int, Cell &c) {
+      if (c.solid || c.h <= 0.0 || c.h >= fm)
+        return;
+      const real d = std::min(c.h, dAbs);
+      c.h -= d;
+      absorbedVolume += d * dx * dx;
+      if (c.h < hDry) {
+        absorbedVolume += c.h * dx * dx;
+        c.h = 0.0;
+      }
     });
 
     updateFlags();

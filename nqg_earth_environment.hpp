@@ -747,6 +747,97 @@ public:
   }
 };
 
+
+class GlobeResolver {
+public:
+  Vec3 pos = Vec3(0, 0, 1.7);
+  Vec3 up = Vec3(0, 0, 1);
+  Vec3 fwd = Vec3(0, 1, 0);
+  real traveled = 0.0;
+  long turns = 0;
+
+  static Vec3 center() { return Vec3(0, 0, -planet::R_E); }
+  static real closureAngle() { return 2.0 * PI_E; }
+  static real closureArc() { return closureAngle() * planet::R_E; }
+
+  Vec3 right() const { return fwd.cross(up); }
+  real altitude() const { return (pos - center()).norm() - planet::R_E; }
+  real revolutionFraction() const { return traveled / closureAngle(); }
+
+  static Vec3 rodrigues(const Vec3 &v, const Vec3 &k, real a) {
+    const real c = std::cos(a), s = std::sin(a);
+    return v * c + k.cross(v) * s + k * (k.dot(v) * (1.0 - c));
+  }
+
+  void turn(real dYaw) { fwd = (fwd * std::cos(dYaw) + right() * std::sin(dYaw)); orthonormalize(); }
+
+  void walk(const Vec3 &tangent, real dAlt) {
+    const Vec3 r = pos - center();
+    const real rho = r.norm();
+    const Vec3 d = tangent - up * tangent.dot(up);
+    const real dist = d.norm();
+    Vec3 u1 = up;
+    if (dist > 1e-12) {
+      const real a = dist / rho;
+      const Vec3 dh = d * (1.0 / dist);
+      u1 = up * std::cos(a) + dh * std::sin(a);
+      fwd = rodrigues(fwd, up.cross(dh), a);
+      advance(a);
+    }
+    up = u1;
+    pos = center() + u1 * (rho + dAlt);
+    orthonormalize();
+  }
+
+  void setPosition(const Vec3 &p) {
+    const Vec3 r = p - center();
+    const real rho = r.norm();
+    if (rho < 1e-9) {
+      pos = p;
+      return;
+    }
+    const Vec3 u1 = r * (1.0 / rho);
+    const Vec3 k = up.cross(u1);
+    const real sn = k.norm();
+    if (sn > 1e-15) {
+      const real a = std::atan2(sn, std::clamp(up.dot(u1), -1.0, 1.0));
+      fwd = rodrigues(fwd, k * (1.0 / sn), a);
+      advance(a);
+    }
+    up = u1;
+    pos = p;
+    orthonormalize();
+    snapClosure();
+  }
+
+private:
+  void advance(real a) {
+    traveled += a;
+    while (traveled >= closureAngle()) {
+      traveled -= closureAngle();
+      ++turns;
+    }
+  }
+
+  void orthonormalize() {
+    up = up.normalized();
+    Vec3 f = fwd - up * fwd.dot(up);
+    if (f.norm2() < 1e-18)
+      f = std::abs(up.x) < 0.9 ? Vec3(1, 0, 0).cross(up) : Vec3(0, 1, 0).cross(up);
+    fwd = f.normalized();
+  }
+
+  void snapClosure() {
+    const Vec3 home(0, 0, 1);
+    if (turns > 0 && std::acos(std::clamp(up.dot(home), -1.0, 1.0)) < 1e-7 &&
+        traveled < 1e-6) {
+      pos = center() + home * (pos - center()).norm();
+      up = home;
+      orthonormalize();
+    }
+  }
+};
+
 } // namespace earth
 } // namespace nqg
 

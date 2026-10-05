@@ -423,7 +423,8 @@ int main(int argc, char *argv[]) {
   playerBody.eyeHeight = 1.70;
 
   Vec3 camPos(0, -3.0, playerBody.eyeHeight);
-  real camYaw = 0.0;
+  earth::GlobeResolver globe;
+  globe.setPosition(camPos);
   real camPitch = -0.05;
   bool zeroGravity = false;
 
@@ -458,25 +459,26 @@ int main(int argc, char *argv[]) {
     auto &im = app.input();
 
     if (im.isMouseLeftDown()) {
-      camYaw += im.mouseDeltaX() * 0.0035;
+      globe.turn(im.mouseDeltaX() * 0.0035);
       camPitch -= im.mouseDeltaY() * 0.0035;
-      camPitch = std::clamp(camPitch, -1.4, 1.4);
     }
     if (im.isKeyDown(SDL_SCANCODE_LEFT))
-      camYaw -= 1.6 * dt;
+      globe.turn(-1.6 * dt);
     if (im.isKeyDown(SDL_SCANCODE_RIGHT))
-      camYaw += 1.6 * dt;
+      globe.turn(1.6 * dt);
     if (im.isKeyDown(SDL_SCANCODE_UP))
-      camPitch = std::clamp(camPitch + 1.2 * dt, -1.4, 1.4);
+      camPitch += 1.2 * dt;
     if (im.isKeyDown(SDL_SCANCODE_DOWN))
-      camPitch = std::clamp(camPitch - 1.2 * dt, -1.4, 1.4);
+      camPitch -= 1.2 * dt;
 
-    Vec3 forward(std::sin(camYaw), std::cos(camYaw), 0);
-    Vec3 right(std::cos(camYaw), -std::sin(camYaw), 0);
-    Vec3 lookDir(std::sin(camYaw) * std::cos(camPitch),
-                 std::cos(camYaw) * std::cos(camPitch), std::sin(camPitch));
+    const Vec3 up = globe.up;
+    const Vec3 forward = globe.fwd;
+    const Vec3 right = globe.right();
+    const Vec3 lookDir = forward * std::cos(camPitch) + up * std::sin(camPitch);
+    const Vec3 viewUp = up * std::cos(camPitch) - forward * std::sin(camPitch);
 
-    real altitudeFactor = std::sqrt(1.0 + std::max(0.0, camPos.z) / 10.0);
+    real altitudeFactor =
+        std::sqrt(1.0 + std::max(0.0, globe.altitude()) / 10.0);
     real shiftMult =
         (im.isKeyDown(SDL_SCANCODE_LSHIFT) || im.isKeyDown(SDL_SCANCODE_RSHIFT))
             ? SHIFT_BOOST
@@ -503,7 +505,7 @@ int main(int argc, char *argv[]) {
             app.audio()->triggerTransient(freefallMode ? 220.0f : 660.0f, 0.5f,
                                           45.0f);
         } else {
-          camVel.z = JUMP_IMPULSE;
+          camVel = camVel + up * (JUMP_IMPULSE - camVel.dot(up));
           lastTapTime = controlTime;
           if (app.audio())
             app.audio()->triggerTransient(440.0f, 0.35f, 22.0f);
@@ -513,17 +515,14 @@ int main(int argc, char *argv[]) {
     spaceWasDown = spaceDown;
 
     Vec3 oldPos = camPos;
+    Vec3 disp(0, 0, 0);
     if (freefallMode) {
       Vec3 acc(0, 0, 0);
       if (!zeroGravity)
-        acc.z -= scene.currentGravity;
-
-      const real rho = scene.currentDensity;
-      const Vec3 relVel = camVel - scene.currentWind;
-      acc = acc - relVel * (rho * 0.4);
+        acc = acc - up * scene.currentGravity;
+      acc = acc - (camVel - scene.currentWind) * (scene.currentDensity * 0.4);
       if (spaceHeldLongEnough)
-        acc.z += thrustScaled;
-
+        acc = acc + up * thrustScaled;
       const real airCtrl = 3.0 * altitudeFactor;
       if (im.isKeyDown(SDL_SCANCODE_W))
         acc = acc + forward * airCtrl;
@@ -533,45 +532,47 @@ int main(int argc, char *argv[]) {
         acc = acc - right * airCtrl;
       if (im.isKeyDown(SDL_SCANCODE_D))
         acc = acc + right * airCtrl;
-
       camVel = camVel + acc * dt;
-      camPos = camPos + camVel * dt;
+      disp = camVel * dt;
     } else {
+      Vec3 wish(0, 0, 0);
       if (im.isKeyDown(SDL_SCANCODE_W))
-        camPos = camPos + forward * (moveSpeed * dt);
+        wish = wish + forward;
       if (im.isKeyDown(SDL_SCANCODE_S))
-        camPos = camPos - forward * (moveSpeed * dt);
+        wish = wish - forward;
       if (im.isKeyDown(SDL_SCANCODE_A))
-        camPos = camPos - right * (moveSpeed * dt);
+        wish = wish - right;
       if (im.isKeyDown(SDL_SCANCODE_D))
-        camPos = camPos + right * (moveSpeed * dt);
-
+        wish = wish + right;
+      real vUp = camVel.dot(up);
       if (spaceHeldLongEnough)
-        camVel.z = std::max(camVel.z, flySpeed);
-      else if (!zeroGravity && camPos.z > playerBody.eyeHeight)
-        camVel.z -= scene.currentGravity * dt;
-
+        vUp = std::max(vUp, flySpeed);
+      else if (!zeroGravity && globe.altitude() > playerBody.eyeHeight + 1e-3)
+        vUp -= scene.currentGravity * dt;
       if (im.isKeyDown(SDL_SCANCODE_C)) {
-        camPos.z = std::max(playerBody.eyeHeight, camPos.z - moveSpeed * dt);
-        camVel.z = 0;
+        vUp = 0;
+        disp = up * (-moveSpeed * dt);
       } else {
-        camPos.z += camVel.z * dt;
+        disp = up * (vUp * dt);
       }
+      disp = disp + wish * (moveSpeed * dt);
+      camVel = up * vUp;
     }
 
-    Vec3 delta = camPos - oldPos;
-    real moveLen = delta.norm();
+    const real moveLen = disp.norm();
     int nSub = 1;
-    if (std::isfinite(moveLen) && moveLen > COLLISION_STEP) {
+    if (std::isfinite(moveLen) && moveLen > COLLISION_STEP &&
+        camPos.norm2() < 300.0 * 300.0)
       nSub = std::clamp(int(std::ceil(moveLen / COLLISION_STEP)), 1, 256);
-    }
-
-    camPos = oldPos;
-    Vec3 subDelta = delta * (1.0 / real(nSub));
+    const Vec3 subDelta = disp * (1.0 / real(nSub));
     for (int i = 0; i < nSub; ++i) {
-      camPos = camPos + subDelta;
+      const real dUp = subDelta.dot(globe.up);
+      globe.walk(subDelta - globe.up * dUp, dUp);
+      camPos = globe.pos;
       scene.resolvePlayerCollision(camPos, camVel, playerBody);
+      globe.setPosition(camPos);
     }
+    camPos = globe.pos;
 
     real actualMove = (camPos - oldPos).norm();
     real actualSpeed = actualMove / std::max(0.001, dt);
@@ -642,7 +643,7 @@ int main(int argc, char *argv[]) {
     real windMag = scene.currentWind.norm();
     app.updateAudio(dt, 1.0, 0.0, windMag > 0.5 ? windMag * 0.15 : 0.0, 0.0);
 
-    Image frame = scene.render(renderW, renderH, camPos, camYaw, camPitch);
+    Image frame = scene.renderView(renderW, renderH, camPos, lookDir, viewUp);
     app.renderFrame(frame);
 
     SDL_Renderer *ren = app.renderer();
@@ -663,14 +664,15 @@ int main(int argc, char *argv[]) {
       SDL_RenderDebugTextFormat(ren, 30, 48, "Pos: %.2f, %.2f, %.2f", camPos.x,
                                 camPos.y, camPos.z);
       SDL_RenderDebugTextFormat(ren, 30, 66, "Piedi/Testa: %.2f / %.2f m",
-                                playerBody.footZ(camPos.z),
-                                playerBody.headZ(camPos.z));
+                                playerBody.footZ(globe.altitude()),
+                                playerBody.headZ(globe.altitude()));
       SDL_RenderDebugTextFormat(
           ren, 30, 84, "In stanza: %s | In spillway: %s",
           scene.room.insideXY(camPos) ? "SI" : "NO",
           scene.water.isInsideSpillway(camPos.x, camPos.y) ? "SI" : "NO");
-      SDL_RenderDebugTextFormat(ren, 30, 102, "Altitudine: %.1f m",
-                                scene.currentAltitude);
+      SDL_RenderDebugTextFormat(ren, 30, 102, "Alt: %.1f m | giro: %.5f (n=%ld)",
+                                scene.currentAltitude,
+                                globe.revolutionFraction(), globe.turns);
       SDL_RenderDebugTextFormat(ren, 30, 120, "Gravita': %.4f m/s^2",
                                 zeroGravity ? 0.0 : scene.currentGravity);
       SDL_RenderDebugTextFormat(ren, 30, 138, "Pressione: %.0f Pa",
