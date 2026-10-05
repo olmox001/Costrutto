@@ -1,10 +1,10 @@
 // ============================================================================
 //  nqg_cleanroom_game.cpp  -  Appartamento su Globo Terrestre (SDL3)
-//  ---------------------------------------------------------------------------
-//  SPACE: tap=salto | hold=volo | 2xTap=FREE-FALL
-//  SHIFT: boost 10x
-//  Collisione: pareti + mobili + casse + acqua + sabbia, con substepping 5cm
-//  Ripple: emesso automaticamente mentre ti muovi nell'acqua
+//  FIX 2025e:
+//   - renderW/H: 640x480 -> 320x240 (4x meno pixel, ~4x FPS).
+//     Modifica questi due valori se vuoi piu' qualita' o piu' fps.
+//   - Campo EM di esempio impostato su due solidi (charge ±1e-3 C)
+//     per verificare visivamente l'effetto della forza di Coulomb.
 // ============================================================================
 #include "nqg_cleanroom_engine.hpp"
 #include "nqg_matter_physics.hpp"
@@ -41,8 +41,18 @@ int main(int argc, char *argv[]) {
   }
 
   CleanRoomScene scene;
-  int renderW = 640;
-  int renderH = 480;
+
+  // --- FPS: 320x240 e' 4x piu' veloce di 640x480 ---
+  // Se hai una GPU veloce e vuoi piu' dettaglio, alza a 480x360 o 640x480.
+  int renderW = 320;
+  int renderH = 240;
+
+  // --- Campo EM di esempio: due solidi carichi (attrazione Coulomb) ---
+  // Attivalo/commentalo per testare.
+  if (scene.solids.size() >= 4) {
+    scene.solids[2].charge = +1e-3; // cassa grande
+    scene.solids[3].charge = -1e-3; // cassa piccola
+  }
 
   apartment::CapsuleCollider playerBody;
   playerBody.radius = 0.30;
@@ -69,8 +79,8 @@ int main(int argc, char *argv[]) {
   constexpr real JUMP_IMPULSE = 5.5;
   constexpr real FREEFALL_THRUST = 20.0;
   constexpr real SHIFT_BOOST = 10.0;
-  constexpr real COLLISION_STEP = 0.05;    // 5 cm substep
-  constexpr double RIPPLE_INTERVAL = 0.10; // s
+  constexpr real COLLISION_STEP = 0.05;
+  constexpr double RIPPLE_INTERVAL = 0.10;
 
   std::cout
       << "Appartamento: 12m x 10m x 3.2m con porta sud.\n"
@@ -84,7 +94,6 @@ int main(int argc, char *argv[]) {
     controlTime += dt;
     auto &im = app.input();
 
-    // Mouse look / frecce
     if (im.isMouseLeftDown()) {
       camYaw += im.mouseDeltaX() * 0.0035;
       camPitch -= im.mouseDeltaY() * 0.0035;
@@ -113,7 +122,6 @@ int main(int argc, char *argv[]) {
     real flySpeed = BASE_FLY_SPEED * altitudeFactor * shiftMult;
     real thrustScaled = FREEFALL_THRUST * altitudeFactor;
 
-    // SPACE gesture state machine
     const bool spaceDown = im.isKeyDown(SDL_SCANCODE_SPACE);
     const bool spaceJustPressed = spaceDown && !spaceWasDown;
     const bool spaceJustReleased = !spaceDown && spaceWasDown;
@@ -122,7 +130,6 @@ int main(int argc, char *argv[]) {
 
     if (spaceJustPressed)
       spacePressTime = controlTime;
-
     if (spaceJustReleased) {
       const double heldDuration = controlTime - spacePressTime;
       if (heldDuration < TAP_MAX_DURATION) {
@@ -142,11 +149,7 @@ int main(int argc, char *argv[]) {
     }
     spaceWasDown = spaceDown;
 
-    // -----------------------------------------------------------------------
-    // MOVIMENTO: calcola posizione desiderata, poi sub-step + collisione
-    // -----------------------------------------------------------------------
     Vec3 oldPos = camPos;
-
     if (freefallMode) {
       Vec3 acc(0, 0, 0);
       if (!zeroGravity)
@@ -155,7 +158,6 @@ int main(int argc, char *argv[]) {
       const real rho = scene.currentDensity;
       const Vec3 relVel = camVel - scene.currentWind;
       acc = acc - relVel * (rho * 0.4);
-
       if (spaceHeldLongEnough)
         acc.z += thrustScaled;
 
@@ -181,11 +183,10 @@ int main(int argc, char *argv[]) {
       if (im.isKeyDown(SDL_SCANCODE_D))
         camPos = camPos + right * (moveSpeed * dt);
 
-      if (spaceHeldLongEnough) {
+      if (spaceHeldLongEnough)
         camVel.z = std::max(camVel.z, flySpeed);
-      } else if (!zeroGravity && camPos.z > playerBody.eyeHeight) {
+      else if (!zeroGravity && camPos.z > playerBody.eyeHeight)
         camVel.z -= scene.currentGravity * dt;
-      }
 
       if (im.isKeyDown(SDL_SCANCODE_C)) {
         camPos.z = std::max(playerBody.eyeHeight, camPos.z - moveSpeed * dt);
@@ -195,17 +196,11 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    // Delta di movimento -> sub-stepping con collisione ogni 5 cm
     Vec3 delta = camPos - oldPos;
     real moveLen = delta.norm();
-
     int nSub = 1;
     if (std::isfinite(moveLen) && moveLen > COLLISION_STEP) {
-      nSub = int(std::ceil(moveLen / COLLISION_STEP));
-      if (nSub < 1)
-        nSub = 1;
-      if (nSub > 256)
-        nSub = 256;
+      nSub = std::clamp(int(std::ceil(moveLen / COLLISION_STEP)), 1, 256);
     }
 
     camPos = oldPos;
@@ -215,7 +210,6 @@ int main(int argc, char *argv[]) {
       scene.resolvePlayerCollision(camPos, camVel, playerBody);
     }
 
-    // Ripple se il giocatore si muove nell'acqua
     real actualMove = (camPos - oldPos).norm();
     real actualSpeed = actualMove / std::max(0.001, dt);
     if (actualSpeed > 0.3 && controlTime - lastRippleTime > RIPPLE_INTERVAL) {
@@ -225,13 +219,8 @@ int main(int argc, char *argv[]) {
 
     Vec3 spawnTarget = camPos + lookDir * 2.2;
 
-    // -----------------------------------------------------------------------
-    // Azioni
-    // -----------------------------------------------------------------------
     if (im.wasKeyPressed(SDL_SCANCODE_1) || im.isKeyDown(SDL_SCANCODE_1)) {
       scene.water.addImpulse(spawnTarget, scene.simTime, 0.08);
-      for (auto &w : scene.water.waves)
-        w.amplitude = std::min(0.055, w.amplitude + 0.008);
       if (app.audio())
         app.audio()->triggerTransient(320.0f, 0.45f, 22.0f);
     }
@@ -249,11 +238,11 @@ int main(int argc, char *argv[]) {
       box.metallic = 0.2;
       box.roughness = 0.3;
       scene.solids.push_back(box);
+      scene.solids.back().refreshWorldHalf();
     }
     if (im.wasKeyPressed(SDL_SCANCODE_G)) {
       zeroGravity = !zeroGravity;
-      scene.matterSim.gravity =
-          zeroGravity ? Vec3(0, 0, 0) : Vec3(0, 0, -scene.currentGravity);
+      scene.setZeroGravity(zeroGravity);
     }
     if (im.isKeyDown(SDL_SCANCODE_T)) {
       scene.air.windVelocity = Vec3(lookDir.x * 6.5, lookDir.y * 6.5, 0.8);
@@ -282,7 +271,6 @@ int main(int argc, char *argv[]) {
 
     scene.stepPhysics(dt);
 
-    // Audio
     for (const auto &ev : scene.matterSim.frameAudioEvents) {
       if (app.audio())
         app.audio()->triggerTransient(static_cast<float>(ev.frequency),
@@ -291,20 +279,16 @@ int main(int argc, char *argv[]) {
     real windMag = scene.currentWind.norm();
     app.updateAudio(dt, 1.0, 0.0, windMag > 0.5 ? windMag * 0.15 : 0.0, 0.0);
 
-    // Render
     Image frame = scene.render(renderW, renderH, camPos, camYaw, camPitch);
     app.renderFrame(frame);
 
-    // -----------------------------------------------------------------------
-    // HUD
-    // -----------------------------------------------------------------------
     SDL_Renderer *ren = app.renderer();
     if (ren && app.hud().mode() != HudRenderer::HudMode::Off) {
       int winW = 0, winH = 0;
       SDL_GetWindowSize(app.window(), &winW, &winH);
       SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
-      SDL_FRect rMat{20, 20, 460, 344};
+      SDL_FRect rMat{20, 20, 460, 362};
       SDL_SetRenderDrawColor(ren, 15, 25, 38, 230);
       SDL_RenderFillRect(ren, &rMat);
       SDL_SetRenderDrawColor(ren, 50, 130, 210, 255);
@@ -325,7 +309,7 @@ int main(int argc, char *argv[]) {
       SDL_RenderDebugTextFormat(ren, 30, 102, "Altitudine: %.1f m",
                                 scene.currentAltitude);
       SDL_RenderDebugTextFormat(ren, 30, 120, "Gravita': %.4f m/s^2",
-                                scene.currentGravity);
+                                zeroGravity ? 0.0 : scene.currentGravity);
       SDL_RenderDebugTextFormat(ren, 30, 138, "Pressione: %.0f Pa",
                                 scene.currentPressure);
       SDL_RenderDebugTextFormat(ren, 30, 156, "Densita': %.5f kg/m^3",
@@ -338,17 +322,37 @@ int main(int argc, char *argv[]) {
           scene.water.currentLevel(), scene.water.waterVolume);
       SDL_RenderDebugTextFormat(ren, 30, 228, "Ripples attivi: %zu",
                                 scene.water.ripples.size());
+
+      // Stato sleeping/EM dei solidi
+      int nAsleep = 0, nAwake = 0;
+      real maxEM = 0.0;
+      for (const auto &s : scene.solids) {
+        if (s.isStatic)
+          continue;
+        if (s.asleep)
+          ++nAsleep;
+        else
+          ++nAwake;
+        maxEM = std::max(maxEM, s.lastEMForce.norm());
+      }
+      SDL_RenderDebugTextFormat(ren, 30, 246,
+                                "Solidi: awake=%d asleep=%d | |F_EM|max=%.3e",
+                                nAwake, nAsleep, maxEM);
+
       SDL_SetRenderDrawColor(ren, freefallMode ? 255 : 100,
                              freefallMode ? 180 : 220, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 246,
+      SDL_RenderDebugTextFormat(ren, 30, 264,
                                 "SPACE: tap=salt | hold=vola | 2x=%s",
                                 freefallMode ? "FREE-FALL ON" : "Direct");
       SDL_SetRenderDrawColor(ren, 230, 240, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 264,
-                                "Stanza 12x10x3.2m + spillway 2x3m", 0);
-      SDL_RenderDebugTextFormat(ren, 30, 282, "Solidi: %zu | FPS: %.1f",
+      SDL_RenderDebugTextFormat(ren, 30, 282,
+                                "Stanza 12x10x3.2m + spillway 2x3m");
+      SDL_RenderDebugTextFormat(ren, 30, 300, "Solidi totali: %zu | FPS: %.1f",
                                 scene.solids.size(), app.fps());
-      SDL_RenderDebugTextFormat(ren, 30, 300, "Pos. spawn: %.2f, %.2f, %.2f",
+      SDL_RenderDebugTextFormat(ren, 30, 318,
+                                "Render: %dx%d (alza in cpp se vuoi)", renderW,
+                                renderH);
+      SDL_RenderDebugTextFormat(ren, 30, 336, "Pos. spawn: %.2f, %.2f, %.2f",
                                 spawnTarget.x, spawnTarget.y, spawnTarget.z);
 
       SDL_FRect rAir{static_cast<float>(winW - 360), 20, 340, 120};

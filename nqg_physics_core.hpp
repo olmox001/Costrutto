@@ -46,6 +46,8 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -592,7 +594,8 @@ inline real dSdLambda(const std::vector<real> &p) { // = -Var_p(ln p) <= 0 [M]
 // SOLUZIONE CHIUSA nel dominio log: ln p_i(l) = e^{sign*l} ln p_i(0) - lnZ.
 // O(n), esatta.
 inline void flowLog(std::vector<real> &lnp, real lambda, int sign = +1) {
-  const real sc = std::exp(sign * lambda);
+  // FIX: clamp per evitare overflow di std::exp quando |lambda| e' grande.
+  const real sc = std::exp(std::clamp(sign * lambda, -700.0, 700.0));
   for (real &l : lnp)
     if (l > NEG_INF)
       l *= sc;
@@ -844,6 +847,855 @@ private:
   std::vector<real> lam_;
 };
 } // namespace hypothesis
+
+// ============================================================ contatto e
+// attrito
+namespace contact {
+inline real combineFriction(real a, real b) {
+  return std::sqrt(std::max(a, 0.0) * std::max(b, 0.0));
+}
+inline real coulombImpulse(real stick, real normal, real muS, real muK) {
+  stick = std::max(stick, 0.0);
+  normal = std::max(normal, 0.0);
+  return stick <= muS * normal ? stick : muK * normal;
+}
+inline real stokesNumber(real rhoBody, real speed, real length, real mu) {
+  return rhoBody * std::abs(speed) * length / (9.0 * std::max(mu, 1e-12));
+}
+inline real wetRestitution(real eDry, real St, real Stc = 10.0) {
+  if (St <= Stc)
+    return 0.0;
+  return eDry * (1.0 - Stc / St);
+}
+inline real wetFrictionCoefficient(real muDry, real film, real roughness,
+                                   real viscosity, real speed, real pressure,
+                                   real length) {
+  if (film <= 0.0 || speed <= 1e-9)
+    return muDry;
+  const real p = std::max(pressure, 1.0);
+  const real hHd = std::sqrt(viscosity * speed * std::max(length, 1e-6) / p);
+  const real lam = std::min(film, hHd) / std::max(roughness, 1e-9);
+  const real phi = 1.0 / (1.0 + std::pow(lam / 2.0, 4.0));
+  const real muHyd =
+      std::min(muDry, viscosity * speed / (std::max(hHd, 1e-9) * p));
+  return phi * muDry + (1.0 - phi) * muHyd;
+}
+inline real squeezeDiscCoefficient(real mu, real R, real h) {
+  return 1.5 * PI * mu * std::pow(R, 4.0) / std::pow(std::max(h, 1e-9), 3.0);
+}
+inline real squeezeSphereCoefficient(real mu, real R, real h) {
+  return 6.0 * PI * mu * R * R / std::max(h, 1e-9);
+}
+inline real rollingDeceleration(real crr, real g) { return crr * g; }
+} // namespace contact
+
+// ================================================================ fluidi
+namespace fluid {
+
+struct Liquid {
+  real rho = 998.2;
+  real mu = 1.002e-3;
+  real sigma = 0.0728;
+  real contactAngle = 0.4363323129985824;
+  real nu() const { return mu / rho; }
+};
+
+inline Liquid waterAtKelvin(real T) {
+  T = std::clamp(T, 273.16, 373.0);
+  const real t = T - 273.15;
+  Liquid L;
+  const real num = 999.83952 + 16.945176 * t - 7.9870401e-3 * t * t -
+                   46.170461e-6 * t * t * t + 105.56302e-9 * std::pow(t, 4.0) -
+                   280.54253e-12 * std::pow(t, 5.0);
+  L.rho = num / (1.0 + 16.897850e-3 * t);
+  L.mu = 2.414e-5 * std::pow(10.0, 247.8 / (T - 140.0));
+  const real tau = 1.0 - T / 647.096;
+  L.sigma = 0.2358 * std::pow(tau, 1.256) * (1.0 - 0.625 * tau);
+  return L;
+}
+
+inline real capillaryLength(const Liquid &L, real g) {
+  return std::sqrt(L.sigma / (L.rho * g));
+}
+inline real laplacePressure(real sigma, real r1, real r2) {
+  return sigma * (1.0 / r1 + 1.0 / r2);
+}
+inline real capillaryGravityOmega(const Liquid &L, real g, real k, real depth) {
+  return std::sqrt((g * k + L.sigma * k * k * k / L.rho) *
+                   std::tanh(k * depth));
+}
+inline real bondNumber(const Liquid &L, real g, real len) {
+  return L.rho * g * len * len / L.sigma;
+}
+inline real weberNumber(const Liquid &L, real v, real len) {
+  return L.rho * v * v * len / L.sigma;
+}
+inline real puddleThickness(const Liquid &L, real g) {
+  return 2.0 * capillaryLength(L, g) * std::sin(0.5 * L.contactAngle);
+}
+inline real contactLineThreshold(const Liquid &L) {
+  return L.sigma * (1.0 - std::cos(L.contactAngle));
+}
+inline real meniscusRise(const Liquid &L, real g, real wallAngle) {
+  return std::sqrt(2.0) * capillaryLength(L, g) *
+         std::sqrt(std::max(0.0, 1.0 - std::sin(wallAngle)));
+}
+inline real capillaryVerticalForce(const Liquid &L, real perimeter,
+                                   real bodyAngle) {
+  return -L.sigma * perimeter * std::cos(bodyAngle);
+}
+
+struct BedSample {
+  real z = 0;
+  real manning = 0.012;
+  bool solid = false;
+};
+
+class ShallowFlow {
+public:
+  static constexpr int T = 16;
+  static constexpr int SH = 4;
+  static constexpr real SOLID_Z = 1.0e3;
+
+  struct Cell {
+    real h = 0, b = 0, u = 0, v = 0, n = 0.012;
+    real tu = 0, tv = 0, fx = 0, fy = 0, s = 1, k = 0;
+    bool solid = false;
+  };
+  struct Tile {
+    std::array<Cell, T * T> c;
+    int ti = 0, tj = 0, mark = 0;
+    bool wet = false, run = false;
+  };
+  struct Sample {
+    bool wet = false;
+    real eta = 0, depth = 0, bed = 0, u = 0, v = 0;
+  };
+  using BedFn = std::function<BedSample(real, real)>;
+
+  real dx;
+  int TX, TY;
+  real x0, y0;
+  Liquid liquid;
+  BedFn bed;
+  real gravity = 9.80665;
+  real airDensity = 1.2;
+  real windX = 0, windY = 0;
+  real cfl = 0.45;
+  real hDry = 1e-5;
+  real hCap = 1e-3;
+  real visibleDepth = 1e-4;
+  real smagorinsky = 0.16;
+  real speedLimit = 30.0;
+  int maxSubsteps = 24;
+  real lastMaxWave = 1.0, lastMaxDepth = 0.0;
+  bool hasWet = false;
+  real bxMin = 0, bxMax = 0, byMin = 0, byMax = 0, bzMin = 0, bzMax = 0;
+
+  explicit ShallowFlow(real cell = 0.1, int tilesX = 128, int tilesY = 128,
+                       real cx = 0, real cy = 0)
+      : dx(cell), TX(tilesX), TY(tilesY) {
+    x0 = cx - 0.5 * TX * T * dx;
+    y0 = cy - 0.5 * TY * T * dx;
+    dir.assign(std::size_t(TX) * TY, nullptr);
+  }
+  ShallowFlow(const ShallowFlow &o) { copyFrom(o); }
+  ShallowFlow &operator=(const ShallowFlow &o) {
+    if (this != &o)
+      copyFrom(o);
+    return *this;
+  }
+
+  Tile *tileAt(int ti, int tj) const {
+    if (ti < 0 || tj < 0 || ti >= TX || tj >= TY)
+      return nullptr;
+    return dir[std::size_t(tj) * TX + ti];
+  }
+  Cell *at(int i, int j) {
+    if (i < 0 || j < 0)
+      return nullptr;
+    Tile *t = tileAt(i >> SH, j >> SH);
+    return t ? &t->c[std::size_t(j & (T - 1)) * T + (i & (T - 1))] : nullptr;
+  }
+  const Cell *at(int i, int j) const {
+    if (i < 0 || j < 0)
+      return nullptr;
+    Tile *t = tileAt(i >> SH, j >> SH);
+    return t ? &t->c[std::size_t(j & (T - 1)) * T + (i & (T - 1))] : nullptr;
+  }
+  int cellIndexX(real x) const { return int(std::floor((x - x0) / dx)); }
+  int cellIndexY(real y) const { return int(std::floor((y - y0) / dx)); }
+  real centerX(int i) const { return x0 + (i + 0.5) * dx; }
+  real centerY(int j) const { return y0 + (j + 0.5) * dx; }
+
+  BedSample bedSampleAt(real x, real y) const {
+    return bed ? bed(x, y) : BedSample();
+  }
+
+  Tile *ensureTile(int ti, int tj) {
+    if (ti < 0 || tj < 0 || ti >= TX || tj >= TY)
+      return nullptr;
+    Tile *&slot = dir[std::size_t(tj) * TX + ti];
+    if (slot)
+      return slot;
+    tiles.emplace_back();
+    slot = &tiles.back();
+    slot->ti = ti;
+    slot->tj = tj;
+    loadBed(*slot);
+    return slot;
+  }
+
+  void loadBed(Tile &t) {
+    for (int lj = 0; lj < T; ++lj)
+      for (int li = 0; li < T; ++li) {
+        Cell &c = t.c[std::size_t(lj) * T + li];
+        BedSample s =
+            bedSampleAt(centerX(t.ti * T + li), centerY(t.tj * T + lj));
+        c.solid = s.solid;
+        c.b = s.solid ? SOLID_Z : s.z;
+        c.n = s.manning;
+        if (c.solid) {
+          c.h = 0;
+          c.u = c.v = 0;
+        }
+      }
+  }
+
+  void refreshBed() {
+    for (Tile &t : tiles)
+      loadBed(t);
+  }
+
+  void clear() {
+    for (Tile &t : tiles) {
+      for (Cell &c : t.c) {
+        c.h = c.u = c.v = c.tu = c.tv = c.fx = c.fy = c.k = 0;
+        c.s = 1;
+      }
+      t.wet = false;
+      t.run = false;
+    }
+    run.clear();
+    hasWet = false;
+    lastMaxWave = 1.0;
+    lastMaxDepth = 0.0;
+  }
+
+  void fillRect(real xa, real xb, real ya, real yb, real depth) {
+    const int i0 = cellIndexX(xa), i1 = cellIndexX(xb);
+    const int j0 = cellIndexY(ya), j1 = cellIndexY(yb);
+    for (int tj = std::max(0, j0 >> SH); tj <= (j1 >> SH); ++tj)
+      for (int ti = std::max(0, i0 >> SH); ti <= (i1 >> SH); ++ti)
+        ensureTile(ti, tj);
+    for (int j = j0; j <= j1; ++j)
+      for (int i = i0; i <= i1; ++i) {
+        Cell *c = at(i, j);
+        if (!c || c->solid)
+          continue;
+        c->h = depth;
+        markWet(i, j, depth);
+      }
+  }
+
+  void addVolume(real x, real y, real radius, real volume) {
+    if (!(volume != 0.0) || !std::isfinite(volume))
+      return;
+    const int ic = cellIndexX(x), jc = cellIndexY(y);
+    const int rc = int(std::ceil(radius / dx)) + 1;
+    std::vector<Cell *> sel;
+    std::vector<std::pair<int, int>> idx;
+    for (int j = jc - rc; j <= jc + rc; ++j)
+      for (int i = ic - rc; i <= ic + rc; ++i) {
+        const real ddx = centerX(i) - x, ddy = centerY(j) - y;
+        if (ddx * ddx + ddy * ddy > radius * radius && !(i == ic && j == jc))
+          continue;
+        ensureTile(i >> SH, j >> SH);
+        Cell *c = at(i, j);
+        if (!c || c->solid)
+          continue;
+        sel.push_back(c);
+        idx.emplace_back(i, j);
+      }
+    if (sel.empty())
+      return;
+    const real dh = volume / (real(sel.size()) * dx * dx);
+    for (std::size_t q = 0; q < sel.size(); ++q) {
+      sel[q]->h = std::max(0.0, sel[q]->h + dh);
+      markWet(idx[q].first, idx[q].second, sel[q]->h);
+    }
+  }
+
+  void addVolumeRing(real cx, real cy, real hx, real hy, bool circular,
+                     real margin, real volume) {
+    if (!(volume != 0.0) || !std::isfinite(volume))
+      return;
+    const real ox = hx + margin, oy = hy + margin;
+    const int i0 = cellIndexX(cx - ox), i1 = cellIndexX(cx + ox);
+    const int j0 = cellIndexY(cy - oy), j1 = cellIndexY(cy + oy);
+    std::vector<Cell *> sel;
+    for (int j = j0; j <= j1; ++j)
+      for (int i = i0; i <= i1; ++i) {
+        const real ddx = centerX(i) - cx, ddy = centerY(j) - cy;
+        bool inner, outer;
+        if (circular) {
+          const real r2 = ddx * ddx + ddy * ddy;
+          inner = r2 <= hx * hx;
+          outer = r2 <= ox * ox;
+        } else {
+          inner = std::abs(ddx) <= hx && std::abs(ddy) <= hy;
+          outer = std::abs(ddx) <= ox && std::abs(ddy) <= oy;
+        }
+        if (inner || !outer)
+          continue;
+        Cell *c = at(i, j);
+        if (!c || c->solid || c->h <= hDry)
+          continue;
+        sel.push_back(c);
+      }
+    if (sel.empty())
+      return;
+    const real dh = volume / (real(sel.size()) * dx * dx);
+    for (Cell *c : sel)
+      c->h = std::max(0.0, c->h + std::max(dh, -0.5 * c->h));
+  }
+
+  void addMomentum(real x, real y, real radius, real px, real py) {
+    if (!std::isfinite(px) || !std::isfinite(py))
+      return;
+    const int ic = cellIndexX(x), jc = cellIndexY(y);
+    const int rc = int(std::ceil(radius / dx)) + 1;
+    std::vector<Cell *> sel;
+    real mass = 0;
+    for (int j = jc - rc; j <= jc + rc; ++j)
+      for (int i = ic - rc; i <= ic + rc; ++i) {
+        const real ddx = centerX(i) - x, ddy = centerY(j) - y;
+        if (ddx * ddx + ddy * ddy > radius * radius)
+          continue;
+        Cell *c = at(i, j);
+        if (!c || c->solid || c->h <= hDry)
+          continue;
+        sel.push_back(c);
+        mass += liquid.rho * c->h * dx * dx;
+      }
+    if (sel.empty() || mass < 1e-6)
+      return;
+    real du = px / mass, dv = py / mass;
+    const real mag = std::sqrt(du * du + dv * dv);
+    if (mag > 2.0) {
+      du *= 2.0 / mag;
+      dv *= 2.0 / mag;
+    }
+    for (Cell *c : sel) {
+      c->u += du;
+      c->v += dv;
+    }
+  }
+
+  Sample sample(real x, real y) const {
+    const real fi = (x - x0) / dx - 0.5, fj = (y - y0) / dx - 0.5;
+    const int i0 = int(std::floor(fi)), j0 = int(std::floor(fj));
+    const real fx = fi - i0, fy = fj - j0;
+    Sample s;
+    real w = 0, eta = 0, dep = 0, bd = 0, uu = 0, vv = 0;
+    for (int dj = 0; dj < 2; ++dj)
+      for (int di = 0; di < 2; ++di) {
+        const Cell *c = at(i0 + di, j0 + dj);
+        if (!c || c->solid || c->h <= visibleDepth)
+          continue;
+        const real wt = (di ? fx : 1 - fx) * (dj ? fy : 1 - fy);
+        const Cell *e = at(i0 + di + 1, j0 + dj);
+        const Cell *n = at(i0 + di, j0 + dj + 1);
+        const real cu = 0.5 * (c->u + (e ? e->u : c->u));
+        const real cv = 0.5 * (c->v + (n ? n->v : c->v));
+        w += wt;
+        eta += wt * (c->b + c->h);
+        dep += wt * c->h;
+        bd += wt * c->b;
+        uu += wt * cu;
+        vv += wt * cv;
+      }
+    if (w < 0.5)
+      return s;
+    s.wet = true;
+    s.eta = eta / w;
+    s.depth = dep / w;
+    s.bed = bd / w;
+    s.u = uu / w;
+    s.v = vv / w;
+    return s;
+  }
+
+  real depthAt(real x, real y) const {
+    const Cell *c = at(cellIndexX(x), cellIndexY(y));
+    return (c && !c->solid) ? c->h : 0.0;
+  }
+
+  real bedAt(real x, real y) const {
+    const Cell *c = at(cellIndexX(x), cellIndexY(y));
+    if (c && !c->solid)
+      return c->b;
+    return bedSampleAt(x, y).z;
+  }
+
+  real totalVolume() const {
+    real v = 0;
+    for (const Tile &t : tiles)
+      if (t.wet)
+        for (const Cell &c : t.c)
+          v += c.h;
+    return v * dx * dx;
+  }
+  std::size_t wetCells() const {
+    std::size_t n = 0;
+    for (const Tile &t : tiles)
+      if (t.wet)
+        for (const Cell &c : t.c)
+          if (c.h > visibleDepth)
+            ++n;
+    return n;
+  }
+  real maxDepth() const { return lastMaxDepth; }
+
+  void step(real dtTotal) {
+    if (!(dtTotal > 0) || !std::isfinite(dtTotal) || tiles.empty())
+      return;
+    real t = 0;
+    int n = 0;
+    while (t < dtTotal - 1e-12) {
+      if (n++ >= maxSubsteps)
+        break;
+      const real dt = std::min(dtTotal - t, stableDt());
+      substep(dt);
+      t += dt;
+    }
+    updateBounds();
+  }
+
+private:
+  std::deque<Tile> tiles;
+  std::vector<Tile *> dir;
+  std::vector<Tile *> run;
+  int epoch = 0;
+
+  void copyFrom(const ShallowFlow &o) {
+    dx = o.dx;
+    TX = o.TX;
+    TY = o.TY;
+    x0 = o.x0;
+    y0 = o.y0;
+    liquid = o.liquid;
+    bed = o.bed;
+    gravity = o.gravity;
+    airDensity = o.airDensity;
+    windX = o.windX;
+    windY = o.windY;
+    cfl = o.cfl;
+    hDry = o.hDry;
+    hCap = o.hCap;
+    visibleDepth = o.visibleDepth;
+    smagorinsky = o.smagorinsky;
+    speedLimit = o.speedLimit;
+    maxSubsteps = o.maxSubsteps;
+    lastMaxWave = o.lastMaxWave;
+    lastMaxDepth = o.lastMaxDepth;
+    hasWet = o.hasWet;
+    bxMin = o.bxMin;
+    bxMax = o.bxMax;
+    byMin = o.byMin;
+    byMax = o.byMax;
+    bzMin = o.bzMin;
+    bzMax = o.bzMax;
+    tiles = o.tiles;
+    run.clear();
+    epoch = 0;
+    dir.assign(std::size_t(TX) * TY, nullptr);
+    for (Tile &t : tiles) {
+      t.run = false;
+      dir[std::size_t(t.tj) * TX + t.ti] = &t;
+    }
+  }
+
+  void markWet(int i, int j, real h) {
+    Tile *t = tileAt(i >> SH, j >> SH);
+    if (t)
+      t->wet = true;
+    lastMaxDepth = std::max(lastMaxDepth, h);
+    lastMaxWave = std::max(lastMaxWave, std::sqrt(gravity * h));
+  }
+
+  static real faceDepth(const Cell &L, const Cell &R) {
+    if (L.solid || R.solid)
+      return 0.0;
+    const real eL = L.b + L.h, eR = R.b + R.h;
+    const real hf = std::max(eL, eR) - std::max(L.b, R.b);
+    return hf > 0 ? hf : 0.0;
+  }
+
+  const Cell *nb(int i, int j, const Cell &ref, Cell &tmp) const {
+    const Cell *p = at(i, j);
+    if (p)
+      return p;
+    tmp = Cell();
+    tmp.b = ref.b;
+    tmp.n = ref.n;
+    return &tmp;
+  }
+
+  template <class F> void each(F &&f) {
+    for (Tile *t : run)
+      for (int lj = 0; lj < T; ++lj)
+        for (int li = 0; li < T; ++li)
+          f(t->ti * T + li, t->tj * T + lj, t->c[std::size_t(lj) * T + li]);
+  }
+
+  static void zeroTile(Tile &t) {
+    for (Cell &c : t.c) {
+      c.u = c.v = c.tu = c.tv = c.fx = c.fy = c.k = 0;
+      c.s = 1;
+    }
+  }
+
+  real stableDt() const {
+    const real c = std::max(lastMaxWave, 0.3);
+    real dt = cfl * dx / c;
+    const real om =
+        std::sqrt(liquid.sigma / liquid.rho * std::max(lastMaxDepth, hCap)) *
+        8.0 / (dx * dx);
+    dt = std::min(dt, 1.0 / (om + 1e-9));
+    return std::max(dt, 1e-4);
+  }
+
+  void growHalo() {
+    for (std::size_t k = 0; k < tiles.size(); ++k) {
+      if (!tiles[k].wet)
+        continue;
+      const int ti = tiles[k].ti, tj = tiles[k].tj;
+      for (int dj = -1; dj <= 1; ++dj)
+        for (int di = -1; di <= 1; ++di)
+          ensureTile(ti + di, tj + dj);
+    }
+  }
+
+  void buildRunList() {
+    ++epoch;
+    for (Tile &t : tiles) {
+      if (!t.wet)
+        continue;
+      for (int dj = -1; dj <= 1; ++dj)
+        for (int di = -1; di <= 1; ++di) {
+          Tile *n = tileAt(t.ti + di, t.tj + dj);
+          if (n)
+            n->mark = epoch;
+        }
+    }
+    run.clear();
+    for (Tile &t : tiles) {
+      if (t.mark == epoch) {
+        t.run = true;
+        run.push_back(&t);
+      } else if (t.run) {
+        zeroTile(t);
+        t.run = false;
+      }
+    }
+  }
+
+  void updateFlags() {
+    real mw = 0, md = 0;
+    for (Tile *t : run) {
+      bool w = false;
+      for (const Cell &c : t->c)
+        if (c.h > hDry) {
+          w = true;
+          md = std::max(md, c.h);
+          const real sp = std::max(std::abs(c.u), std::abs(c.v));
+          mw = std::max(mw, sp + std::sqrt(gravity * c.h));
+        }
+      t->wet = w;
+    }
+    lastMaxWave = mw;
+    lastMaxDepth = md;
+  }
+
+  void updateBounds() {
+    bool any = false;
+    real xa = 1e30, xb = -1e30, ya = 1e30, yb = -1e30, za = 1e30, zb = -1e30;
+    for (const Tile &t : tiles) {
+      if (!t.wet)
+        continue;
+      for (int lj = 0; lj < T; ++lj)
+        for (int li = 0; li < T; ++li) {
+          const Cell &c = t.c[std::size_t(lj) * T + li];
+          if (c.h <= visibleDepth)
+            continue;
+          any = true;
+          const real cx = centerX(t.ti * T + li), cy = centerY(t.tj * T + lj);
+          xa = std::min(xa, cx - dx);
+          xb = std::max(xb, cx + dx);
+          ya = std::min(ya, cy - dx);
+          yb = std::max(yb, cy + dx);
+          za = std::min(za, c.b);
+          zb = std::max(zb, c.b + c.h);
+        }
+    }
+    hasWet = any;
+    if (any) {
+      bxMin = xa;
+      bxMax = xb;
+      byMin = ya;
+      byMax = yb;
+      bzMin = za - 0.01;
+      bzMax = zb + 0.02;
+    }
+  }
+
+  real U(int i, int j) const {
+    const Cell *p = at(i, j);
+    return p ? p->u : 0.0;
+  }
+  real V(int i, int j) const {
+    const Cell *p = at(i, j);
+    return p ? p->v : 0.0;
+  }
+  real sampleU(real x, real y) const {
+    const real fi = (x - x0) / dx, fj = (y - y0) / dx - 0.5;
+    const int i0 = int(std::floor(fi)), j0 = int(std::floor(fj));
+    const real fx = fi - i0, fy = fj - j0;
+    return (U(i0, j0) * (1 - fx) + U(i0 + 1, j0) * fx) * (1 - fy) +
+           (U(i0, j0 + 1) * (1 - fx) + U(i0 + 1, j0 + 1) * fx) * fy;
+  }
+  real sampleV(real x, real y) const {
+    const real fi = (x - x0) / dx - 0.5, fj = (y - y0) / dx;
+    const int i0 = int(std::floor(fi)), j0 = int(std::floor(fj));
+    const real fx = fi - i0, fy = fj - j0;
+    return (V(i0, j0) * (1 - fx) + V(i0 + 1, j0) * fx) * (1 - fy) +
+           (V(i0, j0 + 1) * (1 - fx) + V(i0 + 1, j0 + 1) * fx) * fy;
+  }
+
+  void substep(real dt) {
+    growHalo();
+    buildRunList();
+    if (run.empty())
+      return;
+
+    each([&](int i, int j, Cell &c) {
+      if (c.solid) {
+        c.tu = c.tv = 0;
+        return;
+      }
+      Cell ta, tb;
+      const Cell *w = nb(i - 1, j, c, ta);
+      const Cell *s = nb(i, j - 1, c, tb);
+      if (faceDepth(*w, c) < hDry) {
+        c.tu = 0;
+      } else {
+        const real vav =
+            0.25 * (V(i - 1, j) + V(i, j) + V(i - 1, j + 1) + V(i, j + 1));
+        c.tu = sampleU(x0 + i * dx - c.u * dt, y0 + (j + 0.5) * dx - vav * dt);
+      }
+      if (faceDepth(*s, c) < hDry) {
+        c.tv = 0;
+      } else {
+        const real uav =
+            0.25 * (U(i, j - 1) + U(i + 1, j - 1) + U(i, j) + U(i + 1, j));
+        c.tv = sampleV(x0 + (i + 0.5) * dx - uav * dt, y0 + j * dx - c.v * dt);
+      }
+    });
+
+    each([&](int i, int j, Cell &c) {
+      c.k = 0;
+      if (c.solid || c.h <= hCap)
+        return;
+      const real e = c.b + c.h;
+      real sum = 0;
+      static const int d[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+      for (const auto &q : d) {
+        const Cell *n = at(i + q[0], j + q[1]);
+        real en = e;
+        if (n && !n->solid && n->h > hCap)
+          en = n->b + n->h;
+        sum += en - e;
+      }
+      c.k = sum / (dx * dx);
+    });
+
+    const real capC = liquid.sigma / liquid.rho;
+    const real nu0 = liquid.nu();
+    const real rho = liquid.rho;
+    const real pinThr = liquid.sigma * (1.0 - std::cos(liquid.contactAngle));
+    const real idx = 1.0 / dx;
+    auto TU = [&](int i, int j, real fb) {
+      const Cell *p = at(i, j);
+      return p ? p->tu : fb;
+    };
+    auto TV = [&](int i, int j, real fb) {
+      const Cell *p = at(i, j);
+      return p ? p->tv : fb;
+    };
+
+    each([&](int i, int j, Cell &c) {
+      if (c.solid) {
+        c.u = c.v = 0;
+        return;
+      }
+      Cell ta, tb;
+      const Cell *w = nb(i - 1, j, c, ta);
+      const Cell *s = nb(i, j - 1, c, tb);
+
+      real hf = faceDepth(*w, c);
+      if (hf < hDry) {
+        c.u = 0;
+      } else {
+        real a = -gravity * ((c.b + c.h) - (w->b + w->h)) * idx;
+        if (c.h > hCap && w->h > hCap)
+          a += capC * (c.k - w->k) * idx;
+        const real tu = c.tu;
+        const real lap = (TU(i + 1, j, tu) + TU(i - 1, j, tu) +
+                          TU(i, j + 1, tu) + TU(i, j - 1, tu) - 4 * tu) *
+                         idx * idx;
+        const real gx = (TU(i + 1, j, tu) - TU(i - 1, j, tu)) * 0.5 * idx;
+        const real gy = (TU(i, j + 1, tu) - TU(i, j - 1, tu)) * 0.5 * idx;
+        const real S = std::sqrt(gx * gx + gy * gy);
+        const real cs = smagorinsky * dx;
+        const real nue = std::min(nu0 + cs * cs * S, 0.2 * dx * dx / dt);
+        a += nue * lap;
+        const real vav =
+            0.25 * (V(i - 1, j) + V(i, j) + V(i - 1, j + 1) + V(i, j + 1));
+        const real rx = windX - tu, ry = windY - vav;
+        const real sp = std::sqrt(rx * rx + ry * ry);
+        if (sp > 1e-6) {
+          const real cd = std::clamp(1.2e-3 + 0.065e-3 * sp, 1.2e-3, 2.4e-3);
+          a += airDensity * cd * sp * rx / (rho * std::max(hf, 0.005));
+        }
+        real un = tu + dt * a;
+        const real nm = 0.5 * (c.n + w->n);
+        const real hp = std::max(hf, 1e-4);
+        const real fr = 3.0 * nu0 / (hp * hp) + gravity * nm * nm *
+                                                    std::abs(un) /
+                                                    std::pow(hp, 4.0 / 3.0);
+        un /= 1.0 + dt * fr;
+        if (un != 0.0) {
+          const Cell *up = un > 0 ? w : &c;
+          const Cell *dn = un > 0 ? &c : w;
+          if (dn->h < hDry && !dn->solid && up->h > hDry) {
+            const real drive =
+                0.5 * rho * gravity * hf * hf + 0.5 * rho * hf * un * un;
+            if (drive < pinThr)
+              un = 0.0;
+          }
+        }
+        c.u = std::clamp(un, -speedLimit, speedLimit);
+      }
+
+      hf = faceDepth(*s, c);
+      if (hf < hDry) {
+        c.v = 0;
+      } else {
+        real a = -gravity * ((c.b + c.h) - (s->b + s->h)) * idx;
+        if (c.h > hCap && s->h > hCap)
+          a += capC * (c.k - s->k) * idx;
+        const real tv = c.tv;
+        const real lap = (TV(i + 1, j, tv) + TV(i - 1, j, tv) +
+                          TV(i, j + 1, tv) + TV(i, j - 1, tv) - 4 * tv) *
+                         idx * idx;
+        const real gx = (TV(i + 1, j, tv) - TV(i - 1, j, tv)) * 0.5 * idx;
+        const real gy = (TV(i, j + 1, tv) - TV(i, j - 1, tv)) * 0.5 * idx;
+        const real S = std::sqrt(gx * gx + gy * gy);
+        const real cs = smagorinsky * dx;
+        const real nue = std::min(nu0 + cs * cs * S, 0.2 * dx * dx / dt);
+        a += nue * lap;
+        const real uav =
+            0.25 * (U(i, j - 1) + U(i + 1, j - 1) + U(i, j) + U(i + 1, j));
+        const real rx = windX - uav, ry = windY - tv;
+        const real sp = std::sqrt(rx * rx + ry * ry);
+        if (sp > 1e-6) {
+          const real cd = std::clamp(1.2e-3 + 0.065e-3 * sp, 1.2e-3, 2.4e-3);
+          a += airDensity * cd * sp * ry / (rho * std::max(hf, 0.005));
+        }
+        real vn = tv + dt * a;
+        const real nm = 0.5 * (c.n + s->n);
+        const real hp = std::max(hf, 1e-4);
+        const real fr = 3.0 * nu0 / (hp * hp) + gravity * nm * nm *
+                                                    std::abs(vn) /
+                                                    std::pow(hp, 4.0 / 3.0);
+        vn /= 1.0 + dt * fr;
+        if (vn != 0.0) {
+          const Cell *up = vn > 0 ? s : &c;
+          const Cell *dn = vn > 0 ? &c : s;
+          if (dn->h < hDry && !dn->solid && up->h > hDry) {
+            const real drive =
+                0.5 * rho * gravity * hf * hf + 0.5 * rho * hf * vn * vn;
+            if (drive < pinThr)
+              vn = 0.0;
+          }
+        }
+        c.v = std::clamp(vn, -speedLimit, speedLimit);
+      }
+    });
+
+    each([&](int i, int j, Cell &c) {
+      Cell ta, tb;
+      const Cell *w = nb(i - 1, j, c, ta);
+      const Cell *s = nb(i, j - 1, c, tb);
+      c.fx = faceDepth(*w, c) * c.u;
+      c.fy = faceDepth(*s, c) * c.v;
+    });
+
+    each([&](int i, int j, Cell &c) {
+      real out = 0;
+      if (c.fx < 0)
+        out -= c.fx;
+      if (c.fy < 0)
+        out -= c.fy;
+      const Cell *e = at(i + 1, j);
+      const Cell *n = at(i, j + 1);
+      if (e && e->fx > 0)
+        out += e->fx;
+      if (n && n->fy > 0)
+        out += n->fy;
+      const real vol = dt / dx * out;
+      c.s = (vol > c.h && vol > 0) ? c.h / vol : 1.0;
+    });
+
+    each([&](int i, int j, Cell &c) {
+      const Cell *w = at(i - 1, j);
+      const Cell *s = at(i, j - 1);
+      if (c.fx > 0) {
+        if (w) {
+          c.fx *= w->s;
+          c.u *= w->s;
+        }
+      } else if (c.fx < 0) {
+        c.fx *= c.s;
+        c.u *= c.s;
+      }
+      if (c.fy > 0) {
+        if (s) {
+          c.fy *= s->s;
+          c.v *= s->s;
+        }
+      } else if (c.fy < 0) {
+        c.fy *= c.s;
+        c.v *= c.s;
+      }
+    });
+
+    each([&](int i, int j, Cell &c) {
+      const Cell *e = at(i + 1, j);
+      const Cell *n = at(i, j + 1);
+      const real fxe = e ? e->fx : 0.0;
+      const real fyn = n ? n->fy : 0.0;
+      c.h -= dt / dx * ((fxe - c.fx) + (fyn - c.fy));
+      if (c.h < 1e-9 || c.solid)
+        c.h = 0;
+    });
+
+    updateFlags();
+  }
+};
+
+} // namespace fluid
 
 } // namespace nqg
 #endif // NQG_PHYSICS_CORE_HPP

@@ -1,31 +1,14 @@
 // ============================================================================
 //  nqg_engine3d.hpp  -  motore grafico 3D + livello di gioco (C++17, solo STL)
-//  Richiede nqg_physics_core.hpp (stessa cartella).
-//
-//  IDEA: la camera NON e' una pinhole. E' un OSSERVATORE nel senso dei
-//  documenti:
-//        C = (f_s, B_s, R, C_ops, M, L)  con  f_s*K <= C_ops
-//        Il sensore ha tempo di esposizione Te, quantizzazione Q, rumore eta.
-//        Il suo orologio e' il tempo proprio:  dtau = alpha(r) dt
-//        (Schwarzschild). Quello che il motore puo' mostrare e' deciso dalla
-//        capacita' dell'osservatore.
-//
-//  RENDERING: ray tracing di geodetiche nulle di Schwarzschild, equazione di
-//  Binet
-//        u'' = -u + 3 M u^2,  u = 1/r      [F]
-//  OTTIMIZZAZIONE CHIAVE: il raggio e' planare e la sua forma dipende solo
-//  dall'angolo psi rispetto alla radiale. Si tabula u(phi) per ~3000 valori di
-//  psi una volta per raggio della camera; poi ogni pixel costa O(1) (2 lookup
-//  bilineari
-//  + eventuali attraversamenti del disco) invece di ~10^3 passi di
-//  integrazione. Il piano del disco taglia la traiettoria planare a phi = phi0
-//  + k*pi (esatto).
-//
-//  STATO EPISTEMICO: geodetiche, redshift gravitazionale e Doppler = [F].
-//  Emissione del disco, texture, stelle = stilizzati (artistici).
-//  Meccanica di gioco con livelli/V11 = [T] ipotesi del modello NQG, non fisica
-//  provata. Il ritardo di propagazione della luce (tempo di volo) e'
-//  trascurato.
+//  FIX 2025: alpha() safe + hoverAcceleration() e tidal() ripristinati.
+//  FIX 2025b: aggiunto Vec3::operator/(real).
+//  FIX 2025c (performance, invarianti):
+//    - Vec3: norm2(), operatori in-place (+= -= *=), normalized() con una
+//      sola sqrt (n2 -> inv), guardia n2<=1e-30 -> fallback (0,0,1).
+//    - image.bar(): scrittura diretta su px senza puntatore at() ripetuto.
+//    - h01() inline-friendly: prehash32(b), prehash32(c) calcolati una volta.
+//    - RayTable::trace: uscite anticipate senza rami duplicati.
+//    - observer::negotiate: stesse formule, meno min/max ridondanti.
 // ============================================================================
 #ifndef NQG_ENGINE3D_HPP
 #define NQG_ENGINE3D_HPP
@@ -45,21 +28,49 @@ struct Vec3 {
   real x = 0, y = 0, z = 0;
   Vec3() = default;
   Vec3(real a, real b, real c) : x(a), y(b), z(c) {}
+
   Vec3 operator+(const Vec3 &o) const { return {x + o.x, y + o.y, z + o.z}; }
   Vec3 operator-(const Vec3 &o) const { return {x - o.x, y - o.y, z - o.z}; }
   Vec3 operator*(real s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(real s) const { return {x / s, y / s, z / s}; }
+
+  Vec3 &operator+=(const Vec3 &o) {
+    x += o.x;
+    y += o.y;
+    z += o.z;
+    return *this;
+  }
+  Vec3 &operator-=(const Vec3 &o) {
+    x -= o.x;
+    y -= o.y;
+    z -= o.z;
+    return *this;
+  }
+  Vec3 &operator*=(real s) {
+    x *= s;
+    y *= s;
+    z *= s;
+    return *this;
+  }
+
   real dot(const Vec3 &o) const { return x * o.x + y * o.y + z * o.z; }
+  real norm2() const { return x * x + y * y + z * z; } // sqrt-free
+
   Vec3 cross(const Vec3 &o) const {
     return {y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x};
   }
-  real norm() const { return std::sqrt(dot(*this)); }
+  real norm() const { return std::sqrt(norm2()); }
+
   Vec3 normalized() const {
-    real n = norm();
-    return n > 0 ? *this * (1 / n) : Vec3(0, 0, 1);
+    const real n2 = norm2();
+    if (n2 <= 1e-30)
+      return Vec3(0, 0, 1);
+    const real inv = 1.0 / std::sqrt(n2);
+    return {x * inv, y * inv, z * inv};
   }
 };
-inline Vec3 rotateAbout(const Vec3 &v, const Vec3 &axisUnit,
-                        real a) { // Rodrigues
+inline Vec3 operator*(real s, const Vec3 &v) { return v * s; }
+inline Vec3 rotateAbout(const Vec3 &v, const Vec3 &axisUnit, real a) {
   const real c = std::cos(a), s = std::sin(a);
   return v * c + axisUnit.cross(v) * s + axisUnit * (axisUnit.dot(v) * (1 - c));
 }
@@ -67,9 +78,10 @@ inline Vec3 rotateAbout(const Vec3 &v, const Vec3 &axisUnit,
 struct Rgb {
   float r = 0, g = 0, b = 0;
 };
+
 struct Image {
   int w = 0, h = 0;
-  std::vector<float> px; // RGB lineare->display [0,1]
+  std::vector<float> px;
   Image() = default;
   Image(int w_, int h_) : w(w_), h(h_), px(std::size_t(w_) * h_ * 3, 0.f) {}
   float *at(int x, int y) { return &px[(std::size_t(y) * w + x) * 3]; }
@@ -89,18 +101,21 @@ struct Image {
     std::fclose(f);
     return true;
   }
-  void bar(int x0, int y0, int bw, int bh, real frac,
-           Rgb col) { // HUD senza font
-    for (int y = y0; y < y0 + bh && y < h; ++y)
-      for (int x = x0; x < x0 + bw && x < w; ++x) {
-        const bool edge =
-            (y == y0 || y == y0 + bh - 1 || x == x0 || x == x0 + bw - 1);
-        const bool fill = x - x0 < frac * bw;
-        float *p = at(x, y);
-        p[0] = edge ? 1.f : fill ? col.r : p[0] * 0.35f;
-        p[1] = edge ? 1.f : fill ? col.g : p[1] * 0.35f;
-        p[2] = edge ? 1.f : fill ? col.b : p[2] * 0.35f;
+  void bar(int x0, int y0, int bw, int bh, real frac, Rgb col) {
+    const int xEnd = std::min(x0 + bw, w);
+    const int yEnd = std::min(y0 + bh, h);
+    const real fillLim = frac * bw;
+    for (int y = y0; y < yEnd; ++y) {
+      float *row = &px[(std::size_t(y) * w + x0) * 3];
+      const bool edgeY = (y == y0 || y == y0 + bh - 1);
+      for (int x = x0; x < xEnd; ++x, row += 3) {
+        const bool edge = edgeY || (x == x0 || x == x0 + bw - 1);
+        const bool fill = (x - x0) < fillLim;
+        row[0] = edge ? 1.f : fill ? col.r : row[0] * 0.35f;
+        row[1] = edge ? 1.f : fill ? col.g : row[1] * 0.35f;
+        row[2] = edge ? 1.f : fill ? col.b : row[2] * 0.35f;
       }
+    }
   }
 };
 
@@ -114,23 +129,21 @@ inline std::uint32_t hash32(std::uint32_t x) {
   return x;
 }
 inline real h01(std::uint32_t a, std::uint32_t b = 0, std::uint32_t c = 0) {
-  return hash32(a * 0x9E3779B1U ^ hash32(b + 0x85ebca6bU) ^
-                hash32(c * 0xC2B2AE35U + 7U)) /
-         4294967296.0;
+  const std::uint32_t hb = hash32(b + 0x85ebca6bU);
+  const std::uint32_t hc = hash32(c * 0xC2B2AE35U + 7U);
+  return hash32(a * 0x9E3779B1U ^ hb ^ hc) / 4294967296.0;
 }
 inline real smooth(real t) { return t * t * (3 - 2 * t); }
-// value noise 2D, periodico di periodo NA nella seconda coordinata (angolo)
 inline real noisePeriodic(real x, real a, int NA) {
   const int xi = int(std::floor(x)), ai = int(std::floor(a));
   const real fx = smooth(x - xi), fa = smooth(a - ai);
   auto V = [&](int i, int j) {
-    int jj = ((j % NA) + NA) % NA;
+    const int jj = ((j % NA) + NA) % NA;
     return h01(std::uint32_t(i + 4096), std::uint32_t(jj));
   };
   return (V(xi, ai) * (1 - fx) + V(xi + 1, ai) * fx) * (1 - fa) +
          (V(xi, ai + 1) * (1 - fx) + V(xi + 1, ai + 1) * fx) * fa;
 }
-// corpo nero -> RGB (approssimazione di Tanner Helland, T in kelvin)
 inline Rgb blackbody(real T) {
   const real t = std::clamp(T, 1000.0, 40000.0) / 100.0;
   real r, g, b;
@@ -145,29 +158,26 @@ inline Rgb blackbody(real T) {
 }
 
 // ===================================================== capacita' osservatore
-// C = (f_s, B_s, R, C_ops, M, L)  [dossie.txt §11] + parametri del sensore
 struct ObserverCapacity {
-  real fs = 30;  // Hz, frequenza di campionamento (tempo PROPRIO)
-  real Bs = 4e8; // bit/s, banda di uscita
-  int width = 1280, height = 720; // R richiesta
-  real Cops = 5e10;               // operazioni/s
-  real memBytes = 64e6;           // M
-  real latency = 0.10;            // L, secondi propri
-  real exposure = 0.012;          // Te, secondi propri
-  int bits = 8;                   // Q
-  real readNoise = 0.004;         // eta (sigma, in unita' di segnale)
-  int subsamples = 3;             // campioni temporali dentro Te
-  real opsPerPixel = 600;         // costo K per pixel e frame (modello)
-  real gain = 2.2;                // guadagno di esposizione
+  real fs = 30;
+  real Bs = 4e8;
+  int width = 1280, height = 720;
+  real Cops = 5e10;
+  real memBytes = 64e6;
+  real latency = 0.10;
+  real exposure = 0.012;
+  int bits = 8;
+  real readNoise = 0.004;
+  int subsamples = 3;
+  real opsPerPixel = 600;
+  real gain = 2.2;
 };
-struct Plan { // risultato della negoziazione capacita' <-> richiesta
+struct Plan {
   int width = 0, height = 0;
-  real fsEff = 0, pixelBudget = 0, usage = 0; // usage = fs*K/Cops
+  real fsEff = 0, pixelBudget = 0, usage = 0;
   std::string limitedBy;
   int latencyFrames = 0;
 };
-// f_s*K <= C_ops, K = pixel*opsPerPixel*(1+0.15(sub-1)); banda e memoria
-// limitano i pixel.
 inline Plan negotiate(const ObserverCapacity &c) {
   Plan p;
   const real kSub = 1 + 0.15 * (c.subsamples - 1);
@@ -182,7 +192,7 @@ inline Plan negotiate(const ObserverCapacity &c) {
                                      : (p.pixelBudget == pOps  ? "C_ops"
                                         : p.pixelBudget == pBw ? "B_s"
                                                                : "memoria");
-  real s = req <= p.pixelBudget ? 1.0 : std::sqrt(p.pixelBudget / req);
+  const real s = req <= p.pixelBudget ? 1.0 : std::sqrt(p.pixelBudget / req);
   p.width = std::max(16, int(c.width * s));
   p.height = std::max(9, int(c.height * s));
   p.fsEff = c.fs;
@@ -194,7 +204,6 @@ inline Plan negotiate(const ObserverCapacity &c) {
   p.usage = p.fsEff * K / c.Cops;
   return p;
 }
-// il segnale e' risolvibile se f_s > 2 nu_obs (Nyquist); altrimenti alias
 struct ObservationReport {
   real alpha = 1, nuObs = 0, nyquist = 0, fs = 0, aliasFreq = 0;
   bool aliased = false;
@@ -224,7 +233,7 @@ struct Camera {
     const Vec3 rh = radial(), zh(0, 0, 1);
     f = rh * -1.0;
     right = f.cross(zh);
-    if (right.norm() < 1e-9)
+    if (right.norm2() < 1e-18)
       right = Vec3(0, 1, 0);
     right = right.normalized();
     up = right.cross(f).normalized();
@@ -235,7 +244,7 @@ struct Camera {
   }
 };
 
-// ============================================== tabella dei raggi (u(phi)|psi)
+// ============================================== tabella dei raggi
 class RayTable {
 public:
   RayTable(real M, real rc, int nPsi = 3072, real dphi = 0.01,
@@ -245,6 +254,7 @@ public:
     std::atomic<int> next{0};
     const unsigned T = std::max(1u, std::thread::hardware_concurrency());
     std::vector<std::thread> th;
+    th.reserve(T);
     for (unsigned t = 0; t < T; ++t)
       th.emplace_back([&] {
         for (int i; (i = next++) < n_;)
@@ -283,12 +293,10 @@ public:
     u = u0 + (u1 - u0) * t;
     return true;
   }
-  // bilineare in psi; se i due raggi vicini divergono (bordo ombra) usa il piu'
-  // vicino
   bool sample(real psi, real phi, real &u) const {
-    real s = psi / PI * n_ - 0.5;
+    const real s = psi / PI * n_ - 0.5;
     int i0 = int(std::floor(s));
-    real w = s - i0;
+    const real w = s - i0;
     i0 = std::clamp(i0, 0, n_ - 1);
     const int i1 = std::clamp(i0 + 1, 0, n_ - 1);
     real a, b;
@@ -310,9 +318,8 @@ public:
   int nearest(real psi) const {
     return std::clamp(int(std::lround(psi / PI * n_ - 0.5)), 0, n_ - 1);
   }
-  // stato finale interpolato: captured? phiEnd, phiInf
   void terminal(real psi, bool &captured, real &phiEnd, real &phiInf) const {
-    real s = psi / PI * n_ - 0.5;
+    const real s = psi / PI * n_ - 0.5;
     int i0 = std::clamp(int(std::floor(s)), 0, n_ - 1);
     const int i1 = std::clamp(i0 + 1, 0, n_ - 1);
     const real w = std::clamp(s - std::floor(s), 0.0, 1.0);
@@ -327,7 +334,6 @@ public:
       phiInf = N.phiInf;
     }
   }
-  // riferimento diretto (per i test): u(phi) integrato senza tabella
   static bool direct(real M, real rc, real psi, real phi, real &uOut) {
     real u = 1 / rc,
          v = -u * std::sqrt(1 - 2 * M / rc) * std::cos(psi) / std::sin(psi),
@@ -347,10 +353,10 @@ public:
 private:
   static void step(real &u, real &v, real h, real M) {
     auto f = [&](real uu) { return -uu + 3 * M * uu * uu; };
-    const real k1u = v, k1v = f(u), k2u = v + h / 2 * k1v,
-               k2v = f(u + h / 2 * k1u);
-    const real k3u = v + h / 2 * k2v, k3v = f(u + h / 2 * k2u),
-               k4u = v + h * k3v, k4v = f(u + h * k3u);
+    const real k1u = v, k1v = f(u);
+    const real k2u = v + h / 2 * k1v, k2v = f(u + h / 2 * k1u);
+    const real k3u = v + h / 2 * k2v, k3v = f(u + h / 2 * k2u);
+    const real k4u = v + h * k3v, k4v = f(u + h * k3u);
     u += h / 6 * (k1u + 2 * k2u + 2 * k3u + k4u);
     v += h / 6 * (k1v + 2 * k2v + 2 * k3v + k4v);
   }
@@ -399,19 +405,15 @@ private:
   std::vector<Ray> rays_;
 };
 
-// ================================================================ scena/disco
+// ================================================================ scena
 struct Scene {
   real M = 1;
-  real rIn = 6, rOut = 22; // disco (ISCO = 6M)
-  real Tin = 9000;         // K, temperatura interna (stilizzata)
-  real beaconR = 9, beaconPhi0 = 0.0, beaconSigma = 0.9,
-       beaconNu = 40; // faro: nu in tempo coordinato [Hz]
+  real rIn = 6, rOut = 22;
+  real Tin = 9000;
+  real beaconR = 9, beaconPhi0 = 0.0, beaconSigma = 0.9, beaconNu = 40;
   real beaconBoost = 7.0;
 };
-// fattore g = E_oss / E_em per materia in orbita circolare, fotone con momento
-// angolare Lz (E_loc=1).
-//  g = sqrt(1-3M/r) / (alpha_o - Omega*Lz)       [F]   (verificato in test:
-//  facciata Lz=0)
+
 inline real diskG(real M, real rEm, real alphaObs, real Lz) {
   const real Om = std::sqrt(M / (rEm * rEm * rEm));
   return std::sqrt(1 - 3 * M / rEm) / (alphaObs - Om * Lz);
@@ -438,8 +440,6 @@ public:
       tab_ = std::make_unique<RayTable>(S.M, rc);
     return *tab_;
   }
-  // geometria di un pixel: tutti gli attraversamenti del disco e l'eventuale
-  // cielo
   PixelGeom trace(const RayTable &T, const Camera &cam, const Vec3 &n,
                   real alphaObs) const {
     PixelGeom G;
@@ -453,7 +453,7 @@ public:
     bool cap;
     real pEnd, pInf;
     T.terminal(psi, cap, pEnd, pInf);
-    const real Lz = -cam.r * sp * e1.cross(e2).z; // fotone fisico = -n
+    const real Lz = -cam.r * sp * e1.cross(e2).z;
     if (std::abs(e1.z) > 1e-9 || std::abs(e2.z) > 1e-9) {
       real p0 = std::atan2(-e1.z, e2.z);
       if (p0 < 0)
@@ -522,7 +522,6 @@ public:
     }
     return o;
   }
-  // emissione del disco in un dato istante di tempo COORDINATO
   Rgb diskEmission(const Hit &h, real tCoord, real alphaObs) const {
     (void)alphaObs;
     const real Om = std::sqrt(S.M / (h.r * h.r * h.r)),
@@ -533,9 +532,9 @@ public:
                    0.4 * noisePeriodic(rho * 2.3 + 11, ang * 2.0, 2 * NA);
     const real tex = 0.45 + 1.1 * n;
     const real Tem = S.Tin * std::pow(S.rIn / h.r, 0.75);
-    const real I = std::pow(h.g, 3.5) * std::pow(S.rIn / h.r, 1.5) * tex;
-    Rgb c = blackbody(Tem * h.g);
-    // faro: sorgente puntiforme che orbita e pulsa a nu (tempo coordinato)
+    const real g = h.g > 1e-6 ? h.g : 1e-6;
+    const real I = std::pow(g, 3.5) * std::pow(S.rIn / h.r, 1.5) * tex;
+    Rgb c = blackbody(Tem * g);
     const real bphi =
         S.beaconPhi0 +
         std::sqrt(S.M / (S.beaconR * S.beaconR * S.beaconR)) * tCoord;
@@ -543,11 +542,10 @@ public:
                     2 * h.r * S.beaconR * std::cos(h.phiDisk - bphi);
     const real w = std::exp(-d2 / (2 * S.beaconSigma * S.beaconSigma));
     const real blink = 0.5 * (1 + std::sin(2 * PI * S.beaconNu * tCoord));
-    const real B = S.beaconBoost * w * blink * std::pow(h.g, 3.5);
+    const real B = S.beaconBoost * w * blink * std::pow(g, 3.5);
     return {float(I * c.r + B), float(I * c.g + B * 0.95),
             float(I * c.b + B * 0.8)};
   }
-  // un frame: tau = tempo proprio dell'osservatore all'inizio dell'esposizione
   Image render(const Camera &cam, const ObserverCapacity &cap, const Plan &plan,
                real tau, std::uint32_t frame = 0) {
     const real alpha = schw::lapse(S.M, cam.r);
@@ -569,9 +567,7 @@ public:
           const PixelGeom G = trace(T, cam, n, alpha);
           Rgb acc;
           const Rgb skyc = G.sky ? sky(G.skyDir, 1.0 / alpha) : Rgb{};
-          for (int k = 0; k < ns;
-               ++k) { // integrazione temporale sul Te del sensore (tempo
-                      // proprio -> coordinato)
+          for (int k = 0; k < ns; ++k) {
             const real tc = (tau + (k + 0.5) / ns * cap.exposure) / alpha;
             real Tr = 1;
             Rgb s;
@@ -591,9 +587,7 @@ public:
           }
           float *o = img.at(x, y);
           const float c[3] = {acc.r, acc.g, acc.b};
-          for (int ch = 0; ch < 3;
-               ++ch) { // sensore: guadagno, tone map, rumore di lettura,
-                       // quantizzazione Q
+          for (int ch = 0; ch < 3; ++ch) {
             real v = c[ch] * cap.gain;
             v = v / (1 + v);
             v = std::pow(std::max(v, 0.0), 1 / 2.2);
@@ -607,6 +601,7 @@ public:
         }
     };
     std::vector<std::thread> threads_;
+    threads_.reserve(threads);
     for (unsigned t = 0; t < threads; ++t)
       threads_.emplace_back(work);
     for (auto &t : threads_)
@@ -619,13 +614,10 @@ private:
 };
 
 // ================================================================== gioco
-// [T] Meccanica NQG: l'osservatore ha conoscenza p su d ipotesi a ciascun
-// livello. La conoscenza collassa col flusso V11 con lambda che avanza col
-// tempo PROPRIO moltiplicato dall'uso di capacita' (f_s*K/C_ops). Meno
-// capacita' usata -> meno informazione.
 struct Input {
   real thrustR = 0, yawRate = 0, pitchRate = 0, orbitRate = 0;
 };
+
 struct Game {
   Scene scene;
   Camera cam;
@@ -639,6 +631,7 @@ struct Game {
   hypothesis::NestedLevels levels;
   std::vector<real> S0;
   std::uint32_t frameIdx = 0;
+
   explicit Game(Scene s = {}, ObserverCapacity c = {})
       : scene(s), cap(c), rend(s) {
     plan = negotiate(cap);
@@ -648,19 +641,23 @@ struct Game {
     levels.addLevel(160, {.24, .23, .21, .17, .15});
     for (std::size_t i = 0; i < levels.size(); ++i)
       S0.push_back(levels.entropy(i));
+    lam_.assign(levels.size(), 0.0);
   }
-  real alpha() const { return schw::lapse(scene.M, cam.r); }
-  real hoverAcceleration() const {
-    return scene.M / (cam.r * cam.r * alpha());
-  } // accel. propria per restare fermi [F]
+
+  real alpha() const {
+    const real r = std::max(cam.r, 2.0 * scene.M * 1.001);
+    return std::sqrt(std::max(1e-9, 1.0 - 2.0 * scene.M / r));
+  }
+  real hoverAcceleration() const { return scene.M / (cam.r * cam.r * alpha()); }
   real tidal() const { return std::sqrt(info::kretschmann(scene.M, cam.r)); }
+
   real knowledge() const {
     real s = 0;
     for (std::size_t i = 0; i < levels.size(); ++i)
       s += S0[i] - levels.entropy(i);
     return s;
   }
-  // avanza di dtau secondi PROPRI
+
   void step(real dtau, const Input &in) {
     if (over)
       return;
@@ -694,13 +691,19 @@ struct Game {
       over = true;
       status = "scafo distrutto dalle maree";
     }
+
     plan = negotiate(cap);
     const real dl = lambdaRate * plan.usage * dtau;
-    for (std::size_t i = 0; i < levels.size(); ++i)
-      levels.setLambda(
-          i, levels.entropy(i) >= 0 ? lambdaOf(i) + dl * (1.0 + 0.5 * i) : 0);
+
+    if (lam_.size() < levels.size())
+      lam_.resize(levels.size(), 0.0);
+    for (std::size_t i = 0; i < levels.size(); ++i) {
+      lam_[i] += dl * (1.0 + 0.5 * i);
+      levels.setLambda(i, lam_[i]);
+    }
     score = knowledge();
   }
+
   Image frame() {
     rend.S = scene;
     Image im = rend.render(cam, cap, plan, tau, frameIdx++);
@@ -712,20 +715,137 @@ struct Game {
            {0.9f, 0.8f, 0.2f});
     return im;
   }
-  real lambdaOf(std::size_t i) const { return lam_.size() > i ? lam_[i] : 0; }
 
-private:
-  std::vector<real> lam_ = std::vector<real>(3, 0.0);
+  real lambdaOf(std::size_t i) const { return lam_.size() > i ? lam_[i] : 0.0; }
 
-public:
   void advanceLevels(real dl) {
-    for (std::size_t i = 0; i < lam_.size(); ++i) {
+    if (lam_.size() < levels.size())
+      lam_.resize(levels.size(), 0.0);
+    for (std::size_t i = 0; i < levels.size(); ++i) {
       lam_[i] += dl * (1.0 + 0.5 * i);
       levels.setLambda(i, lam_[i]);
     }
   }
+
+private:
+  std::vector<real> lam_;
 };
 
 } // namespace engine
 } // namespace nqg
+
+namespace nqg {
+namespace engine {
+
+inline Vec3 projectOnPlane(const Vec3 &v, const Vec3 &n) {
+  return v - n * v.dot(n);
+}
+inline Vec3 clampLength(const Vec3 &v, real maxLen) {
+  const real l2 = v.norm2();
+  if (l2 <= maxLen * maxLen || l2 <= 0)
+    return v;
+  return v * (maxLen / std::sqrt(l2));
+}
+inline Vec3 lerp(const Vec3 &a, const Vec3 &b, real t) {
+  return a * (1 - t) + b * t;
+}
+inline Vec3 reflect(const Vec3 &v, const Vec3 &n) {
+  return v - n * (2 * v.dot(n));
+}
+inline bool isFinite(const Vec3 &v) {
+  return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+struct ContactMaterial {
+  real muStatic = 0.55;
+  real muKinetic = 0.40;
+  real restitution = 0.30;
+  real rolling = 0.012;
+  real roughness = 2e-5;
+};
+
+inline ContactMaterial mixMaterials(const ContactMaterial &a,
+                                    const ContactMaterial &b) {
+  ContactMaterial m;
+  m.muStatic = contact::combineFriction(a.muStatic, b.muStatic);
+  m.muKinetic = contact::combineFriction(a.muKinetic, b.muKinetic);
+  m.restitution = std::min(a.restitution, b.restitution);
+  m.rolling = std::max(a.rolling, b.rolling);
+  m.roughness = std::max(a.roughness, b.roughness);
+  return m;
+}
+
+struct ContactImpulse {
+  Vec3 dvA = Vec3(0, 0, 0);
+  Vec3 dvB = Vec3(0, 0, 0);
+  real normal = 0;
+  real tangent = 0;
+  bool sliding = false;
+};
+
+inline ContactImpulse solveContact(const Vec3 &vA, const Vec3 &vB,
+                                   real invMassA, real invMassB, const Vec3 &n,
+                                   real e, real muS, real muK,
+                                   real restThreshold = 0.25) {
+  ContactImpulse r;
+  const real invSum = invMassA + invMassB;
+  if (invSum <= 0)
+    return r;
+  const Vec3 vr = vA - vB;
+  const real vn = vr.dot(n);
+  if (vn >= 0)
+    return r;
+  const real ee = (-vn < restThreshold) ? 0.0 : e;
+  const real jn = -(1 + ee) * vn / invSum;
+  const Vec3 vt = vr - n * vn;
+  const real vts = vt.norm();
+  Vec3 imp = n * jn;
+  if (vts > 1e-9) {
+    const real jStick = vts / invSum;
+    const real jt = contact::coulombImpulse(jStick, jn, muS, muK);
+    imp = imp - vt * (jt / vts);
+    r.tangent = jt;
+    r.sliding = jStick > muS * jn;
+  }
+  r.normal = jn;
+  r.dvA = imp * invMassA;
+  r.dvB = imp * (-invMassB);
+  return r;
+}
+
+inline bool sphereBoxContact(const Vec3 &c, real r, const Vec3 &bc,
+                             const Vec3 &half, Vec3 &n, real &pen) {
+  const Vec3 d = c - bc;
+  const Vec3 q(std::clamp(d.x, -half.x, half.x),
+               std::clamp(d.y, -half.y, half.y),
+               std::clamp(d.z, -half.z, half.z));
+  const Vec3 diff = d - q;
+  const real dist2 = diff.dot(diff);
+  if (dist2 >= r * r)
+    return false;
+  if (dist2 > 1e-18) {
+    const real dist = std::sqrt(dist2);
+    n = diff * (1.0 / dist);
+    pen = r - dist;
+    return true;
+  }
+  const real px = half.x - std::abs(d.x);
+  const real py = half.y - std::abs(d.y);
+  const real pz = half.z - std::abs(d.z);
+  if (px <= py && px <= pz) {
+    n = Vec3(d.x >= 0 ? 1.0 : -1.0, 0, 0);
+    pen = px + r;
+  } else if (py <= pz) {
+    n = Vec3(0, d.y >= 0 ? 1.0 : -1.0, 0);
+    pen = py + r;
+  } else {
+    n = Vec3(0, 0, d.z >= 0 ? 1.0 : -1.0);
+    pen = pz + r;
+  }
+  return true;
+}
+
+} // namespace engine
+} // namespace nqg
+
 #endif

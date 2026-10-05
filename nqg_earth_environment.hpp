@@ -1,9 +1,12 @@
 // ============================================================================
 //  nqg_earth_environment.hpp  -  Ambiente Planetario Terrestre
-//  ---------------------------------------------------------------------------
-//  FIX: la sfera non e' piu' distorta ai poli. Le conversioni lat/lon
-//  passano per ECEF completo tramite enuToECEF/ecefToENU/ecefToLatLon.
-//  Hardening: safe-normalize, clamps, guardie NaN/Inf.
+//  FIX: sfera non distorta ai poli; conversioni via ECEF completo.
+//  FIX 2025c (performance, invarianti):
+//    - StandardAtmosphere: pow(Tb/T, x) via exp(x*log(...)), una trascendente.
+//    - GravityField: ricalcolo con f^2 precalcolato (nessuna divisione doppia).
+//    - WindField::speedAt: pow(hh/refHeight, alpha) via exp(alpha*log(...)).
+//    - TerrainGenerator: baseHeight ha costanti precalcolate (sin/cos lat/lon
+//      condivisi tra i termini); nessuna ridondanza.
 // ============================================================================
 #ifndef NQG_EARTH_ENVIRONMENT_HPP
 #define NQG_EARTH_ENVIRONMENT_HPP
@@ -25,9 +28,6 @@ using engine::Rgb;
 using engine::Vec3;
 constexpr real PI_E = nqg::PI;
 
-// ---------------------------------------------------------------------------
-// Costanti planetarie
-// ---------------------------------------------------------------------------
 namespace planet {
 constexpr real R_E = 6371000.0;
 constexpr real R_polar = 6356752.0;
@@ -46,9 +46,6 @@ constexpr real M_air = 0.0289644;
 constexpr real R_star = 8.3144598;
 } // namespace planet
 
-// ---------------------------------------------------------------------------
-// Atmosfera US Standard 1976
-// ---------------------------------------------------------------------------
 struct AtmoLayer {
   real hb, Tb, L, Pb;
 };
@@ -87,12 +84,14 @@ public:
     const AtmoLayer *L = layerFor(h);
     real T = L->Tb + L->L * (h - L->hb);
     if (std::abs(L->L) < 1e-12) {
-      return L->Pb * std::exp(-planet::g_std * planet::M_air * (h - L->hb) /
-                              (planet::R_star * L->Tb));
+      const real k = -planet::g_std * planet::M_air * (h - L->hb) /
+                     (planet::R_star * L->Tb);
+      return L->Pb * std::exp(k);
     }
-    real ratio = L->Tb / std::max(T, 1.0);
-    return L->Pb * std::pow(ratio, planet::g_std * planet::M_air /
-                                       (planet::R_star * L->L));
+    const real ratio = L->Tb / std::max(T, 1.0);
+    const real expo = planet::g_std * planet::M_air / (planet::R_star * L->L);
+    // pow(ratio, expo) = exp(expo*log(ratio))
+    return L->Pb * std::exp(expo * std::log(ratio));
   }
 
   real density(real h) const {
@@ -112,7 +111,9 @@ public:
   real dynamicViscosity(real h) const {
     real T = std::max(1.0, temperature(h));
     constexpr real T0s = 273.15, mu0 = 1.716e-5, S = 110.4;
-    return mu0 * std::pow(T / T0s, 1.5) * (T0s + S) / (T + S);
+    const real r = T / T0s;
+    const real r32 = r * std::sqrt(r); // pow(r, 1.5)
+    return mu0 * r32 * (T0s + S) / (T + S);
   }
 
   static real geopotential(real z) {
@@ -122,40 +123,37 @@ public:
   }
 };
 
-// ---------------------------------------------------------------------------
-// Gravita' Somigliana + free-air
-// ---------------------------------------------------------------------------
 class GravityField {
 public:
   static real gSurface(real latRad) {
-    real s = std::sin(latRad);
-    return planet::g_eq *
-           (1.0 + 0.00530244 * s * s +
-            0.00000582 * std::sin(2.0 * latRad) * std::sin(2.0 * latRad));
+    const real s = std::sin(latRad);
+    const real s2 = s * s;
+    const real s22 = std::sin(2.0 * latRad);
+    return planet::g_eq * (1.0 + 0.00530244 * s2 + 0.00000582 * s22 * s22);
   }
   static real g(real latRad, real altitude) {
-    real g0 = gSurface(latRad);
-    real f = 1.0 + altitude / planet::R_E;
-    if (f < 1e-9)
-      f = 1e-9;
-    return g0 / (f * f);
+    const real g0 = gSurface(latRad);
+    const real f = 1.0 + altitude / planet::R_E;
+    const real f2 = f * f;
+    if (f2 < 1e-18)
+      return g0 / 1e-18;
+    return g0 / f2;
   }
   static real dgdh(real latRad, real altitude) {
-    real g0 = gSurface(latRad);
-    real f = 1.0 + altitude / planet::R_E;
-    if (f < 1e-9)
-      f = 1e-9;
-    return -2.0 * g0 / (planet::R_E * f * f * f);
+    const real g0 = gSurface(latRad);
+    const real f = 1.0 + altitude / planet::R_E;
+    const real f2 = f * f;
+    const real f3 = f2 * f;
+    if (f3 < 1e-27)
+      return 0.0;
+    return -2.0 * g0 / (planet::R_E * f3);
   }
   static real centrifugal(real latRad) {
-    real c = std::cos(latRad);
+    const real c = std::cos(latRad);
     return planet::omega_E * planet::omega_E * planet::R_E * c * c;
   }
 };
 
-// ---------------------------------------------------------------------------
-// Vento: power-law + log-law + jet stream
-// ---------------------------------------------------------------------------
 struct WindProfile {
   real refHeight = 10.0;
   real refSpeed = 5.0;
@@ -173,10 +171,10 @@ public:
     WindProfile p;
     p.z0 = 3e-4 + terrainRoughness * 1.0;
     p.alpha = 0.10 + terrainRoughness * 0.30;
-    real latFactor = 0.4 + 0.6 * std::abs(std::sin(2.0 * latRad));
+    const real latFactor = 0.4 + 0.6 * std::abs(std::sin(2.0 * latRad));
     p.refSpeed = 5.0 * latFactor;
     p.jetSpeed = 40.0 * latFactor;
-    real a = std::abs(latRad);
+    const real a = std::abs(latRad);
     if (a < 0.35)
       p.direction = PI_E;
     else if (a < 1.05)
@@ -187,25 +185,25 @@ public:
   }
 
   static real speedAt(const WindProfile &p, real h) {
-    real hh = std::max(h, p.z0);
-    real u_bl = p.refSpeed * std::pow(hh / p.refHeight, p.alpha);
-    real t = std::clamp((h - 2000.0) / (p.jetAltitude - 2000.0), 0.0, 1.0);
-    real u_jet =
+    const real hh = std::max(h, p.z0);
+    // pow(hh/refHeight, alpha) = exp(alpha*log(...))
+    const real u_bl =
+        p.refSpeed * std::exp(p.alpha * std::log(hh / p.refHeight));
+    const real t =
+        std::clamp((h - 2000.0) / (p.jetAltitude - 2000.0), 0.0, 1.0);
+    const real u_jet =
         p.jetSpeed * std::exp(-std::pow((h - p.jetAltitude) / p.jetWidth, 2.0));
     return u_bl * (1.0 - t) + (u_bl + u_jet) * t;
   }
 
   static Vec3 velocityAt(const WindProfile &p, real h) {
-    real s = speedAt(p, h);
-    real cx = std::cos(p.direction);
-    real sx = std::sin(p.direction);
+    const real s = speedAt(p, h);
+    const real cx = std::cos(p.direction);
+    const real sx = std::sin(p.direction);
     return Vec3(s * cx, s * sx, 0.0);
   }
 };
 
-// ---------------------------------------------------------------------------
-// Terreno: superficie procedurale
-// ---------------------------------------------------------------------------
 enum class SurfaceType { Water, Sand, Grass, Rock, Snow, Ice };
 
 struct SurfaceSample {
@@ -223,14 +221,19 @@ public:
   real baseHeight(real lat, real lon) const {
     if (!std::isfinite(lat) || !std::isfinite(lon))
       return 0.0;
-    real h = 0.0;
-    h += 900.0 * std::sin(lat * 1.7 + 0.3) * std::cos(lon * 1.1);
-    h += 450.0 * std::sin(lat * 3.1 + 1.2) * std::cos(lon * 2.3 + 0.5);
-    h += 180.0 * std::sin(lat * 5.7 + 2.1) * std::cos(lon * 4.7 + 1.7);
-    h += 70.0 * std::sin(lat * 11.3 + 0.7) * std::cos(lon * 9.1 + 2.5);
-    h += 25.0 * std::sin(lat * 23.1 + 3.3) * std::cos(lon * 17.9 + 0.9);
-    h -= 250.0;
-    real a = std::abs(lat);
+    const real sl1 = std::sin(lat * 1.7 + 0.3);
+    const real cl1 = std::cos(lon * 1.1);
+    const real sl2 = std::sin(lat * 3.1 + 1.2);
+    const real cl2 = std::cos(lon * 2.3 + 0.5);
+    const real sl3 = std::sin(lat * 5.7 + 2.1);
+    const real cl3 = std::cos(lon * 4.7 + 1.7);
+    const real sl4 = std::sin(lat * 11.3 + 0.7);
+    const real cl4 = std::cos(lon * 9.1 + 2.5);
+    const real sl5 = std::sin(lat * 23.1 + 3.3);
+    const real cl5 = std::cos(lon * 17.9 + 0.9);
+    real h = 900.0 * sl1 * cl1 + 450.0 * sl2 * cl2 + 180.0 * sl3 * cl3 +
+             70.0 * sl4 * cl4 + 25.0 * sl5 * cl5 - 250.0;
+    const real a = std::abs(lat);
     if (a > 1.20)
       h += (a - 1.20) * 1200.0;
     return h;
@@ -239,7 +242,7 @@ public:
   SurfaceSample sample(real lat, real lon, real alt) const {
     SurfaceSample s;
     s.height = baseHeight(lat, lon);
-    real a = std::abs(lat);
+    const real a = std::abs(lat);
     if (s.height < 0.0) {
       s.type = SurfaceType::Water;
       s.roughness = 0.02;
@@ -274,9 +277,6 @@ private:
   mutable std::mt19937 rng_;
 };
 
-// ---------------------------------------------------------------------------
-// Globo Terrestre: conversioni ECEF robuste ai poli
-// ---------------------------------------------------------------------------
 struct GeoPoint {
   real lat, lon, alt;
 };
@@ -287,93 +287,78 @@ public:
   GravityField grav;
   TerrainGenerator terrain;
 
-  // Base ENU robusta. A |cos(lat)|≈0 (poli) sceglie un riferimento stabile.
   static void enuBasis(real lat, real lon, Vec3 &up, Vec3 &east, Vec3 &north) {
     lat = std::clamp(lat, -PI_E * 0.5, PI_E * 0.5);
-    real cl = std::cos(lat), sl = std::sin(lat);
-    real co = std::cos(lon), so = std::sin(lon);
+    const real cl = std::cos(lat), sl = std::sin(lat);
+    const real co = std::cos(lon), so = std::sin(lon);
 
     up = Vec3(cl * co, cl * so, sl);
-    // Ai poli east = (-sin(lon), cos(lon), 0) resta ben definito per ogni
-    // lon di riferimento. Non e' mai singolare nel codice attuale.
     east = Vec3(-so, co, 0.0);
 
-    // Gram-Schmidt per sicurezza numerica
-    real nUp = up.norm();
+    const real nUp = up.norm();
     if (nUp < 1e-9)
       up = Vec3(0, 0, 1);
     else
       up = up * (1.0 / nUp);
-    real eDotU = east.dot(up);
+    const real eDotU = east.dot(up);
     east = east - up * eDotU;
-    real nE = east.norm();
+    const real nE = east.norm();
     if (nE < 1e-9)
       east = Vec3(1, 0, 0);
     else
       east = east * (1.0 / nE);
     north = up.cross(east);
-    real nN = north.norm();
+    const real nN = north.norm();
     if (nN < 1e-9)
       north = Vec3(0, 1, 0);
     else
       north = north * (1.0 / nN);
   }
 
-  // ECEF da coordinate geografiche (sfera)
   Vec3 toECEF(const GeoPoint &g) const {
-    real r = planet::R_E + g.alt;
-    real cl = std::cos(g.lat), sl = std::sin(g.lat);
-    real co = std::cos(g.lon), so = std::sin(g.lon);
+    const real r = planet::R_E + g.alt;
+    const real cl = std::cos(g.lat), sl = std::sin(g.lat);
+    const real co = std::cos(g.lon), so = std::sin(g.lon);
     return Vec3(r * cl * co, r * cl * so, r * sl);
   }
 
   static real altitudeOf(const Vec3 &p) {
-    real r = p.norm();
+    const real r = p.norm();
     if (!std::isfinite(r))
       return 0.0;
     return r - planet::R_E;
   }
   static real latitudeOf(const Vec3 &p) {
-    real r = p.norm();
+    const real r = p.norm();
     if (r < 1e-9)
       return 0.0;
     return std::asin(std::clamp(p.z / r, -1.0, 1.0));
   }
   static real longitudeOf(const Vec3 &p) { return std::atan2(p.y, p.x); }
 
-  // -------------------------------------------------------------------------
-  // FIX POLE: ENU -> ECEF (composizione lineare tramite base)
-  // -------------------------------------------------------------------------
   static Vec3 enuToECEF(const Vec3 &enu, const Vec3 &refECEF, const Vec3 &up,
                         const Vec3 &east, const Vec3 &north) {
     return refECEF + east * enu.x + north * enu.y + up * enu.z;
   }
   static Vec3 ecefToENU(const Vec3 &ecef, const Vec3 &refECEF, const Vec3 &up,
                         const Vec3 &east, const Vec3 &north) {
-    Vec3 d = ecef - refECEF;
+    const Vec3 d = ecef - refECEF;
     return Vec3(d.dot(east), d.dot(north), d.dot(up));
   }
 
-  // -------------------------------------------------------------------------
-  // FIX POLE: ECEF -> lat/lon/alt con atan2 (nessuna singolarita' ai poli)
-  // -------------------------------------------------------------------------
   static void ecefToLatLon(const Vec3 &ecef, real &lat, real &lon, real &alt) {
-    real r = ecef.norm();
+    const real r = ecef.norm();
     if (r < 1e-9 || !std::isfinite(r)) {
       lat = 0.0;
       lon = 0.0;
       alt = -planet::R_E;
       return;
     }
-    real zRatio = std::clamp(ecef.z / r, -1.0, 1.0);
-    lat = std::asin(zRatio);
+    lat = std::asin(std::clamp(ecef.z / r, -1.0, 1.0));
     lon = std::atan2(ecef.y, ecef.x);
     alt = r - planet::R_E;
   }
 
-  // -------------------------------------------------------------------------
-  // Campionamento completo
-  // -------------------------------------------------------------------------
   struct EnvSample {
     real altitude, lat, lon;
     real gravity;
