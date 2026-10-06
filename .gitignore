@@ -10,3 +10,5 @@ test_window_sdl3
 Costrutto.app
 test_sdf
 diff.txt
+Makefile
+test_water_spray

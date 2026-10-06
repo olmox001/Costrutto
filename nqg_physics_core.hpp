@@ -415,6 +415,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace nqg {
@@ -1255,6 +1256,11 @@ inline real rollingDeceleration(real crr, real g) { return crr * g; }
 // ================================================================ fluidi
 namespace fluid {
 
+// Scala di scabrezza del fondo [m]: profondita' delle depressioni in cui il
+// film e' trattenuto. UNA sola costante: ritenzione, soglia minima dello
+// spessore nell'ancoraggio e distanza di asperita' del contatto corpo-fondo.
+constexpr real ROUGHNESS = 2.0e-4;
+
 struct Liquid {
   real rho = 998.2;
   real mu = 1.002e-3;
@@ -1316,7 +1322,11 @@ struct BedSample {
   // permeabile) e ritenzione (m, accumulo nelle depressioni di rugosita':
   // un film piu' sottile non scorre piu' ma resta intrappolato/assorbito).
   real infil = 0.0;
-  real retention = 2.0e-4;
+  real retention = ROUGHNESS;
+  // Il fondo e' occupato da un corpo solido (statico o mobile, stessa regola):
+  // l'acqua che occupava la colonna viene SPOSTATA nelle celle vicine, non
+  // assorbita (conservazione del volume).
+  bool body = false;
 };
 
 class ShallowFlow {
@@ -1328,13 +1338,14 @@ public:
   struct Cell {
     real h = 0, b = 0, u = 0, v = 0, n = 0.012;
     real tu = 0, tv = 0, fx = 0, fy = 0, s = 1, k = 0;
-    real inf = 0.0, ret = 2.0e-4;
+    real inf = 0.0, ret = ROUGHNESS;
     bool solid = false;
+    bool body = false;
   };
   struct Tile {
     std::array<Cell, T * T> c;
     int ti = 0, tj = 0, mark = 0;
-    bool wet = false, run = false;
+    bool wet = false, run = false, loaded = false;
   };
   struct Sample {
     bool wet = false;
@@ -1358,6 +1369,18 @@ public:
   real speedLimit = 30.0;
   int maxSubsteps = 24;
   real absorbRate = 4.0e-4;
+  real dropGap = 0.0; // 0 = disattivato (comportamento storico)
+  // Ritenzione (film sotto c.ret) su fondo IMPERMEABILE: se retainToSink e'
+  // attivo (lo imposta nqg_water_spray.hpp) il volume NON viene dichiarato
+  // "assorbito" ma consegnato in `retained` (cella, volume, quota fondo) a chi
+  // lo trasforma in perline: nessun volume sparisce dal conto. Su terreno
+  // permeabile (inf > 0) resta assorbimento reale. false = comportamento storico.
+  bool retainToSink = false;
+  struct Retained {
+    int i = 0, j = 0;
+    real v = 0, z = 0;
+  };
+  std::unordered_map<long long, Retained> retained;
   real volumeBudget = 60.0;
   std::size_t maxTiles = 4096;
   real absorbedVolume = 0.0;
@@ -1405,6 +1428,23 @@ public:
     return bed ? bed(x, y) : BedSample();
   }
 
+  // Fondo di una cella: MEDIANA di 5 campioni (centro + 4 quarti di cella).
+  // Un bordo (tavolo, scatola) che cade a meta' cella o esattamente sul
+  // centro non dipende piu' da un confronto al limite (prima: limite
+  // invisibile a +-dx/2 dal bordo vero): l'errore di posizione del bordo e'
+  // <= dx/4 e la scelta e' per maggioranza.
+  BedSample cellBed(real cx, real cy) const {
+    if (!bed)
+      return BedSample();
+    const real q = 0.25 * dx;
+    const BedSample s[5] = {bed(cx, cy), bed(cx - q, cy - q), bed(cx + q, cy - q),
+                            bed(cx - q, cy + q), bed(cx + q, cy + q)};
+    auto zz = [&](int k) { return s[k].solid ? SOLID_Z : s[k].z; };
+    int idx[5] = {0, 1, 2, 3, 4};
+    std::sort(idx, idx + 5, [&](int a, int b) { return zz(a) < zz(b); });
+    return s[idx[2]];
+  }
+
   Tile *ensureTile(int ti, int tj) {
     if (ti < 0 || tj < 0 || ti >= TX || tj >= TY)
       return nullptr;
@@ -1419,13 +1459,47 @@ public:
     return slot;
   }
 
-  void loadBed(Tile &t) {
+  struct Rect {
+    real xa, xb, ya, yb;
+  };
+  struct Lost {
+    int i, j;
+    real v;
+  };
+  std::vector<Lost> lostQ;
+
+  void loadBed(Tile &t, const Rect *rect = nullptr) {
+    const bool first = !t.loaded;
+    t.loaded = true;
     for (int lj = 0; lj < T; ++lj)
       for (int li = 0; li < T; ++li) {
+        const int gi = t.ti * T + li, gj = t.tj * T + lj;
+        const real cx = centerX(gi), cy = centerY(gj);
+        if (rect && (cx < rect->xa || cx > rect->xb || cy < rect->ya ||
+                     cy > rect->yb))
+          continue;
         Cell &c = t.c[std::size_t(lj) * T + li];
-        BedSample s =
-            bedSampleAt(centerX(t.ti * T + li), centerY(t.tj * T + lj));
+        BedSample s = cellBed(cx, cy);
+        // Il fondo che SALE sotto l'acqua occupa il posto del liquido: la
+        // superficie non deve saltare di colpo (onde spurie ogni refresh).
+        // Sabbia: il volume e' assorbito dai pori. Corpo solido: il volume e'
+        // spostato nelle celle bagnate vicine (nessuna perdita di acqua).
+        if (!first && !c.solid && c.h > 0.0) {
+          real lost = 0.0;
+          if (s.solid)
+            lost = s.body ? c.h : 0.0;
+          else if (s.z > c.b)
+            lost = std::min(c.h, s.z - c.b);
+          if (lost > 0.0) {
+            c.h -= lost;
+            if (s.body)
+              lostQ.push_back({gi, gj, lost * dx * dx});
+            else
+              absorbedVolume += lost * dx * dx;
+          }
+        }
         c.solid = s.solid;
+        c.body = s.body;
         c.b = s.solid ? SOLID_Z : s.z;
         c.n = s.manning;
         c.inf = s.infil;
@@ -1437,9 +1511,87 @@ public:
       }
   }
 
+  // Ridistribuisce nelle celle bagnate piu' vicine (anelli crescenti) il
+  // volume spostato da un corpo; se non c'e' acqua vicina e' assorbito.
+  void redistributeLost() {
+    for (const Lost &q : lostQ) {
+      bool placed = false;
+      for (int r = 1; r <= 64 && !placed; ++r) {
+        std::vector<std::pair<int, int>> sel;
+        for (int dj = -r; dj <= r; ++dj)
+          for (int di = -r; di <= r; ++di) {
+            if (std::max(std::abs(di), std::abs(dj)) != r)
+              continue;
+            const Cell *c = at(q.i + di, q.j + dj);
+            if (!c || c->solid || c->body || c->h <= hDry)
+              continue;
+            sel.emplace_back(q.i + di, q.j + dj);
+          }
+        if (sel.empty())
+          continue;
+        const real dh = q.v / (real(sel.size()) * dx * dx);
+        for (const auto &ij : sel) {
+          Cell *c = at(ij.first, ij.second);
+          c->h += dh;
+          markWet(ij.first, ij.second, c->h);
+        }
+        placed = true;
+      }
+      if (!placed)
+        absorbedVolume += q.v;
+    }
+    lostQ.clear();
+  }
+
   void refreshBed() {
     for (Tile &t : tiles)
       loadBed(t);
+    redistributeLost();
+  }
+
+  // Aggiorna il fondo solo nel rettangolo (corpi mobili: costo locale).
+  void refreshBedRect(real xa, real xb, real ya, real yb) {
+    const Rect r{xa, xb, ya, yb};
+    for (Tile &t : tiles) {
+      const real tx0 = x0 + t.ti * T * dx, tx1 = tx0 + T * dx;
+      const real ty0 = y0 + t.tj * T * dx, ty1 = ty0 + T * dx;
+      if (tx1 < xa || tx0 > xb || ty1 < ya || ty0 > yb)
+        continue;
+      loadBed(t, &r);
+    }
+    redistributeLost();
+  }
+
+  // Sposta nelle celle bagnate vicine un volume (m^3) proveniente da (x, y).
+  void pushOut(real x, real y, real volume) {
+    if (!(volume > 0.0) || !std::isfinite(volume))
+      return;
+    lostQ.push_back({cellIndexX(x), cellIndexY(y), volume});
+    redistributeLost();
+  }
+
+  // Svuota l'impronta di un corpo (acqua "fantasma" interna al solido quando
+  // passa da galleggiante ad appoggiato). Ritorna il volume rimosso.
+  real drainRect(real cx, real cy, real hx, real hy, bool circular) {
+    const int i0 = cellIndexX(cx - hx), i1 = cellIndexX(cx + hx);
+    const int j0 = cellIndexY(cy - hy), j1 = cellIndexY(cy + hy);
+    real removed = 0.0;
+    for (int j = j0; j <= j1; ++j)
+      for (int i = i0; i <= i1; ++i) {
+        const real ddx = centerX(i) - cx, ddy = centerY(j) - cy;
+        const bool inside =
+            circular ? (ddx * ddx / (hx * hx) + ddy * ddy / (hy * hy) <= 1.0)
+                     : (std::abs(ddx) <= hx && std::abs(ddy) <= hy);
+        if (!inside)
+          continue;
+        Cell *c = at(i, j);
+        if (!c || c->solid || c->h <= 0.0)
+          continue;
+        removed += c->h * dx * dx;
+        c->h = 0.0;
+        c->u = c->v = 0.0;
+      }
+    return removed;
   }
 
   void clear() {
@@ -1661,46 +1813,112 @@ public:
     }
   }
 
-  Sample sample(real x, real y) const {
+  // Strapiombo (dropGap > 0, impostato da nqg_water_spray.hpp): la faccia fra
+  // una cella alta e una cella la cui superficie libera sta SOTTO il fondo
+  // della prima non conduce: l'acqua non "teletrasporta" la colonna sul
+  // pavimento, ma resta al bordo e ne esce come getto/gocce (modulo spray).
+  bool faceDepthClosed(const Cell &L, const Cell &R) const {
+    if (!(dropGap > 0.0) || std::abs(L.b - R.b) <= dropGap)
+      return false;
+    const Cell &lo = L.b < R.b ? L : R;
+    const Cell &hi = L.b < R.b ? R : L;
+    return lo.b + lo.h < hi.b;
+  }
+  // Due celle adiacenti sono idraulicamente CONNESSE se il salto di fondo e'
+  // una pendenza praticabile (<= ~1.25 dx) oppure se l'acqua della cella piu'
+  // bassa raggiunge il fondo di quella piu' alta (sommersione). Un dirupo
+  // (bordo di tavolo/scatola) NON e' connesso: la superficie libera non deve
+  // essere interpolata attraverso di esso (lama d'acqua "appesa" in aria).
+  static bool hydraulicallyConnected(const Cell &a, const Cell &b, real dx) {
+    const real db = std::abs(a.b - b.b);
+    if (db <= 1.25 * dx)
+      return true;
+    const Cell &lo = a.b < b.b ? a : b;
+    const Cell &hi = a.b < b.b ? b : a;
+    return lo.h > hDryConst() && lo.b + lo.h >= hi.b;
+  }
+  static constexpr real hDryConst() { return 1e-5; }
+
+  // Ricostruzione bilineare CONTINUA su tutte le celle fluide (asciutte
+  // incluse, h = 0, eta = fondo), ma limitata alle celle connesse alla cella
+  // di riferimento (quella col peso maggiore): attraverso un dirupo si usa
+  // solo il lato "proprio". Pesi rinormalizzati.
+  struct Recon {
+    real w = 0, eta = 0, dep = 0, bd = 0, uu = 0, vv = 0;
+  };
+  Recon reconstruct(real x, real y) const {
     const real fi = (x - x0) / dx - 0.5, fj = (y - y0) / dx - 0.5;
     const int i0 = int(std::floor(fi)), j0 = int(std::floor(fj));
     const real fx = fi - i0, fy = fj - j0;
-    Sample s;
-    // Ricostruzione bilineare CONTINUA su tutte le celle fluide (asciutte
-    // incluse, con h = 0 e eta = fondo): la profondita' scende a 0 in modo
-    // continuo verso la linea di riva. Prima si usavano solo le celle
-    // bagnate con soglia binaria -> riva a gradini, normali discontinue e
-    // linee scure/segmentate sui bordi. Le celle solide (pareti) restano
-    // escluse e i pesi rinormalizzati.
-    real w = 0, eta = 0, dep = 0, bd = 0, uu = 0, vv = 0;
+    const Cell *cc[4];
+    real wt[4];
+    const Cell *ref = nullptr;
+    real wref = -1.0;
     for (int dj = 0; dj < 2; ++dj)
       for (int di = 0; di < 2; ++di) {
+        const int q = dj * 2 + di;
         const Cell *c = at(i0 + di, j0 + dj);
-        if (!c || c->solid)
+        cc[q] = (c && !c->solid) ? c : nullptr;
+        wt[q] = (di ? fx : 1 - fx) * (dj ? fy : 1 - fy);
+        if (cc[q] && wt[q] > wref) {
+          wref = wt[q];
+          ref = cc[q];
+        }
+      }
+    Recon r;
+    if (!ref)
+      return r;
+    for (int dj = 0; dj < 2; ++dj)
+      for (int di = 0; di < 2; ++di) {
+        const int q = dj * 2 + di;
+        const Cell *c = cc[q];
+        if (!c || !(c == ref || hydraulicallyConnected(*c, *ref, dx)))
           continue;
-        const real wt = (di ? fx : 1 - fx) * (dj ? fy : 1 - fy);
         const Cell *e = at(i0 + di + 1, j0 + dj);
         const Cell *n = at(i0 + di, j0 + dj + 1);
         const real cu = 0.5 * (c->u + (e ? e->u : c->u));
         const real cv = 0.5 * (c->v + (n ? n->v : c->v));
-        w += wt;
-        eta += wt * (c->b + c->h);
-        dep += wt * c->h;
-        bd += wt * c->b;
-        uu += wt * cu;
-        vv += wt * cv;
+        r.w += wt[q];
+        r.eta += wt[q] * (c->b + c->h);
+        r.dep += wt[q] * c->h;
+        r.bd += wt[q] * c->b;
+        r.uu += wt[q] * cu;
+        r.vv += wt[q] * cv;
       }
-    if (w < 0.5)
+    return r;
+  }
+
+  Sample sample(real x, real y) const {
+    Sample s;
+    const Recon r = reconstruct(x, y);
+    if (r.w < 0.5 * 0.5) // almeno meta' del peso del vicinato "proprio"
       return s;
-    s.depth = dep / w;
+    s.depth = r.dep / r.w;
     if (!(s.depth > visibleDepth))
       return s;
     s.wet = true;
-    s.eta = eta / w;
-    s.bed = bd / w;
-    s.u = uu / w;
-    s.v = vv / w;
+    s.eta = r.eta / r.w;
+    s.bed = r.bd / r.w;
+    s.u = r.uu / r.w;
+    s.v = r.vv / r.w;
     return s;
+  }
+
+  // Superficie CONTINUA: stessa ricostruzione di sample() ma senza soglia di
+  // visibilita' (eta = fondo dove l'acqua e' assente). Serve al ray marching.
+  struct Raw {
+    bool valid = false;
+    real eta = 0, depth = 0;
+  };
+  Raw sampleRaw(real x, real y) const {
+    Raw out;
+    const Recon r = reconstruct(x, y);
+    if (r.w < 0.25)
+      return out;
+    out.valid = true;
+    out.eta = r.eta / r.w;
+    out.depth = r.dep / r.w;
+    return out;
   }
 
   real depthAt(real x, real y) const {
@@ -1755,6 +1973,24 @@ public:
 
   real filmMin() const { return 0.5 * puddleThickness(liquid, gravity); }
 
+  // Isteresi dell'angolo di contatto: un film sottile si muove solo se la
+  // spinta (gravita' + capillarita' + inerzia) supera la forza di
+  // ancoraggio della linea di contatto, per unita' di lunghezza
+  //   F_pin = sigma (cos(theta_rec) - cos(theta_adv)),  theta_rec = theta/2.
+  // Accelerazione di soglia a_pin = F_pin / (rho h dx): cresce al diminuire
+  // dello spessore, svanisce sopra ~1 cm (acqua profonda: onde libere).
+  // E' l'attrito statico del liquido: cosi' pozze e fronti SI FERMANO.
+  real pinAccel(real hf) const {
+    constexpr real HFADE = 0.01;
+    if (hf >= HFADE)
+      return 0.0;
+    const real th = liquid.contactAngle;
+    const real hyst =
+        liquid.sigma * std::max(0.0, std::cos(0.5 * th) - std::cos(th));
+    const real fade = 1.0 - hf / HFADE;
+    return fade * hyst / (liquid.rho * std::max(hf, ROUGHNESS) * dx);
+  }
+
 private:
   int pruneCounter = 0;
   std::deque<Tile> tiles;
@@ -1782,6 +2018,9 @@ private:
     speedLimit = o.speedLimit;
     maxSubsteps = o.maxSubsteps;
     absorbRate = o.absorbRate;
+    dropGap = o.dropGap;
+    retainToSink = o.retainToSink;
+    retained = o.retained;
     volumeBudget = o.volumeBudget;
     maxTiles = o.maxTiles;
     absorbedVolume = o.absorbedVolume;
@@ -1813,8 +2052,10 @@ private:
     lastMaxWave = std::max(lastMaxWave, std::sqrt(gravity * h));
   }
 
-  static real faceDepth(const Cell &L, const Cell &R) {
+  real faceDepth(const Cell &L, const Cell &R) const {
     if (L.solid || R.solid)
+      return 0.0;
+    if (faceDepthClosed(L, R))
       return 0.0;
     const real eL = L.b + L.h, eR = R.b + R.h;
     const real hf = std::max(eL, eR) - std::max(L.b, R.b);
@@ -2105,6 +2346,10 @@ private:
           a += airDensity * cd * sp * rx / (rho * std::max(hf, 0.005));
         }
         real un = tu + dt * a;
+        {
+          const real dvPin = dt * pinAccel(hf);
+          un = std::abs(un) <= dvPin ? 0.0 : un - std::copysign(dvPin, un);
+        }
         const real nm = 0.5 * (c.n + w->n);
         const real hp = std::max(hf, 1e-4);
         const real fr = 3.0 * nu0 / (hp * hp) + gravity * nm * nm *
@@ -2150,6 +2395,10 @@ private:
           a += airDensity * cd * sp * ry / (rho * std::max(hf, 0.005));
         }
         real vn = tv + dt * a;
+        {
+          const real dvPin = dt * pinAccel(hf);
+          vn = std::abs(vn) <= dvPin ? 0.0 : vn - std::copysign(dvPin, vn);
+        }
         const real nm = 0.5 * (c.n + s->n);
         const real hp = std::max(hf, 1e-4);
         const real fr = 3.0 * nu0 / (hp * hp) + gravity * nm * nm *
@@ -2227,9 +2476,8 @@ private:
         c.h = 0;
     });
 
-    const real fmGlobal = filmMin();
     const real dAbs = absorbRate * dt;
-    each([&](int, int, Cell &c) {
+    each([&](int i, int j, Cell &c) {
       if (c.solid || c.h <= 0.0)
         return;
       // infiltrazione nel terreno permeabile (Darcy, tasso costante)
@@ -2238,17 +2486,28 @@ private:
         c.h -= di;
         absorbedVolume += di * dx * dx;
       }
-      // film sotto la ritenzione di superficie: intrappolato/assorbito
-      const real fm = std::max(fmGlobal, c.ret);
+      // film sotto la ritenzione di superficie (scabrezza/depressioni del
+      // fondo): intrappolato/assorbito. Lo spessore minimo di pozza NON e' piu'
+      // una perdita di volume: lo tiene l'ancoraggio della linea di contatto.
+      const real fm = c.ret;
       if (c.h <= 0.0 || c.h >= fm)
         return;
       const real d = std::min(c.h, dAbs);
       c.h -= d;
-      absorbedVolume += d * dx * dx;
+      real rem = d;
       if (c.h < hDry) {
-        absorbedVolume += c.h * dx * dx;
+        rem += c.h;
         c.h = 0.0;
       }
+      if (retainToSink && c.inf <= 0.0) {
+        Retained &r =
+            retained[(long long)(i + 100000) * 200003LL + (j + 100000)];
+        r.i = i;
+        r.j = j;
+        r.v += rem * dx * dx;
+        r.z = c.b;
+      } else
+        absorbedVolume += rem * dx * dx;
     });
 
     updateFlags();

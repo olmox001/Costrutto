@@ -369,6 +369,12 @@
 //    - eliminata una divisione vettoriale (vRel/vMag) usando scalare k
 //    - v2 = vRel.dot(vRel) riusato per dragMag (evita vMag*vMag)
 //    - vRel testata come v2 (no sqrt inutile sul ramo d'uscita)
+//  FIX 2026 (unificazione):
+//    - quadraticDrag()/quadraticDragCoeff(): UNICA legge di resistenza
+//      F = -1/2 rho Cd A |v| v usata per aria E acqua e per ogni forma
+//      (prima: tre implementazioni diverse, con l'aria contata due volte).
+//    - sphereDragCoefficient(): crisi di resistenza continua (niente salto
+//      0.44 -> 0.15 a Re = 2e5).
 // ============================================================================
 
 #ifndef NQG_AIR_PHYSICS_HPP
@@ -382,6 +388,17 @@ namespace cleanroom {
 
 using engine::Rgb;
 using engine::Vec3;
+
+// Legge di resistenza quadratica UNICA (aria, acqua, qualunque forma):
+//   F = -1/2 rho Cd A |v| v           (v = velocita' relativa al fluido)
+//   k = 1/2 rho Cd A |v|  [kg/s]      (F = -k v, utile per integrazione implicita)
+inline real quadraticDragCoeff(real rho, real Cd, real area, real speed) {
+  return 0.5 * rho * Cd * area * speed;
+}
+inline Vec3 quadraticDrag(real rho, real Cd, real area, const Vec3 &vRel) {
+  const real k = quadraticDragCoeff(rho, Cd, area, vRel.norm());
+  return Vec3(-vRel.x * k, -vRel.y * k, -vRel.z * k);
+}
 
 struct AirProperties {
   real temperatureK = 293.15;
@@ -435,7 +452,12 @@ struct AirProperties {
     }
     if (Re < 2.0e5)
       return 0.44;
-    return 0.15;
+    if (Re > 4.0e5)
+      return 0.15;
+    // crisi di resistenza: raccordo liscio in log(Re) fra 2e5 e 4e5
+    const real x = std::log(Re / 2.0e5) / std::log(2.0);
+    const real w = x * x * (3.0 - 2.0 * x);
+    return 0.44 * (1.0 - w) + 0.15 * w;
   }
 
   void computeAerodynamicForces(real sphereRadius, real sphereMass,
@@ -462,13 +484,9 @@ struct AirProperties {
       return;
     }
     const real vMag = std::sqrt(v2);
-
     const real Re = (rho * vMag * (2.0 * sphereRadius)) / mu;
     ReOut = Re;
-    const real Cd = sphereDragCoefficient(Re);
-    // dragMag = 1/2 rho Cd A v^2 ; direzione: vRel/vMag * (-dragMag)
-    const real k = -(0.5 * rho * Cd * area * v2) / vMag;
-    fDrag = Vec3(vRel.x * k, vRel.y * k, vRel.z * k);
+    fDrag = quadraticDrag(rho, sphereDragCoefficient(Re), area, vRel);
   }
 };
 

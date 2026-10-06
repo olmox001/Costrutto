@@ -5,12 +5,12 @@ CXXFLAGS = -O2 -std=c++17 -Wall -Wextra -pthread
 LDFLAGS = -framework Cocoa $(shell pkg-config --cflags --libs sdl3)
 
 TARGETS = test_nqg_core test_engine3d test_window_sdl3 test_cleanroom \
-          test_matter_physics test_continuum_physics test_sdf nqg_sample_game \
+          test_matter_physics test_continuum_physics test_sdf test_water_spray nqg_sample_game \
           nqg_cleanroom_game
 
 COMMON_HDRS = nqg_physics_core.hpp nqg_engine3d.hpp nqg_sdf.hpp nqg_earth_environment.hpp \
               nqg_apartment.hpp nqg_air_physics.hpp nqg_matter_physics.hpp \
-              nqg_continuum_physics.hpp
+              nqg_continuum_physics.hpp nqg_water_spray.hpp nqg_cleanroom_engine.hpp
 
 all: $(TARGETS) app
 
@@ -34,6 +34,9 @@ test_continuum_physics: test_continuum_physics.cpp nqg_continuum_physics.hpp nqg
 
 test_sdf: test_sdf.cpp $(COMMON_HDRS)
 	$(CXX) $(CXXFLAGS) test_sdf.cpp -o test_sdf
+
+test_water_spray: test_water_spray.cpp $(COMMON_HDRS)
+	$(CXX) $(CXXFLAGS) test_water_spray.cpp -o test_water_spray
 
 nqg_sample_game: nqg_sample_game.cpp nqg_window_sdl3.hpp nqg_engine3d.hpp nqg_physics_core.hpp
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) nqg_sample_game.cpp -o nqg_sample_game
@@ -83,6 +86,7 @@ test: all
 	./test_matter_physics
 	./test_continuum_physics
 	./test_sdf
+	./test_water_spray
 
 run: nqg_sample_game
 	./nqg_sample_game

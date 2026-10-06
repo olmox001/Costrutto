@@ -293,9 +293,10 @@ int main() {
     for (int i = 0; i < 300; ++i)
       hi.step(1.0 / 30, in);
     CHECK("G2",
-          lo.plan.usage <= 1.0001 && hi.plan.usage < lo.plan.usage + 1e-9 + 1.0,
-          "uso capacita': %.2f (basso C_ops) vs %.2f (alto)", lo.plan.usage,
-          hi.plan.usage);
+          lo.plan.usage <= 1.0001 && hi.plan.usage <= 1.0001 &&
+              hi.plan.width >= lo.plan.width,
+          "uso capacita': %.2f (basso C_ops, %dpx) vs %.2f (alto, %dpx)",
+          lo.plan.usage, lo.plan.width, hi.plan.usage, hi.plan.width);
     Game f;
     f.cam.r = 6;
     real tid0 = f.tidal();

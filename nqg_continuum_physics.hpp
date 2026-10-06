@@ -373,12 +373,28 @@
 //     mantenevano la forza del frame precedente).
 //   - ElectromagneticField::applyToSolids(): accumula (+=) invece di
 //     sovrascrivere -> Coulomb e Lorentz coesistono.
+//  FIX 2026 (unificazione della fisica dei corpi rigidi):
+//   - Materiali: densita', attrito, restituzione, aspetto da nqg_materials.hpp
+//     (setMaterial / setHollow). La massa e' sempre rho_materiale x volume.
+//   - UNA sola resistenza (aria e acqua): cleanroom::quadraticDrag, area
+//     proiettata e Cd dalla forma del corpo (projectedArea/dragCd): nessun
+//     ramo "sfera" sparso nel codice. Aria contata UNA volta (prima 2).
+//   - Idrodinamica: squeeze-film con distanza minima di asperita' (i corpi
+//     pesanti ora scendono sul fondo e si fermano per attrito); disco o
+//     sfera in base alla forma del fondo; stato idrico iniziale coerente
+//     (nessuna iniezione di volume al primo passo).
+//   - Pavimento/terreno: penetrazione e contatto valutati su OGNI punto di
+//     appoggio con la normale del terreno (dune).
+//   - EM: carica limitata dalla rigidita' dielettrica dell'aria (scarica a
+//     corona) e distanza minima = somma dei raggi (prima 1 mC => 9 kN).
+//   - Vento: schermatura opzionale (dentro la casa non c'e' vento).
 // ============================================================================
 #ifndef NQG_CONTINUUM_PHYSICS_HPP
 #define NQG_CONTINUUM_PHYSICS_HPP
 
 #include "nqg_air_physics.hpp"
 #include "nqg_engine3d.hpp"
+#include "nqg_materials.hpp"
 #include "nqg_physics_core.hpp"
 #include "nqg_sdf.hpp"
 
@@ -424,6 +440,7 @@ struct HydroResult {
   real level = 0;
   real film = 0;
   real bedZ = 0;
+  Vec3 centroid = Vec3(0, 0, 0); // baricentro del volume immerso (spinta)
   bool wet = false;
 };
 
@@ -432,10 +449,23 @@ public:
   fluid::ShallowFlow flow;
 
   real refractiveIndex = 1.333;
-  Vec3 absorptionCoeff = Vec3(2.0, 0.25, 0.05);
+  // Coefficienti di assorbimento dell'acqua pura (Pope & Fry 1997) a ~610,
+  // ~550, ~460 nm [1/m].
+  Vec3 absorptionCoeff = Vec3(0.30, 0.064, 0.010);
   real bodyContactAngle = 1.1;
   real addedMassCoeffBox = 0.6;
   real addedMassCoeffSphere = 0.5;
+  real addedMassCoeffCylinder = 0.8; // flusso trasversale (cilindro/capsula)
+  // Scabrezza delle superfici a contatto: sotto questa distanza l'acqua
+  // sotto il corpo drena attraverso le asperita' e non c'e' piu' squeeze-film.
+  // (= scala di scabrezza del fondo, la stessa della ritenzione del film)
+  real asperityGap = fluid::ROUGHNESS;
+
+  // Quota del terreno SENZA i corpi (serve ai corpi appoggiati sul fondo).
+  std::function<real(real, real)> terrainFn;
+  real terrainAt(real x, real y) const {
+    return terrainFn ? terrainFn(x, y) : flow.bedAt(x, y);
+  }
 
   Vec3 basinCenter = Vec3(0, 0, 0);
   real waterVolume = 0.0;     // acqua reale (netta del volume spostato)
@@ -485,6 +515,26 @@ public:
   }
 
   void updateVolume() { waterVolume = flow.totalVolume() - displacedVolume; }
+
+  // Versamento di un volume V (m^3) con quantita' di moto: il raggio di
+  // deposito NON e' un numero a mano ma deriva dal volume (calotta
+  // semisferica di pari volume, r = cbrt(3V / 2pi), almeno mezza cella). Il
+  // resto lo fa il solutore: la velocita' di espansione e' quella del fronte
+  // (sqrt(g h) con h = profondita' risultante), quindi cresce con il volume.
+  // (vx, vy) = velocita' orizzontale del getto all'impatto [m/s].
+  void addVolumeSpread(real x, real y, real volume, real vx = 0.0,
+                       real vy = 0.0) {
+    if (!(volume > 0.0) || !std::isfinite(volume))
+      return;
+    const real r =
+        std::max(std::cbrt(3.0 * volume / (2.0 * PI)), 0.5 * flow.dx);
+    const real before = flow.totalVolume();
+    addVolume(x, y, r, volume);
+    const real applied = flow.totalVolume() - before;
+    if (applied > 0.0 && (vx != 0.0 || vy != 0.0))
+      flow.addMomentum(x, y, r, flow.liquid.rho * applied * vx,
+                       flow.liquid.rho * applied * vy);
+  }
 
   real density() const { return flow.liquid.rho; }
   real totalVolume() const { return flow.totalVolume(); }
@@ -538,18 +588,27 @@ public:
     return b > 0.5 * fluid::ShallowFlow::SOLID_Z ? fallback : b;
   }
 
+  // Normale visiva: solo la pendenza del pelo libero (vicini asciutti = quota
+  // del centro, mai la pendenza del fondo/sabbia), passo di differenza = 1
+  // cella (la ricostruzione bilineare ha normali discontinue ai bordi cella:
+  // allargare lo stencil elimina il reticolo nei riflessi) e dissolvenza verso
+  // la verticale quando il film e' sottile (nessuna riga scura sulla riva).
   Vec3 evaluateNormalVisual(real x, real y, real time) const {
-    auto c = flow.sample(x, y);
-    if (!c.wet)
-      return Vec3(0, 0, 1);
-    const real e = std::max(0.5 * flow.dx, 0.03);
-    const real inv2e = 1.0 / (2.0 * e);
-    const real hL = surfaceOrBed(x - e, y, c.eta);
-    const real hR = surfaceOrBed(x + e, y, c.eta);
-    const real hD = surfaceOrBed(x, y - e, c.eta);
-    const real hU = surfaceOrBed(x, y + e, c.eta);
     (void)time;
-    return Vec3(-(hR - hL) * inv2e, -(hU - hD) * inv2e, 1.0).normalized();
+    const auto c = flow.sampleRaw(x, y);
+    if (!c.valid)
+      return Vec3(0, 0, 1);
+    const real e = std::max(flow.dx, 0.05);
+    const real inv2e = 1.0 / (2.0 * e);
+    auto etaAt = [&](real xx, real yy) {
+      const auto r = flow.sampleRaw(xx, yy);
+      return (r.valid && r.depth > flow.visibleDepth) ? r.eta : c.eta;
+    };
+    const real dhdx = (etaAt(x + e, y) - etaAt(x - e, y)) * inv2e;
+    const real dhdy = (etaAt(x, y + e) - etaAt(x, y - e)) * inv2e;
+    const real t = std::clamp(c.depth / 0.004, 0.0, 1.0);
+    const real w = t * t * (3.0 - 2.0 * t);
+    return Vec3(-dhdx * w, -dhdy * w, 1.0).normalized();
   }
 
   real currentLevel() const {
@@ -574,12 +633,19 @@ public:
     flow.addDisturbance(pos.x, pos.y, std::max(0.06, 1.2 * flow.dx), amp);
   }
 
+  // Raggio vs pelo libero. Ray marching sulla superficie CONTINUA (sampleRaw:
+  // eta = fondo dove non c'e' acqua) con passo adattivo limitato dalla
+  // distanza verticale: un film sottile o un bordo radente non puo' essere
+  // "saltato" (prima: passo fisso >= dx/2 -> riva a segmenti e righe scure).
+  // Il film e' accettato solo se la profondita' alla radice e' visibile.
   bool intersectWater(const Vec3 &ro, const Vec3 &rd, real time, real &tOut,
-                      Vec3 &nOut, real &depthOut) const {
+                      Vec3 &nOut, real &depthOut, real tMax = 1e30) const {
     (void)time;
     if (!flow.hasWet)
       return false;
-    real tN = 0.001, tF = 1e30;
+    // tMax: distanza della prima superficie opaca gia' trovata; il raggio
+    // non cerca acqua oltre (osservatore: si risolve solo cio' che si vede)
+    real tN = 0.001, tF = tMax;
     auto slab = [&](real o, real d, real lo, real hi) {
       if (std::abs(d) < 1e-12)
         return o >= lo && o <= hi;
@@ -595,50 +661,51 @@ public:
         !slab(ro.z, rd.z, flow.bzMin - 0.5, flow.bzMax + 0.5))
       return false;
 
-    auto inside = [&](real t, fluid::ShallowFlow::Sample &s, real &etaUsed) {
+    fluid::ShallowFlow::Raw raw;
+    // g(t) = quota del raggio - quota della superficie (>0: sopra l'acqua)
+    auto gOf = [&](real t) {
       const Vec3 p = ro + rd * t;
-      s = flow.sample(p.x, p.y);
-      if (!s.wet)
-        return false;
-      etaUsed = s.eta;
-      return p.z < etaUsed;
+      raw = flow.sampleRaw(p.x, p.y);
+      return raw.valid ? p.z - raw.eta : 1e9;
     };
-
-    fluid::ShallowFlow::Sample s;
-    real etaUsed = 0;
-    if (inside(tN, s, etaUsed))
-      return false;
-    real tPrev = tN, t = tN;
+    real gPrev = gOf(tN);
+    if (gPrev <= 0.0 && raw.valid && raw.depth > flow.visibleDepth)
+      return false; // l'osservatore parte sott'acqua
     const real dx = flow.dx;
-    for (int it = 0; it < 4000 && t < tF; ++it) {
+    const real slope =
+        std::abs(rd.z) + 0.3; // |dg/dt| massimo (pendenza <= 0.3)
+    real tPrev = tN, t = tN;
+    for (int it = 0; it < 6000 && t < tF; ++it) {
       real step = dx;
-      if (s.wet) {
-        const real gap = (ro + rd * t).z - etaUsed;
-        const real half = 0.5 * std::abs(gap);
-        step = half < 0.5 * dx ? 0.5 * dx : (half > 2.0 * dx ? 2.0 * dx : half);
+      if (raw.valid) {
+        const real gap = std::abs(gPrev);
+        step = std::clamp(0.8 * gap / slope, 0.25 * dx, 2.0 * dx);
       }
       tPrev = t;
       t = std::min(t + step, tF);
-      if (inside(t, s, etaUsed)) {
+      const real g = gOf(t);
+      if (gPrev > 0.0 && g <= 0.0) {
         real lo = tPrev, hi = t;
-        for (int b = 0; b < 10; ++b) {
-          real mid = 0.5 * (lo + hi);
-          fluid::ShallowFlow::Sample sm;
-          real em;
-          if (inside(mid, sm, em))
-            hi = mid;
-          else
+        for (int b = 0; b < 16; ++b) {
+          const real mid = 0.5 * (lo + hi);
+          if (gOf(mid) > 0.0)
             lo = mid;
+          else
+            hi = mid;
         }
-        fluid::ShallowFlow::Sample sh;
-        real eu;
-        inside(hi, sh, eu);
-        const Vec3 p = ro + rd * hi;
-        tOut = hi;
-        nOut = evaluateNormalVisual(p.x, p.y, time);
-        depthOut = std::max(1e-4, sh.depth);
-        return true;
+        gOf(hi);
+        if (raw.valid && raw.depth > flow.visibleDepth) {
+          const Vec3 p = ro + rd * hi;
+          tOut = hi;
+          nOut = evaluateNormalVisual(p.x, p.y, time);
+          depthOut = std::max(1e-4, raw.depth);
+          return true;
+        }
+        // film non visibile: il raggio lo attraversa, si continua
+        gPrev = -1.0;
+        continue;
       }
+      gPrev = g;
       if (t >= tF)
         break;
     }
@@ -687,115 +754,6 @@ public:
            d * std::sqrt(std::max(0.0, 2.0 * r * h - h * h));
   }
 
-  HydroResult boxForces(const Vec3 &pos, const Vec3 &size, const Vec3 &vel,
-                        real g) const {
-    HydroResult r;
-    const real bottom = pos.z - 0.5 * size.z;
-    const real top = pos.z + 0.5 * size.z;
-    const real hx = 0.5 * size.x * 0.9, hy = 0.5 * size.y * 0.9;
-    const int N = 3;
-    int wetCount = 0;
-    real etaSum = 0, subSum = 0, bedSum = 0;
-    Vec3 vsum(0, 0, 0);
-    for (int a = 0; a < N; ++a)
-      for (int b = 0; b < N; ++b) {
-        const real fx = ((a + 0.5) / N) * 2.0 - 1.0;
-        const real fy = ((b + 0.5) / N) * 2.0 - 1.0;
-        auto s = flow.sample(pos.x + fx * hx, pos.y + fy * hy);
-        if (!s.wet)
-          continue;
-        ++wetCount;
-        etaSum += s.eta;
-        bedSum += s.bed;
-        vsum.x += s.u;
-        vsum.y += s.v;
-        real dsub = s.eta - bottom;
-        if (dsub < 0)
-          dsub = 0;
-        else if (dsub > size.z)
-          dsub = size.z;
-        subSum += dsub;
-      }
-    if (wetCount == 0)
-      return r;
-    const real inv = 1.0 / wetCount;
-    r.wet = true;
-    r.level = etaSum * inv;
-    r.waterVel = vsum * inv;
-    r.bedZ = bedSum * inv;
-    r.film = std::max(0.0, r.level - r.bedZ);
-    const real rho = flow.liquid.rho, mu = flow.liquid.mu;
-    const real dsub = subSum / (N * N);
-    r.submergedVolume = size.x * size.y * dsub;
-    r.submergedFraction = size.z > 0 ? dsub / size.z : 0.0;
-    if (r.submergedVolume <= 0)
-      return r;
-    r.buoyancy = rho * g * r.submergedVolume;
-    r.force.z += r.buoyancy;
-    r.addedMass = addedMassCoeffBox * rho * r.submergedVolume;
-    const Vec3 vr = vel - r.waterVel;
-    const real sp = vr.norm();
-    const real Re = rho * sp * std::max(size.x, size.y) / mu;
-    const real Cf = Re < 5e5 ? 1.328 / std::sqrt(std::max(Re, 1.0))
-                             : 0.074 * std::pow(Re, -0.2);
-    const real wetArea = 2.0 * size.x * size.y + 2.0 * (size.x + size.y) * dsub;
-    const real skin = 0.5 * rho * std::min(Cf, 0.2) * wetArea * sp;
-    r.dragCoeff.x = 0.5 * rho * 1.05 * size.y * dsub * std::abs(vr.x) + skin;
-    r.dragCoeff.y = 0.5 * rho * 1.05 * size.x * dsub * std::abs(vr.y) + skin;
-    r.dragCoeff.z = 0.5 * rho * 1.2 * size.x * size.y * std::abs(vr.z) + skin;
-    if (r.level > bottom && r.level < top) {
-      const real perimeter = 2.0 * (size.x + size.y);
-      r.force.z += fluid::capillaryVerticalForce(flow.liquid, perimeter,
-                                                 bodyContactAngle);
-    }
-    const real gap = bottom - r.bedZ;
-    const real Req = std::sqrt(size.x * size.y / PI);
-    if (gap < 0.2 * Req && gap < r.film)
-      r.squeeze = contact::squeezeDiscCoefficient(mu, Req, std::max(gap, 2e-5));
-    return r;
-  }
-
-  HydroResult sphereForces(const Vec3 &pos, real radius, const Vec3 &vel,
-                           real g) const {
-    HydroResult r;
-    auto s = flow.sample(pos.x, pos.y);
-    if (!s.wet)
-      return r;
-    r.wet = true;
-    r.level = s.eta;
-    r.waterVel = Vec3(s.u, s.v, 0);
-    r.bedZ = s.bed;
-    r.film = std::max(0.0, s.eta - s.bed);
-    const real rho = flow.liquid.rho, mu = flow.liquid.mu;
-    const real bottom = pos.z - radius;
-    const real hc = std::clamp(s.eta - bottom, 0.0, 2.0 * radius);
-    if (hc <= 0)
-      return r;
-    r.submergedVolume = PI * hc * hc * (3.0 * radius - hc) / 3.0;
-    r.submergedFraction =
-        r.submergedVolume / ((4.0 / 3.0) * PI * radius * radius * radius);
-    r.buoyancy = rho * g * r.submergedVolume;
-    r.force.z += r.buoyancy;
-    r.addedMass = addedMassCoeffSphere * rho * r.submergedVolume;
-    const Vec3 vr = vel - r.waterVel;
-    const real sp = vr.norm();
-    const real Re = rho * sp * 2.0 * radius / mu;
-    const real Cd = AirProperties::sphereDragCoefficient(Re);
-    const real area = segmentArea(radius, hc);
-    const real c = 0.5 * rho * Cd * area * sp;
-    r.dragCoeff = Vec3(c, c, c);
-    if (hc < 2.0 * radius) {
-      const real a = std::sqrt(std::max(0.0, 2.0 * radius * hc - hc * hc));
-      r.force.z += fluid::capillaryVerticalForce(flow.liquid, 2.0 * PI * a,
-                                                 bodyContactAngle);
-    }
-    const real gap = bottom - r.bedZ;
-    if (gap < 0.25 * radius && gap < r.film)
-      r.squeeze =
-          contact::squeezeSphereCoefficient(mu, radius, std::max(gap, 2e-5));
-    return r;
-  }
-
   void couple(real cx, real cy, real hx, real hy, bool circular, real dVolume,
               real px, real py) {
     const real margin = 1.5 * flow.dx;
@@ -803,24 +761,6 @@ public:
         flow.addVolumeRing(cx, cy, hx, hy, circular, margin, dVolume);
     flow.addMomentum(cx, cy, std::max(hx, hy) + 2.0 * flow.dx, px, py);
     updateVolume();
-  }
-
-  real couplePlayer(const Vec3 &pos, real radius, real footZ, real height,
-                    const Vec3 &vel, real dt, real prevSubmerged) {
-    auto s = flow.sample(pos.x, pos.y);
-    real sub = 0, px = 0, py = 0;
-    if (s.wet) {
-      const real d = std::clamp(s.eta - footZ, 0.0, height);
-      sub = PI * radius * radius * d;
-      const real rx = vel.x - s.u, ry = vel.y - s.v;
-      const real sp = std::sqrt(rx * rx + ry * ry);
-      const real area = 2.0 * radius * d;
-      const real F = 0.5 * flow.liquid.rho * 1.0 * area * sp;
-      px = F * rx * dt;
-      py = F * ry * dt;
-    }
-    couple(pos.x, pos.y, radius, radius, true, sub - prevSubmerged, px, py);
-    return sub;
   }
 };
 
@@ -843,7 +783,18 @@ public:
     return Vec3(psiX, psiY, psiZ);
   }
 
+  // Schermatura (0 = aria ferma, 1 = vento libero): la casa ripara dal vento.
+  std::function<real(const Vec3 &)> shelter;
+
   Vec3 evaluateVelocity(const Vec3 &p, real t) const {
+    const Vec3 v = evaluateFreeVelocity(p, t);
+    if (!shelter)
+      return v;
+    const real k = std::clamp(shelter(p), 0.0, 1.0);
+    return Vec3(v.x * k, v.y * k, v.z * k);
+  }
+
+  Vec3 evaluateFreeVelocity(const Vec3 &p, real t) const {
     const real e = 0.01;
     const real inv2e = 1.0 / (2.0 * e);
     Vec3 pXp = vectorPotential(p + Vec3(e, 0, 0), t);
@@ -862,20 +813,26 @@ public:
     return baseDrift + turbulent * turbulenceIntensity;
   }
 
+  // sphereRadius > 0: corpo sferico (Cd(Re) e sezione pi*r^2), altrimenti
+  // corpo prismatico con Cd = 1.05 sulla sezione laterale.
   Vec3 windForceOnBody(const Vec3 &bodyPos, const Vec3 &bodyVel,
-                       const Vec3 &bodySize, real airDensity,
-                       real simTime) const {
+                       const Vec3 &bodySize, real airDensity, real simTime,
+                       real sphereRadius = 0.0) const {
     Vec3 windVel = evaluateVelocity(bodyPos, simTime);
     Vec3 vRel = windVel - bodyVel;
     const real v2 = vRel.dot(vRel);
     if (v2 < 1e-10)
       return Vec3(0, 0, 0);
     const real vMag = std::sqrt(v2);
-    const real area =
-        std::max(bodySize.y * bodySize.z, bodySize.x * bodySize.z);
-    const real forceMag = 0.5 * airDensity * 1.05 * area * v2;
-    const real k = forceMag / vMag;
-    return Vec3(vRel.x * k, vRel.y * k, vRel.z * k);
+    real area = std::max(bodySize.y * bodySize.z, bodySize.x * bodySize.z);
+    real cd = 1.05;
+    if (sphereRadius > 0.0) {
+      const real Re = airDensity * vMag * 2.0 * sphereRadius / 1.82e-5;
+      cd = AirProperties::sphereDragCoefficient(Re);
+      area = PI * sphereRadius * sphereRadius;
+    }
+    // F = -1/2 rho Cd A |v| v sul moto relativo (corpo - aria) = +vRel
+    return cleanroom::quadraticDrag(airDensity, cd, area, vRel * (-1.0));
   }
 };
 
@@ -902,7 +859,25 @@ public:
       }
   }
 
+  // Massimo dell'altezza in cache: il rendering lo chiedeva a OGNI raggio
+  // scandendo 64x64 celle. Invalidato da ogni modifica fatta da questa classe.
+  mutable real hMaxCache_ = 0.0;
+  mutable bool hMaxValid_ = false;
+  real hMaxCached() const {
+    if (!hMaxValid_) {
+      real m = 0.0;
+      for (const auto &row : height)
+        for (real v : row)
+          m = std::max(m, v);
+      hMaxCache_ = m;
+      hMaxValid_ = true;
+    }
+    return hMaxCache_;
+  }
+  void invalidateBounds() { hMaxValid_ = false; }
+
   void pourSand(real worldX, real worldY, real amount = 0.02) {
+    hMaxValid_ = false;
     real localX = worldX - sandCenter.x;
     real localY = worldY - sandCenter.y;
     int i = int(localX / gridSpacing) + GRID_N / 2;
@@ -914,6 +889,7 @@ public:
   }
 
   void relaxAvalanche(int iterations = 4) {
+    hMaxValid_ = false;
     const real inv_dx = 1.0 / gridSpacing;
     static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
     for (int iter = 0; iter < iterations; ++iter)
@@ -973,13 +949,11 @@ public:
                      Vec3 &nOut) const {
     // Intervallo del raggio dentro la scatola [griglia] x [0, hMax].
     const real half = 0.5 * GRID_N * gridSpacing;
-    real hMax = 0.0;
-    for (const auto &row : height)
-      for (real v : row)
-        hMax = std::max(hMax, v);
+    const real hMax = hMaxCached();
     if (hMax <= 0.005)
       return false;
-    real t0 = 0.01, t1 = 1e30;
+    real t0 = 1e-5,
+         t1 = 1e30; // i raggi sotto un film sottile partono a mm dalla sabbia
     auto slab = [&](real o, real d, real lo, real hi) {
       if (std::abs(d) < 1e-12)
         return o >= lo && o <= hi;
@@ -1032,14 +1006,35 @@ public:
 // ============================================================================
 // 4. SOLIDI RIGIDI
 // ============================================================================
+struct RigidSolidElement;
+inline HydroResult bodyHydro(const ContinuousWaterBody &W,
+                             const RigidSolidElement &b, const Vec3 &vel,
+                             real g);
+
 struct RigidSolidElement {
-  enum class Shape { Box, Cylinder, Sphere, Custom };
+  enum class Shape { Box, Cylinder, Sphere, Capsule, Custom };
   Shape shape = Shape::Box;
   Vec3 pos = Vec3(-1.2, 3.2, 0.4);
   Vec3 vel = Vec3(0, 0, 0);
   Vec3 size = Vec3(0.4, 0.4, 0.4);
+  // La massa e' DERIVATA: mass = density * volume() (syncMass). `density` e'
+  // la densita' media del corpo (cavita' incluse). Default 70.3125 kg/m^3 =
+  // scatola leggera 0.4 m da 4.5 kg. I corpi statici hanno massa infinita.
   real mass = 4.5;
-  real density = 2400.0;
+  real density = 70.3125;
+  // Frazione dell'inviluppo geometrico realmente occupata da materia (1 =
+  // pieno). Massa e volume spostato scalano con essa (es. giocatore: la
+  // capsula e' l'ingombro, il corpo occupa ~17%).
+  real fillFraction = 1.0;
+  // Corpo cavo (cassa, palla): spessore di parete > 0 => fillFraction derivata
+  // dalla geometria (syncMass); la cavita' e' sigillata, quindi l'acqua e
+  // l'aria vedono l'INVILUPPO intero (spinta di Archimede sul volume esterno).
+  real hollowWall = 0.0;
+  bool sealedCavity = false;
+  bool lockRotation = false;    // corpo che resta in piedi (giocatore)
+  bool externalControl = false; // posizione/velocita' guidate da un controllore
+  bool visible = true;          // false: partecipa alla fisica ma non al render
+  real lastReynolds = 0.0;
   real restitution = 0.35;
   real charge = 0.0;
   Rgb albedo = {0.85f, 0.82f, 0.78f};
@@ -1051,11 +1046,21 @@ struct RigidSolidElement {
   real mu_k = 0.40;
   real rolling = 0.015;
   real prevSubmerged = 0;
+  real submergedNow = 0; // volume immerso all'ultimo passo (anche se appoggiato)
   real prevAddedMass = 0;
+  // Corpo appoggiato al fondo: per l'acqua e' parte del fondo (stessa regola
+  // per statici e mobili). Il volume spostato e' gia' contato dal fondo, quindi
+  // niente iniezione ad anello. Gestito da CleanRoomScene::updateWaterGrounding.
+  bool waterGrounded = false;
+  bool bedValid = false;
+  Vec3 bedPos = Vec3(0, 0, 0), bedEx = Vec3(1, 0, 0), bedEy = Vec3(0, 1, 0),
+       bedHalf = Vec3(0, 0, 0);
+  bool hydroInit = false; // stato idrico iniziale gia' allineato alla posa
 
   // Sleeping (anti-jitter)
   bool asleep = false;
   real sleepTimer = 0.0;
+  real restTimer = 0.0; // tempo a riposo DOPO il solver di contatto (pile)
   static constexpr real SLEEP_LIN_THRESH = 0.03; // m/s
   static constexpr real SLEEP_ANG_THRESH = 0.08; // rad/s
   static constexpr real SLEEP_TIME = 0.6;        // s
@@ -1108,6 +1113,15 @@ struct RigidSolidElement {
     case Shape::Cylinder:
       f->setRoot(f->cylinderZ(Vec3(0, 0, 0), std::min(h.x, h.y), h.z));
       break;
+    case Shape::Capsule: {
+      const real r = std::min(h.x, h.y), hs = std::max(0.0, h.z - r);
+      int c = f->sphere(Vec3(0, 0, -hs), r);
+      c = f->unite(c, f->sphere(Vec3(0, 0, hs), r));
+      if (hs > 1e-9)
+        c = f->unite(c, f->cylinderZ(Vec3(0, 0, 0), r, hs));
+      f->setRoot(c);
+      break;
+    }
     case Shape::Custom:
       if (cf) {
         *f = *cf;
@@ -1141,9 +1155,19 @@ struct RigidSolidElement {
       const real r = 0.5 * std::min(size.x, size.y);
       return PI * r * r * size.z;
     }
+    case Shape::Capsule: {
+      const real r = 0.5 * std::min(size.x, size.y);
+      const real cyl = std::max(0.0, size.z - 2.0 * r);
+      return PI * r * r * cyl + (4.0 / 3.0) * PI * r * r * r;
+    }
     default:
       return size.x * size.y * size.z;
     }
+  }
+  // Raggio e semi-asse della capsula (asse z locale): segmento [-hs, +hs]
+  real capsuleRadius() const { return 0.5 * std::min(size.x, size.y); }
+  real capsuleHalfSeg() const {
+    return std::max(0.0, 0.5 * size.z - capsuleRadius());
   }
   Vec3 halfExtents() const { return size * 0.5; }
   real boundRadius() const { return halfExtents().norm(); }
@@ -1151,6 +1175,112 @@ struct RigidSolidElement {
   void wake() {
     asleep = false;
     sleepTimer = 0.0;
+    restTimer = 0.0;
+  }
+
+  // Fattore di volume spostato nei fluidi: inviluppo intero se la cavita' e'
+  // sigillata, altrimenti solo la materia.
+  real displacedFactor() const {
+    return sealedCavity ? 1.0 : std::clamp(fillFraction, 1e-6, 1.0);
+  }
+  real displacedVolumeTotal() const { return volume() * displacedFactor(); }
+
+  // Il materiale fissa densita', attrito, restituzione e aspetto: nessun altro
+  // numero "magico" per corpo.
+  void setMaterial(const materials::Material &m) {
+    density = m.density;
+    restitution = m.restitution;
+    mu_s = m.mu_s;
+    mu_k = m.mu_k;
+    rolling = m.rolling;
+    albedo = m.albedo;
+    metallic = m.metallic;
+    roughness = m.roughness;
+    syncMass();
+  }
+  void setMaterial(materials::Id id) { setMaterial(materials::get(id)); }
+  // Guscio cavo e sigillato di spessore t (m) del materiale corrente.
+  void setHollow(real wallThickness) {
+    hollowWall = std::max(0.0, wallThickness);
+    sealedCavity = hollowWall > 0.0;
+    syncMass();
+  }
+
+  void syncMass() {
+    if (hollowWall > 0.0) {
+      const Vec3 h = size * 0.5;
+      const real hx = shape == Shape::Sphere ? std::min({h.x, h.y, h.z}) : h.x;
+      const real hy = shape == Shape::Sphere ? hx : h.y;
+      const real hz = shape == Shape::Sphere ? hx : h.z;
+      fillFraction = materials::shellFraction(hx, hy, hz, hollowWall);
+    }
+    if (!isStatic && density > 0.0)
+      mass = std::max(1e-6, density * fillFraction * volume());
+  }
+
+  // ---- proprieta' aerodinamiche/idrodinamiche DERIVATE dalla forma ----
+  // Area proiettata esatta lungo la direzione dirW (corpo nel suo riferimento).
+  real projectedArea(const Vec3 &dirW) const {
+    const real dn = dirW.norm();
+    const Vec3 h = size * 0.5;
+    const Vec3 d = dn > 1e-12 ? Vec3(dirW.dot(ex) / dn, dirW.dot(ey) / dn,
+                                     dirW.dot(ez) / dn)
+                              : Vec3(1, 0, 0);
+    switch (shape) {
+    case Shape::Sphere: {
+      const real r = std::min({h.x, h.y, h.z});
+      return PI * r * r;
+    }
+    case Shape::Cylinder: {
+      const real R = std::min(h.x, h.y);
+      return PI * R * R * std::abs(d.z) +
+             2.0 * R * (2.0 * h.z) * std::sqrt(std::max(0.0, 1.0 - d.z * d.z));
+    }
+    case Shape::Capsule: {
+      const real R = std::min(h.x, h.y), hs = std::max(0.0, h.z - R);
+      return PI * R * R +
+             2.0 * R * (2.0 * hs) * std::sqrt(std::max(0.0, 1.0 - d.z * d.z));
+    }
+    default:
+      return 4.0 * (h.y * h.z * std::abs(d.x) + h.x * h.z * std::abs(d.y) +
+                    h.x * h.y * std::abs(d.z));
+    }
+  }
+  // Coefficiente di resistenza di forma (sfera: Cd(Re); gli altri corpi tozzi).
+  // axial = flusso lungo l'asse z del corpo (facce piane o estremi
+  // arrotondati).
+  real dragCd(real Re, bool axial = false) const {
+    switch (shape) {
+    case Shape::Sphere:
+      return AirProperties::sphereDragCoefficient(Re);
+    case Shape::Cylinder:
+      return axial ? 1.15 : 1.0;
+    case Shape::Capsule:
+      return axial ? 0.5 : 0.8;
+    default:
+      return axial ? 1.2 : 1.05;
+    }
+  }
+  // Coefficiente di massa aggiunta (volume di fluido co-accelerato / V).
+  real addedMassCoeff(const ContinuousWaterBody &W) const;
+  // Il fondo e' piano (squeeze a disco) o curvo (squeeze a sfera)?
+  bool flatBottom() const {
+    return shape == Shape::Box || shape == Shape::Cylinder ||
+           shape == Shape::Custom;
+  }
+  // Raggio equivalente (sfera di pari volume d'inviluppo): scala del corpo.
+  real effectiveRadius() const {
+    return std::cbrt(3.0 * volume() / (4.0 * PI));
+  }
+  // Carica massima sostenibile: oltre la rigidita' dielettrica dell'aria
+  // (~3 MV/m) il corpo si scarica a corona. E = k q / R^2 <= E_break.
+  real maxCharge() const {
+    const real R = effectiveRadius();
+    return 3.0e6 * R * R / phys::k_coulomb;
+  }
+  real effectiveCharge() const {
+    const real qm = maxCharge();
+    return std::clamp(charge, -qm, qm);
   }
 
   Vec3 localInertiaDiag() const {
@@ -1161,7 +1291,7 @@ struct RigidSolidElement {
       const real i = 0.4 * mass * r * r;
       return Vec3(i, i, i);
     }
-    if (shape == Shape::Cylinder) {
+    if (shape == Shape::Cylinder || shape == Shape::Capsule) {
       const real r = 0.5 * std::min(size.x, size.y), h = size.z;
       const real it = mass * (3.0 * r * r + h * h) / 12.0;
       return Vec3(it, it, 0.5 * mass * r * r);
@@ -1172,7 +1302,7 @@ struct RigidSolidElement {
   }
 
   Vec3 applyInvInertia(const Vec3 &t) const {
-    if (isStatic || mass <= 0.0)
+    if (isStatic || lockRotation || mass <= 0.0)
       return Vec3(0, 0, 0);
     const Vec3 il = localInertiaDiag();
     if (il.x < 1e-12 || il.y < 1e-12 || il.z < 1e-12)
@@ -1188,7 +1318,9 @@ struct RigidSolidElement {
     const Vec3 d = p - pos;
     return Vec3(d.dot(ex), d.dot(ey), d.dot(ez));
   }
-  Vec3 dirToWorld(const Vec3 &v) const { return ex * v.x + ey * v.y + ez * v.z; }
+  Vec3 dirToWorld(const Vec3 &v) const {
+    return ex * v.x + ey * v.y + ez * v.z;
+  }
 
   // distanza con segno dal solido (mondo)
   real distanceWorld(const Vec3 &p) const { return field().eval(toLocal(p)); }
@@ -1213,6 +1345,8 @@ struct RigidSolidElement {
   }
 
   void integrateOrientation(real dt) {
+    if (lockRotation)
+      return;
     const real w2 = angVel.norm2();
     if (w2 < 1e-24)
       return;
@@ -1477,8 +1611,49 @@ struct RigidSolidElement {
   // gap residuo entro `margin`, utile per contatti di riposo stabili).
   // Funziona anche con solidi COINCIDENTI (stessa posa): non dipende dal
   // campionamento della sola superficie.
+  // Capsula C contro solido O: punto dell'asse piu' vicino a O (campionato
+  // su estremi e quota del centro di O), distanza esatta dal campo SDF di O.
+  // nOut punta da O verso C; point = punto di contatto sulla capsula.
+  static bool capsuleContact(const RigidSolidElement &C,
+                             const RigidSolidElement &O, real margin,
+                             Vec3 &nOut, real &depthOut, Vec3 &point) {
+    const real r = C.capsuleRadius(), hs = C.capsuleHalfSeg();
+    const Vec3 axis = C.ez;
+    real best = 1e30;
+    Vec3 bestP = C.pos, bestG(0, 0, 1);
+    const real tc = std::clamp((O.pos - C.pos).dot(axis), -hs, hs);
+    for (real t : {-hs, 0.0, hs, tc}) {
+      const Vec3 p = C.pos + axis * t;
+      Vec3 g(0, 0, 1);
+      const real d = O.distanceGradWorld(p, g);
+      if (d < best) {
+        best = d;
+        bestP = p;
+        bestG = g;
+      }
+    }
+    const real depth = r - best;
+    if (depth <= -margin)
+      return false;
+    nOut = bestG;
+    depthOut = depth;
+    point = bestP - bestG * r;
+    return true;
+  }
+
   static bool sdfOverlap(const RigidSolidElement &A, const RigidSolidElement &B,
                          Vec3 &colNormal, real &overlap, real margin = 0.0) {
+    if (A.shape == Shape::Capsule && B.shape != Shape::Capsule) {
+      Vec3 p;
+      return capsuleContact(A, B, margin, colNormal, overlap, p);
+    }
+    if (B.shape == Shape::Capsule && A.shape != Shape::Capsule) {
+      Vec3 p, n;
+      if (!capsuleContact(B, A, margin, n, overlap, p))
+        return false;
+      colNormal = n * -1.0;
+      return true;
+    }
     if (A.shape == Shape::Sphere || B.shape == Shape::Sphere) {
       Vec3 g(0, 0, 1);
       if (A.shape == Shape::Sphere) {
@@ -1512,14 +1687,206 @@ struct RigidSolidElement {
 
   struct Manifold {
     Vec3 points[4];
+    // penetrazione per punto lungo la normale (>0 compenetrazione, <0 gap
+    // residuo): serve ai contatti speculativi di riposo. 0 se sconosciuta.
+    real depth[4] = {0, 0, 0, 0};
     int count = 0;
   };
 
+  // Manifold Box-Box per CLIPPING DI FACCIA (Sutherland-Hodgman): la faccia
+  // incidente viene ritagliata sui lati della faccia di riferimento; restano
+  // al massimo 4 punti che coprono davvero il poligono d'appoggio, con la
+  // loro profondita'. Il vecchio campionamento (angoli/spigoli/centri di
+  // entrambi i corpi, 4 piu' lontani dal baricentro) dava insiemi sbilanciati
+  // e coppie spurie => le pile scivolavano e si respingevano.
+  // n punta da B verso A. Restituisce false se non applicabile.
+  static bool boxBoxManifold(const RigidSolidElement &A,
+                             const RigidSolidElement &B, real margin,
+                             const Vec3 &n, Manifold &m) {
+    if (A.shape != Shape::Box || B.shape != Shape::Box ||
+        A.cornerRadius > 0.0 || B.cornerRadius > 0.0)
+      return false;
+    auto bestAxis = [&](const RigidSolidElement &R, const Vec3 &dir, int &k,
+                        real &sgn) {
+      const Vec3 ax[3] = {R.ex, R.ey, R.ez};
+      real best = -1.0;
+      for (int i = 0; i < 3; ++i) {
+        const real d = ax[i].dot(dir);
+        if (std::abs(d) > best) {
+          best = std::abs(d);
+          k = i;
+          sgn = d >= 0 ? 1.0 : -1.0;
+        }
+      }
+      return best;
+    };
+    int kA = 0, kB = 0;
+    real sA = 1, sB = 1;
+    // faccia di A rivolta verso B ha normale -n; faccia di B rivolta verso A:
+    // +n
+    const real alA = bestAxis(A, n * -1.0, kA, sA);
+    const real alB = bestAxis(B, n, kB, sB);
+    const bool refIsA = alA >= alB;
+    const RigidSolidElement &R = refIsA ? A : B;
+    const RigidSolidElement &I = refIsA ? B : A;
+    const int kR = refIsA ? kA : kB;
+    const real sR = refIsA ? sA : sB;
+    const Vec3 axR[3] = {R.ex, R.ey, R.ez};
+    const Vec3 axI[3] = {I.ex, I.ey, I.ez};
+    const Vec3 hR = R.halfExtents(), hI = I.halfExtents();
+    const real hRv[3] = {hR.x, hR.y, hR.z};
+    const real hIv[3] = {hI.x, hI.y, hI.z};
+    const Vec3 fn = axR[kR] * sR; // normale uscente della faccia di riferimento
+    const Vec3 cR = R.pos + fn * hRv[kR];
+    const int ku = (kR + 1) % 3, kv = (kR + 2) % 3;
+    const Vec3 u = axR[ku], v = axR[kv];
+    const real hu = hRv[ku], hv = hRv[kv];
+    // faccia incidente: la piu' anti-parallela a fn
+    int kI = 0;
+    real sI = 1;
+    {
+      real best = -1.0;
+      for (int i = 0; i < 3; ++i) {
+        const real d = axI[i].dot(fn);
+        if (std::abs(d) > best) {
+          best = std::abs(d);
+          kI = i;
+          sI = d >= 0 ? -1.0 : 1.0; // normale uscente incidente = -sign*asse
+        }
+      }
+    }
+    const Vec3 cI = I.pos + axI[kI] * (sI * hIv[kI]);
+    const int ia = (kI + 1) % 3, ib = (kI + 2) % 3;
+    Vec3 poly[16], tmp[16];
+    int np = 4;
+    poly[0] = cI + axI[ia] * hIv[ia] + axI[ib] * hIv[ib];
+    poly[1] = cI - axI[ia] * hIv[ia] + axI[ib] * hIv[ib];
+    poly[2] = cI - axI[ia] * hIv[ia] - axI[ib] * hIv[ib];
+    poly[3] = cI + axI[ia] * hIv[ia] - axI[ib] * hIv[ib];
+    auto clip = [&](const Vec3 &dir, real lim) {
+      int nt = 0;
+      for (int i = 0; i < np; ++i) {
+        const Vec3 &p = poly[i];
+        const Vec3 &q = poly[(i + 1) % np];
+        const real dp = (p - cR).dot(dir) - lim;
+        const real dq = (q - cR).dot(dir) - lim;
+        if (dp <= 0 && nt < 15)
+          tmp[nt++] = p;
+        if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
+          const real t = dp / (dp - dq);
+          if (nt < 15)
+            tmp[nt++] = p + (q - p) * t;
+        }
+      }
+      for (int i = 0; i < nt; ++i)
+        poly[i] = tmp[i];
+      np = nt;
+    };
+    clip(u, hu);
+    if (np)
+      clip(u * -1.0, hu);
+    if (np)
+      clip(v, hv);
+    if (np)
+      clip(v * -1.0, hv);
+    if (np == 0)
+      return false;
+    Vec3 pts[16];
+    real dep[16];
+    int nk = 0;
+    for (int i = 0; i < np; ++i) {
+      const real sep = (poly[i] - cR).dot(fn); // <0: dentro il riferimento
+      if (sep > margin)
+        continue;
+      const Vec3 onFace = poly[i] - fn * (0.5 * sep); // meta' tra le facce
+      pts[nk] = onFace;
+      dep[nk] = -sep;
+      ++nk;
+    }
+    if (nk == 0)
+      return false;
+    int sel[4];
+    int ns = 0;
+    if (nk <= 4) {
+      for (int i = 0; i < nk; ++i)
+        sel[ns++] = i;
+    } else {
+      // 4 punti che massimizzano l'area del poligono d'appoggio
+      Vec3 c(0, 0, 0);
+      for (int i = 0; i < nk; ++i)
+        c = c + pts[i];
+      c = c * (1.0 / real(nk));
+      int i0 = 0;
+      real bd = -1;
+      for (int i = 0; i < nk; ++i) {
+        const real d = (pts[i] - c).norm2();
+        if (d > bd) {
+          bd = d;
+          i0 = i;
+        }
+      }
+      int i1 = i0;
+      bd = -1;
+      for (int i = 0; i < nk; ++i) {
+        const real d = (pts[i] - pts[i0]).norm2();
+        if (d > bd) {
+          bd = d;
+          i1 = i;
+        }
+      }
+      const Vec3 e = pts[i1] - pts[i0];
+      int i2 = i0, i3 = i0;
+      real bp = 0, bn = 0;
+      for (int i = 0; i < nk; ++i) {
+        const real sd = e.cross(pts[i] - pts[i0]).dot(fn);
+        if (sd > bp) {
+          bp = sd;
+          i2 = i;
+        }
+        if (sd < bn) {
+          bn = sd;
+          i3 = i;
+        }
+      }
+      sel[ns++] = i0;
+      sel[ns++] = i1;
+      if (i2 != i0)
+        sel[ns++] = i2;
+      if (i3 != i0 && i3 != i2)
+        sel[ns++] = i3;
+    }
+    m.count = ns;
+    for (int i = 0; i < ns; ++i) {
+      m.points[i] = pts[sel[i]];
+      m.depth[i] = dep[sel[i]];
+    }
+    return true;
+  }
+
   static Manifold buildManifold(const RigidSolidElement &A,
-                                const RigidSolidElement &B,
-                                real margin = 1e-4,
+                                const RigidSolidElement &B, real margin = 1e-4,
                                 const Vec3 *nBtoA = nullptr) {
     Manifold m;
+    if (nBtoA && boxBoxManifold(A, B, margin, *nBtoA, m))
+      return m;
+    if (A.shape == Shape::Capsule && B.shape != Shape::Capsule) {
+      Vec3 n, p;
+      real d;
+      if (capsuleContact(A, B, margin, n, d, p)) {
+        m.points[0] = p;
+        m.count = 1;
+      }
+      return m;
+    }
+    if (B.shape == Shape::Capsule && A.shape != Shape::Capsule) {
+      Vec3 n, p;
+      real d;
+      if (capsuleContact(B, A, margin, n, d, p)) {
+        m.points[0] = p;
+        m.count = 1;
+      }
+      return m;
+    }
     Vec3 buf[64];
     int n = 0;
     for (const Vec3 &v : A.supportPointsWorld())
@@ -1580,6 +1947,11 @@ struct RigidSolidElement {
                     real simTime, const GroundHeightFn &groundHeight = {}) {
     if (isStatic || dt <= 0)
       return;
+    syncMass();
+    if (externalControl) { // il controllore integra il moto: qui solo contatti
+      asleep = false;
+      return;
+    }
 
     // --- Sleeping: corpi a riposo non si integrano -> niente jitter ---
     if (asleep) {
@@ -1589,18 +1961,34 @@ struct RigidSolidElement {
     }
 
     lastGravity = gravityVec * mass;
-    lastWindForce = wind.windForceOnBody(pos, vel, size, airDensity, simTime);
+    const Vec3 windVel = wind.evaluateVelocity(pos, simTime);
+    constexpr real MU_AIR = 1.82e-5;
+    {
+      const real vA = (windVel - vel).norm();
+      lastReynolds = airDensity * vA * std::max(size.x, size.z) / MU_AIR;
+    }
     const real g = std::max(1e-6, gravityVec.norm());
     const int n = std::clamp(int(std::ceil(dt / 0.004)), 1, 24);
     const real h = dt / n;
-    const real area = std::max(size.x * size.z, size.y * size.z);
-    const real airBeta = airDensity * 0.5 * 1.05 * area;
+    // volume spostato nell'aria: stessa regola dei fluidi (inviluppo se cavo
+    // sigillato, materia altrimenti)
+    const real vol = displacedVolumeTotal();
     const Vec3 pos0 = pos, vel0 = vel;
     const Vec3 ex0 = ex, ey0 = ey, ez0 = ez, av0 = angVel;
     Vec3 reaction(0, 0, 0);
 
+    if (!hydroInit) {
+      // Nascita/risveglio: il volume gia' immerso NON e' un nuovo ingresso in
+      // acqua (altrimenti iniezione istantanea di volume + massa aggiunta
+      // = impulso spurio che scaglia i corpi).
+      const HydroResult H0 = bodyHydro(water, *this, vel, g);
+      prevSubmerged = H0.submergedVolume;
+      prevAddedMass = H0.addedMass;
+      hydroInit = true;
+    }
+    Vec3 lastDragAir(0, 0, 0);
     for (int k = 0; k < n; ++k) {
-      HydroResult H = water.boxForces(pos, size, vel, g);
+      HydroResult H = bodyHydro(water, *this, vel, g);
       if (H.addedMass > prevAddedMass + 1e-12) {
         const real f = (mass + prevAddedMass) / (mass + H.addedMass);
         const Vec3 vr = vel - H.waterVel;
@@ -1611,18 +1999,48 @@ struct RigidSolidElement {
       prevAddedMass = H.addedMass;
       const real meff = mass + H.addedMass;
       lastBuoyancy = Vec3(0, 0, H.buoyancy);
+      // spinta applicata al baricentro del volume immerso: il momento
+      // raddrizza i corpi che galleggiano (stessa regola per ogni forma)
+      if (!lockRotation && H.buoyancy > 0.0)
+        angVel =
+            angVel +
+            applyInvInertia((H.centroid - pos).cross(Vec3(0, 0, H.buoyancy))) *
+                h;
+      // Archimede nell'aria sulla parte emersa (stessa regola per tutti)
+      const Vec3 airBuoy = (gravityVec * -1.0) *
+                           (airDensity * vol *
+                            (1.0 - std::clamp(H.submergedFraction, 0.0, 1.0)));
 
-      // Somma forze: gravita' (CoM), buoyancy+drag (acqua),
-      // vento, campo EM (Lorentz + Coulomb tra solidi).
-      const Vec3 F = lastGravity + H.force + lastWindForce + lastEMForce;
-      vel = vel + F * (h / meff);
-      vel = vel * (1.0 / (1.0 + airBeta * h / mass));
+      // Forze: gravita' (CoM), spinta+resistenza (acqua), campo EM, Archimede
+      // in aria. La resistenza dell'aria e' UNA sola, relativa al vento, ed e'
+      // integrata implicitamente (stabile per qualunque passo).
+      const Vec3 F = lastGravity + H.force + lastEMForce + airBuoy;
+      const Vec3 vrA = vel - windVel;
+      const real vA = vrA.norm();
+      // la parte immersa non vede l'aria: resistenza solo sulla frazione emersa
+      const real kAir =
+          (1.0 - std::clamp(H.submergedFraction, 0.0, 1.0)) *
+          cleanroom::quadraticDragCoeff(
+              airDensity,
+              dragCd(airDensity * vA * std::max(size.x, size.z) / MU_AIR),
+              projectedArea(vrA), vA);
+      lastDragAir = vrA * (-kAir);
+      const real a = kAir * h / meff;
+      vel = (vel + F * (h / meff) + windVel * a) * (1.0 / (1.0 + a));
 
       if (H.wet) {
         const Vec3 vr = vel - H.waterVel;
+        // Lo scambio di quantita' di moto verticale con l'acqua non puo'
+        // superare la massa d'acqua coinvolta (rho x volume immerso): uno
+        // strato sottile non frena (ne' fa rimbalzare) un corpo pesante come
+        // farebbe un'acqua profonda. La viscosita' agisce poi tramite lo
+        // squeeze-film (cuscinetto che drena) qui sotto.
+        const real fracCap = std::clamp(
+            water.flow.liquid.rho * H.submergedVolume / meff, 0.0, 1.0);
+        const real fz = std::max(1.0 / (1.0 + H.dragCoeff.z * h / meff),
+                                 1.0 - fracCap);
         Vec3 vn(vr.x / (1.0 + H.dragCoeff.x * h / meff),
-                vr.y / (1.0 + H.dragCoeff.y * h / meff),
-                vr.z / (1.0 + H.dragCoeff.z * h / meff));
+                vr.y / (1.0 + H.dragCoeff.y * h / meff), vr.z * fz);
         if (H.squeeze > 0 && vn.z < 0)
           vn.z /= 1.0 + H.squeeze * h / meff;
         reaction = reaction + (vr - vn) * meff;
@@ -1636,6 +2054,7 @@ struct RigidSolidElement {
       angVel = angVel * (1.0 - 0.05 * h);
       resolveFloor(h, H, F.z, water, groundHeight);
     }
+    lastWindForce = lastDragAir;
 
     if (!(std::isfinite(pos.x) && std::isfinite(pos.y) &&
           std::isfinite(pos.z) && std::isfinite(vel.x) &&
@@ -1674,8 +2093,18 @@ struct RigidSolidElement {
       sleepTimer = 0.0;
     }
 
-    HydroResult Hf = water.boxForces(pos, size, vel, g);
-    water.couple(pos.x, pos.y, 0.5 * size.x, 0.5 * size.y, false,
+    HydroResult Hf = bodyHydro(water, *this, vel, g);
+    submergedNow = Hf.submergedVolume;
+    if (waterGrounded) {
+      // appoggiato: il fondo dell'acqua e' gia' il corpo (volume spostato
+      // contato dal fondo); lo stato dell'anello riparte da zero al distacco
+      prevSubmerged = 0.0;
+      return;
+    }
+    const Vec3 hw = halfW();
+    water.couple(pos.x, pos.y, hw.x, hw.y,
+                 shape == Shape::Sphere || shape == Shape::Cylinder ||
+                     shape == Shape::Capsule,
                  Hf.submergedVolume - prevSubmerged, reaction.x, reaction.y);
     prevSubmerged = Hf.submergedVolume;
   }
@@ -1685,24 +2114,50 @@ private:
                     const ContinuousWaterBody &water,
                     const GroundHeightFn &groundHeight) {
     real groundZ = 0.0;
+    Vec3 gN(0, 0, 1); // normale del terreno (piano z=0, oppure duna)
     if (groundHeight) {
       real gz = groundHeight(pos.x, pos.y);
       if (std::isfinite(gz) && gz > groundZ)
         groundZ = gz;
+      if (groundZ > 1e-3) {
+        const real e = 0.05;
+        const real gxp = groundHeight(pos.x + e, pos.y),
+                   gxm = groundHeight(pos.x - e, pos.y),
+                   gyp = groundHeight(pos.x, pos.y + e),
+                   gym = groundHeight(pos.x, pos.y - e);
+        if (std::isfinite(gxp) && std::isfinite(gxm) && std::isfinite(gyp) &&
+            std::isfinite(gym))
+          gN = Vec3(-(gxp - gxm) / (2.0 * e), -(gyp - gym) / (2.0 * e), 1.0)
+                   .normalized();
+      }
     }
     const Vec3 half = halfExtents();
     const real hZ = std::abs(ex.z) * half.x + std::abs(ey.z) * half.y +
                     std::abs(ez.z) * half.z;
     // punto piu' basso del campo SDF (punti di superficie campionati)
     auto verts = supportPointsWorld();
-    real bottom = lowestZ(); // esatto (sfere/cilindri/forme custom non affondano)
+    real bottom =
+        lowestZ(); // esatto (sfere/cilindri/forme custom non affondano)
     for (const auto &v : verts)
       bottom = std::min(bottom, v.z);
-    if (bottom > groundZ + 1e-4)
+    // penetrazione massima su OGNI punto d'appoggio (terreno non piano)
+    real lift = groundZ - bottom;
+    real gAt[26];
+    for (std::size_t q = 0; q < verts.size(); ++q) {
+      real gz = 0.0;
+      if (groundHeight) {
+        const real t = groundHeight(verts[q].x, verts[q].y);
+        if (std::isfinite(t))
+          gz = std::max(0.0, t);
+      }
+      gAt[q] = gz;
+      lift = std::max(lift, gz - verts[q].z);
+    }
+    if (lift < -1e-4)
       return;
-    pos.z += (groundZ - bottom);
+    pos.z += lift;
     for (auto &v : verts)
-      v.z += (groundZ - bottom);
+      v.z += lift;
 
     const real mu = water.flow.liquid.mu;
     const real film = H.wet ? std::max(0.0, H.level - H.bedZ) : 0.0;
@@ -1712,9 +2167,9 @@ private:
     Vec3 contacts[26];
     int nc = 0;
     const real contactTol = 2e-3;
-    for (const auto &v : verts)
-      if (v.z <= groundZ + contactTol)
-        contacts[nc++] = v;
+    for (std::size_t q = 0; q < verts.size(); ++q)
+      if (verts[q].z <= std::max(groundZ, gAt[q]) + contactTol)
+        contacts[nc++] = verts[q];
     if (nc == 0) {
       // nessun campione a terra (es. sfera): punto di supporto esatto
       contacts[nc++] = supportPointWorld(Vec3(0, 0, -1));
@@ -1734,7 +2189,9 @@ private:
     }
     const real muS = mu_s * fw, muK = mu_k * fw;
     const real invM = 1.0 / mass;
-    const Vec3 dirs[3] = {Vec3(0, 0, 1), Vec3(1, 0, 0), Vec3(0, 1, 0)};
+    // base di contatto: normale del terreno + due tangenti
+    const Vec3 tg1 = (Vec3(1, 0, 0) - gN * gN.x).normalized();
+    const Vec3 dirs[3] = {gN, tg1, gN.cross(tg1)};
     auto kEff = [&](const Vec3 &r, const Vec3 &d) {
       return invM + d.dot(applyInvInertia(r.cross(d)).cross(r));
     };
@@ -1790,9 +2247,10 @@ private:
     for (int k = 0; k < nc; ++k)
       Jtot += acc[k][0];
     if (Jtot > 0.0) {
-      const real iz = applyInvInertia(Vec3(0, 0, 1)).z;
+      const real iz = applyInvInertia(gN).dot(gN);
       const real dwMax = muK * Jtot * 0.25 * D * iz;
-      angVel.z -= std::clamp(angVel.z, -dwMax, dwMax);
+      const real wn = angVel.dot(gN);
+      angVel = angVel - gN * std::clamp(wn, -dwMax, dwMax);
     }
 
     if (rolling > 0.0 && mass > 0.0) {
@@ -1808,6 +2266,185 @@ private:
     }
   }
 };
+
+inline real
+RigidSolidElement::addedMassCoeff(const ContinuousWaterBody &W) const {
+  switch (shape) {
+  case Shape::Sphere:
+    return W.addedMassCoeffSphere;
+  case Shape::Cylinder:
+  case Shape::Capsule:
+    return W.addedMassCoeffCylinder;
+  default:
+    return W.addedMassCoeffBox;
+  }
+}
+
+// ============================================================================
+//  Idrodinamica UNICA per qualunque forma: il volume immerso e il suo
+//  baricentro si ricavano integrando il campo SDF del corpo lungo colonne
+//  verticali fra il fondo del corpo e la quota dell'acqua. Galleggiamento,
+//  massa aggiunta, resistenza, capillarita' e film derivano da li'.
+// ============================================================================
+inline HydroResult bodyHydro(const ContinuousWaterBody &W,
+                             const RigidSolidElement &b, const Vec3 &vel,
+                             real g) {
+  using Shape = RigidSolidElement::Shape;
+  HydroResult r;
+  b.prepare();
+  const Vec3 hw = b.halfW();
+  const real bottom = b.pos.z - hw.z, top = b.pos.z + hw.z;
+  const int N =
+      std::clamp(int(std::ceil(2.0 * std::max(hw.x, hw.y) / 0.06)), 4, 10);
+  const real cellA = (2.0 * hw.x / N) * (2.0 * hw.y / N);
+  real etaSum = 0, bedSum = 0, vSub = 0, footA = 0;
+  Vec3 uSum(0, 0, 0), cSum(0, 0, 0);
+  real minX = 1e30, maxX = -1e30, minY = 1e30, maxY = -1e30;
+  int wetCols = 0;
+  // Corpo appoggiato: la sua impronta e' fondo per l'acqua (colonne asciutte).
+  // Il livello e la corrente sono quelli dell'acqua che lo circonda.
+  bool haveRing = false;
+  real ringEta = 0.0;
+  Vec3 ringU(0, 0, 0);
+  {
+    // Livello idrostatico "fantasma" sotto il corpo SOLO se l'anello e'
+    // bagnato su TUTTI gli 8 campioni (corpo davvero immerso in uno
+    // specchio d'acqua). Con campioni asciutti (riva, bordo di un film
+    // sottile) l'acqua non e' idrostaticamente connessa: prima la media dei
+    // soli campioni bagnati dava una colonna fantasma profonda sotto il corpo
+    // => spinta di Archimede enorme => il corpo veniva lanciato (rimbalzo).
+    // Si usa il MINIMO: il livello non puo' superare quello piu' basso
+    // dell'anello.
+    const real rr = std::hypot(hw.x, hw.y) + 2.0 * W.flow.dx;
+    int n = 0;
+    real etaMin = 1e30;
+    for (int k = 0; k < 8; ++k) {
+      const real ang = k * PI / 4.0;
+      auto q = W.flow.sample(b.pos.x + rr * std::cos(ang),
+                             b.pos.y + rr * std::sin(ang));
+      if (!q.wet)
+        continue;
+      etaMin = std::min(etaMin, q.eta);
+      ringU.x += q.u;
+      ringU.y += q.v;
+      ++n;
+    }
+    if (n == 8) {
+      ringEta = etaMin;
+      ringU = ringU * (1.0 / n);
+      haveRing = true;
+    }
+  }
+  for (int a = 0; a < N; ++a)
+    for (int c = 0; c < N; ++c) {
+      const real x = b.pos.x + (((a + 0.5) / N) * 2.0 - 1.0) * hw.x;
+      const real y = b.pos.y + (((c + 0.5) / N) * 2.0 - 1.0) * hw.y;
+      auto s = W.flow.sample(x, y);
+      // colonna asciutta ma circondata d'acqua (corpo appena appoggiato o
+      // appena sollevato): vale il livello idrostatico circostante
+      if (!s.wet && haveRing && W.terrainAt(x, y) <= ringEta) {
+        s.wet = true;
+        s.eta = ringEta;
+        s.u = ringU.x;
+        s.v = ringU.y;
+      }
+      if (b.waterGrounded)
+        s.bed = W.terrainAt(x, y);
+      if (!s.wet)
+        continue;
+      ++wetCols;
+      etaSum += s.eta;
+      bedSum += s.bed;
+      uSum.x += s.u;
+      uSum.y += s.v;
+      const real zHi = std::min(top, s.eta);
+      if (zHi <= bottom)
+        continue;
+      const int K = std::clamp(int(std::ceil((zHi - bottom) / 0.01)), 1, 12);
+      const real dz = (zHi - bottom) / K;
+      int inside = 0;
+      real zc = 0;
+      for (int k = 0; k < K; ++k) {
+        const real z = bottom + (k + 0.5) * dz;
+        if (b.distanceWorld(Vec3(x, y, z)) < 0.0) {
+          ++inside;
+          zc += z;
+        }
+      }
+      if (inside == 0)
+        continue;
+      const real v = inside * dz * cellA;
+      vSub += v;
+      footA += cellA;
+      cSum = cSum + Vec3(x, y, zc / inside) * v;
+      minX = std::min(minX, x - 0.5 * (2.0 * hw.x / N));
+      maxX = std::max(maxX, x + 0.5 * (2.0 * hw.x / N));
+      minY = std::min(minY, y - 0.5 * (2.0 * hw.y / N));
+      maxY = std::max(maxY, y + 0.5 * (2.0 * hw.y / N));
+    }
+  if (wetCols == 0)
+    return r;
+  const real inv = 1.0 / wetCols;
+  r.wet = true;
+  r.level = etaSum * inv;
+  r.waterVel = uSum * inv;
+  r.bedZ = bedSum * inv;
+  r.film = std::max(0.0, r.level - r.bedZ);
+  if (vSub <= 0.0)
+    return r;
+  const real rho = W.flow.liquid.rho, mu = W.flow.liquid.mu;
+  const real V = std::max(b.volume(), 1e-12);
+  // volume spostato: inviluppo (cavo sigillato) o sola materia (corpo pieno)
+  const real dispF = b.displacedFactor();
+  vSub *= dispF;
+  r.submergedVolume = vSub;
+  r.submergedFraction = std::min(1.0, vSub / (V * dispF));
+  r.centroid = cSum * (1.0 / vSub);
+  r.buoyancy = rho * g * vSub;
+  r.force.z += r.buoyancy;
+  r.addedMass = b.addedMassCoeff(W) * rho * vSub;
+  const real extX = maxX - minX, extY = maxY - minY;
+  const real hs = vSub / std::max(footA, 1e-12);
+  const real boxV = 8.0 * hw.x * hw.y * hw.z;
+  const real pf = std::sqrt(std::clamp(V / std::max(boxV, 1e-12), 0.1, 1.0));
+  const Vec3 vr = vel - r.waterVel;
+  const real sp = vr.norm();
+  const real dChar = std::max(extX, extY);
+  const real Re = rho * sp * dChar / mu;
+  const real Cf = Re < 5e5 ? 1.328 / std::sqrt(std::max(Re, 1.0))
+                           : 0.074 * std::pow(Re, -0.2);
+  const real wetArea = 2.0 * footA + 2.0 * (extX + extY) * hs * pf;
+  const real skin = 0.5 * rho * std::min(Cf, 0.2) * wetArea * sp;
+  const real cdSide = b.dragCd(Re, false);
+  const real cdTop = b.dragCd(Re, true);
+  r.dragCoeff.x = 0.5 * rho * cdSide * extY * hs * pf * std::abs(vr.x) + skin;
+  r.dragCoeff.y = 0.5 * rho * cdSide * extX * hs * pf * std::abs(vr.y) + skin;
+  r.dragCoeff.z = 0.5 * rho * cdTop * footA * pf * std::abs(vr.z) + skin;
+  if (r.level > bottom && r.level < top) {
+    const real perim = (b.shape == Shape::Box || b.shape == Shape::Custom)
+                           ? 2.0 * (extX + extY)
+                           : PI * 0.5 * (extX + extY);
+    r.force.z +=
+        fluid::capillaryVerticalForce(W.flow.liquid, perim, W.bodyContactAngle);
+  }
+  // Squeeze-film (Reynolds): l'acqua sotto un corpo che si avvicina al fondo
+  // deve drenare lateralmente. Fondo piano -> disco, fondo curvo -> sfera.
+  // Sotto la distanza di asperita' il film non regge piu' (contatto per
+  // asperita'): il corpo pesante tocca il fondo e lo trattiene l'attrito.
+  const real gap = b.lowestZ() - r.bedZ;
+  if (gap >= W.asperityGap && gap < r.film &&
+      gap < 0.2 * std::max(dChar, 1e-3)) {
+    if (b.flatBottom()) {
+      const real Req = std::sqrt(std::max(footA, 1e-12) / PI);
+      r.squeeze = contact::squeezeDiscCoefficient(mu, Req, gap);
+    } else {
+      const real Rc =
+          b.shape == Shape::Sphere ? b.sphereRadius() : b.capsuleRadius();
+      r.squeeze = contact::squeezeSphereCoefficient(mu, Rc, gap);
+    }
+  }
+  return r;
+}
 
 // ============================================================================
 // 5-6. EM e Quantistico
@@ -1897,9 +2534,10 @@ public:
   // Lorentz: campo E/B sui solidi carichi. ACCUMULA (+=).
   void applyToSolids(std::vector<RigidSolidElement> &solids) const {
     for (auto &s : solids) {
-      if (s.isStatic || std::abs(s.charge) < 1e-15)
+      const real q = s.effectiveCharge();
+      if (s.isStatic || std::abs(q) < 1e-15)
         continue;
-      s.lastEMForce = s.lastEMForce + lorentzForce(s.pos, s.vel, s.charge);
+      s.lastEMForce = s.lastEMForce + lorentzForce(s.pos, s.vel, q);
     }
   }
 
@@ -1909,14 +2547,20 @@ public:
       if (solids[i].isStatic)
         continue;
       for (std::size_t j = i + 1; j < solids.size(); ++j) {
-        real qi = solids[i].charge, qj = solids[j].charge;
+        // carica limitata dalla scarica a corona dell'aria
+        real qi = solids[i].effectiveCharge(), qj = solids[j].effectiveCharge();
         if (std::abs(qi) < 1e-15 || std::abs(qj) < 1e-15)
           continue;
         Vec3 rVec = solids[i].pos - solids[j].pos;
         real r = rVec.norm();
-        if (r < 0.05)
-          r = 0.05;
-        Vec3 rHat = rVec * (1.0 / r);
+        // i corpi non si compenetrano: il centro non puo' stare piu' vicino
+        // della somma dei raggi equivalenti
+        const real rMin = std::max(0.05, solids[i].effectiveRadius() +
+                                             solids[j].effectiveRadius());
+        if (r < rMin)
+          r = rMin;
+        Vec3 rHat =
+            rVec.normalized(); // direzione vera (non quella del r limitato)
         real fMag = phys::k_coulomb * qi * qj / (r * r);
         Vec3 force = rHat * fMag;
         if (!solids[i].isStatic)

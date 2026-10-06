@@ -361,420 +361,93 @@
 #
 # ---------------------------------------------------------------------------*/
 // ============================================================================
-//  nqg_cleanroom_game.cpp  -  Appartamento su Globo Terrestre (SDL3)
-//  FIX 2025e:
-//   - renderW/H: 640x480 -> 320x240 (4x meno pixel, ~4x FPS).
-//     Modifica questi due valori se vuoi piu' qualita' o piu' fps.
-//   - Campo EM di esempio impostato su due solidi (charge ±1e-3 C)
-//     per verificare visivamente l'effetto della forza di Coulomb.
+//  nqg_materials.hpp  -  Tabella dei materiali di base (SORGENTE UNICA)
+//  ---------------------------------------------------------------------------
+//  Ogni corpo rigido ricava da QUI densita', attrito, restituzione, rotolamento
+//  e aspetto. La massa NON si assegna mai a mano: mass = rho_materiale x
+//  volume_di_materia (syncMass). Un oggetto "cavo" (cassa, palla) e' descritto
+//  da materiale + spessore di parete (RigidSolidElement::setHollow), cosi' la
+//  densita' media risulta dalla geometria e non da un numero magico.
+//  Valori tipici da letteratura (kg/m^3, coefficienti adimensionali).
 // ============================================================================
+#ifndef NQG_MATERIALS_HPP
+#define NQG_MATERIALS_HPP
 
-#include "nqg_cleanroom_engine.hpp"
-#include "nqg_matter_physics.hpp"
-#include "nqg_window_sdl3.hpp"
-#include <algorithm>
-#include <iostream>
-#include <memory>
+#include "nqg_engine3d.hpp"
+#include "nqg_physics_core.hpp"
 
-using namespace nqg;
-using namespace nqg::cleanroom;
-using namespace nqg::matter;
-using namespace nqg::window;
+namespace nqg {
+namespace materials {
 
-int main(int argc, char *argv[]) {
-  (void)argc;
-  (void)argv;
+struct Material {
+  const char *name = "generico";
+  real density = 1000.0;     // kg/m^3 (materiale pieno)
+  real restitution = 0.30;   // coefficiente di restituzione (urto verso rigido)
+  real mu_s = 0.50;          // attrito statico
+  real mu_k = 0.40;          // attrito cinetico
+  real rolling = 0.015;      // resistenza al rotolamento C_rr
+  engine::Rgb albedo = {0.80f, 0.78f, 0.74f};
+  real metallic = 0.0;
+  real roughness = 0.5;
+};
 
-  std::cout << "Avvio NQG Apartment su Globo Terrestre...\n";
+enum class Id {
+  Concrete,
+  Plaster,
+  CeramicTile,
+  Brick,
+  Stone,
+  Steel,
+  Aluminium,
+  Glass,
+  OakWood,
+  PineWood,
+  Plywood,
+  Cardboard,
+  RubberBall,
+  HardPlastic,
+  Foam,
+  Ice,
+  HumanBody,
+  QuartzSand
+};
 
-  WindowConfig cfg;
-  cfg.title = "NQG Apartment on Earth - Unified Collision";
-  cfg.windowWidth = 1280;
-  cfg.windowHeight = 720;
-  cfg.resizable = true;
-  cfg.vsync = true;
-  cfg.headless = false;
-  cfg.enableAudio = true;
-  cfg.showHud = true;
-
-  WindowComponent app;
-  if (!app.init(cfg)) {
-    std::cerr << "Errore apertura finestra SDL3!\n";
-    return 1;
-  }
-
-  CleanRoomScene scene;
-
-  // --- FPS: 320x240 e' 4x piu' veloce di 640x480 ---
-  // Se hai una GPU veloce e vuoi piu' dettaglio, alza a 480x360 o 640x480.
-  int renderW = 480;
-  int renderH = 360;
-
-  // --- Campo EM di esempio: due solidi carichi (attrazione Coulomb) ---
-  // Attivalo/commentalo per testare.
-  {
-    // i primi room.walls.size() solidi sono le pareti: poi tavolo, cassa
-    // grande e cassa piccola
-    const std::size_t w0 = scene.room.walls.size();
-    if (scene.solids.size() > w0 + 2) {
-      scene.solids[w0 + 1].charge = +1e-3; // cassa grande
-      scene.solids[w0 + 2].charge = -1e-3; // cassa piccola
-    }
-  }
-
-  apartment::CapsuleCollider playerBody;
-  playerBody.radius = 0.30;
-  playerBody.height = 1.80;
-  playerBody.eyeHeight = 1.70;
-
-  Vec3 camPos(0, -3.0, playerBody.eyeHeight);
-  earth::GlobeResolver globe;
-  globe.setPosition(camPos);
-  real camPitch = -0.05;
-  bool zeroGravity = false;
-
-  Vec3 camVel(0, 0, 0);
-  bool freefallMode = false;
-  bool spaceWasDown = false;
-  double spacePressTime = 0.0;
-  double lastTapTime = -100.0;
-  double controlTime = 0.0;
-
-  constexpr double TAP_MAX_DURATION = 0.25;
-  constexpr double DOUBLE_TAP_WINDOW = 0.40;
-  constexpr real BASE_MOVE_SPEED = 10.0;
-  constexpr real BASE_FLY_SPEED = 15.0;
-  constexpr real JUMP_IMPULSE = 5.5;
-  constexpr real FREEFALL_THRUST = 20.0;
-  constexpr real SHIFT_BOOST = 10.0;
-  constexpr real COLLISION_STEP = 0.05;
-
-  std::cout
-      << "Appartamento: 12m x 10m x 3.2m con porta sud.\n"
-         "SPACE: tap=salto | hold=volo | 2xTap=FREE-FALL\n"
-         "SHIFT: boost 10x\n"
-         "[1] Acqua | [2] Sabbia | [3] Solido | [T] Vento | [G] Gravita'\n"
-         "[L] Luce | [X] Pulisci | [ESC] Esci\n";
-
-  while (app.pollEvents()) {
-    double dt = app.computeDeltaTime();
-    controlTime += dt;
-    auto &im = app.input();
-
-    if (im.isMouseLeftDown()) {
-      globe.turn(im.mouseDeltaX() * 0.0035);
-      camPitch -= im.mouseDeltaY() * 0.0035;
-    }
-    if (im.isKeyDown(SDL_SCANCODE_LEFT))
-      globe.turn(-1.6 * dt);
-    if (im.isKeyDown(SDL_SCANCODE_RIGHT))
-      globe.turn(1.6 * dt);
-    if (im.isKeyDown(SDL_SCANCODE_UP))
-      camPitch += 1.2 * dt;
-    if (im.isKeyDown(SDL_SCANCODE_DOWN))
-      camPitch -= 1.2 * dt;
-
-    const Vec3 up = globe.up;
-    const Vec3 forward = globe.fwd;
-    const Vec3 right = globe.right();
-    const Vec3 lookDir = forward * std::cos(camPitch) + up * std::sin(camPitch);
-    const Vec3 viewUp = up * std::cos(camPitch) - forward * std::sin(camPitch);
-
-    real altitudeFactor =
-        std::sqrt(1.0 + std::max(0.0, globe.altitude()) / 10.0);
-    real shiftMult =
-        (im.isKeyDown(SDL_SCANCODE_LSHIFT) || im.isKeyDown(SDL_SCANCODE_RSHIFT))
-            ? SHIFT_BOOST
-            : 1.0;
-    real moveSpeed = BASE_MOVE_SPEED * altitudeFactor * shiftMult;
-    real flySpeed = BASE_FLY_SPEED * altitudeFactor * shiftMult;
-    real thrustScaled = FREEFALL_THRUST * altitudeFactor;
-
-    const bool spaceDown = im.isKeyDown(SDL_SCANCODE_SPACE);
-    const bool spaceJustPressed = spaceDown && !spaceWasDown;
-    const bool spaceJustReleased = !spaceDown && spaceWasDown;
-    const bool spaceHeldLongEnough =
-        spaceDown && (controlTime - spacePressTime) > TAP_MAX_DURATION;
-
-    if (spaceJustPressed)
-      spacePressTime = controlTime;
-    if (spaceJustReleased) {
-      const double heldDuration = controlTime - spacePressTime;
-      if (heldDuration < TAP_MAX_DURATION) {
-        if (controlTime - lastTapTime < DOUBLE_TAP_WINDOW) {
-          freefallMode = !freefallMode;
-          lastTapTime = -100.0;
-          if (app.audio())
-            app.audio()->triggerTransient(freefallMode ? 220.0f : 660.0f, 0.5f,
-                                          45.0f);
-        } else {
-          camVel = camVel + up * (JUMP_IMPULSE - camVel.dot(up));
-          lastTapTime = controlTime;
-          if (app.audio())
-            app.audio()->triggerTransient(440.0f, 0.35f, 22.0f);
-        }
-      }
-    }
-    spaceWasDown = spaceDown;
-
-    Vec3 oldPos = camPos;
-    Vec3 disp(0, 0, 0);
-    if (freefallMode) {
-      Vec3 acc(0, 0, 0);
-      if (!zeroGravity)
-        acc = acc - up * scene.currentGravity;
-      acc = acc - (camVel - scene.currentWind) * (scene.currentDensity * 0.4);
-      if (spaceHeldLongEnough)
-        acc = acc + up * thrustScaled;
-      const real airCtrl = 3.0 * altitudeFactor;
-      if (im.isKeyDown(SDL_SCANCODE_W))
-        acc = acc + forward * airCtrl;
-      if (im.isKeyDown(SDL_SCANCODE_S))
-        acc = acc - forward * airCtrl;
-      if (im.isKeyDown(SDL_SCANCODE_A))
-        acc = acc - right * airCtrl;
-      if (im.isKeyDown(SDL_SCANCODE_D))
-        acc = acc + right * airCtrl;
-      camVel = camVel + acc * dt;
-      disp = camVel * dt;
-    } else {
-      Vec3 wish(0, 0, 0);
-      if (im.isKeyDown(SDL_SCANCODE_W))
-        wish = wish + forward;
-      if (im.isKeyDown(SDL_SCANCODE_S))
-        wish = wish - forward;
-      if (im.isKeyDown(SDL_SCANCODE_A))
-        wish = wish - right;
-      if (im.isKeyDown(SDL_SCANCODE_D))
-        wish = wish + right;
-      real vUp = camVel.dot(up);
-      if (spaceHeldLongEnough)
-        vUp = std::max(vUp, flySpeed);
-      else if (!zeroGravity && globe.altitude() > playerBody.eyeHeight + 1e-3)
-        vUp -= scene.currentGravity * dt;
-      if (im.isKeyDown(SDL_SCANCODE_C)) {
-        vUp = 0;
-        disp = up * (-moveSpeed * dt);
-      } else {
-        disp = up * (vUp * dt);
-      }
-      disp = disp + wish * (moveSpeed * dt);
-      camVel = up * vUp;
-    }
-
-    {
-      // il giocatore urta con la propria velocita' di marcia (massa x v)
-      const Vec3 hd = disp - up * disp.dot(up);
-      scene.playerMoveVel = (!freefallMode && std::isfinite(hd.norm()))
-                                ? hd * (1.0 / std::max(1e-3, dt))
-                                : Vec3(0, 0, 0);
-    }
-    const real moveLen = disp.norm();
-    int nSub = 1;
-    if (std::isfinite(moveLen) && moveLen > COLLISION_STEP &&
-        camPos.norm2() < 300.0 * 300.0)
-      nSub = std::clamp(int(std::ceil(moveLen / COLLISION_STEP)), 1, 256);
-    const Vec3 subDelta = disp * (1.0 / real(nSub));
-    for (int i = 0; i < nSub; ++i) {
-      const real dUp = subDelta.dot(globe.up);
-      globe.walk(subDelta - globe.up * dUp, dUp);
-      camPos = globe.pos;
-      scene.resolvePlayerCollision(camPos, camVel, playerBody);
-      globe.setPosition(camPos);
-    }
-    camPos = globe.pos;
-
-    // Il giocatore e' un corpo rigido come gli altri: spinta, resistenza e
-    // quantita' di moto ceduta all'acqua passano dalla stessa idrodinamica.
-    {
-      Vec3 moveVel = (camPos - oldPos) * (1.0 / std::max(1e-3, dt));
-      moveVel.z = 0.0;
-      if (!(moveVel.norm() < 50.0))
-        moveVel = Vec3(0, 0, 0);
-      scene.couplePlayer(camPos, camVel, moveVel, playerBody, dt);
-    }
-
-    Vec3 spawnTarget = camPos + lookDir * 2.2;
-
-    if (im.wasKeyPressed(SDL_SCANCODE_1) || im.isKeyDown(SDL_SCANCODE_1)) {
-      // getto d'acqua: 4 L/s versati nel punto indicato (volume reale)
-      // il raggio di deposito deriva dal volume (addVolumeSpread)
-      scene.water.addVolumeSpread(spawnTarget.x, spawnTarget.y, 0.004 * dt);
-      if (app.audio())
-        app.audio()->triggerTransient(320.0f, 0.45f, 22.0f);
-    }
-    if (im.wasKeyPressed(SDL_SCANCODE_2) || im.isKeyDown(SDL_SCANCODE_2)) {
-      scene.sand.pourSand(spawnTarget.x, spawnTarget.y, 0.05);
-      scene.sand.relaxAvalanche(5);
-      if (app.audio())
-        app.audio()->triggerTransient(880.0f, 0.22f, 35.0f);
-    }
-    if (im.wasKeyPressed(SDL_SCANCODE_3)) {
-      continuum::RigidSolidElement box;
-      box.pos = spawnTarget;
-      box.size = Vec3(0.4, 0.4, 0.4);
-      box.albedo = {0.88f, 0.88f, 0.82f};
-      box.metallic = 0.2;
-      box.roughness = 0.3;
-      scene.addSolid(box); // nasce sempre senza compenetrazioni
-    }
-    if (im.wasKeyPressed(SDL_SCANCODE_G)) {
-      zeroGravity = !zeroGravity;
-      scene.setZeroGravity(zeroGravity);
-    }
-    if (im.isKeyDown(SDL_SCANCODE_T)) {
-      scene.air.windVelocity = Vec3(lookDir.x * 6.5, lookDir.y * 6.5, 0.8);
-    }
-    if (im.wasKeyPressed(SDL_SCANCODE_L)) {
-      static int lightMode = 0;
-      lightMode = (lightMode + 1) % 3;
-      if (lightMode == 0) {
-        scene.lighting = LightingSystem::createApartmentPreset();
-      } else if (lightMode == 1) {
-        for (auto &l : scene.lighting.lights) {
-          l.temperatureK = 2700.0;
-          l.intensity = 2.0;
-        }
-      } else {
-        for (std::size_t i = 0; i < scene.lighting.lights.size(); ++i) {
-          scene.lighting.lights[i].active = (i == 0);
-          scene.lighting.lights[i].intensity = 0.9;
-        }
-      }
-    }
-    if (im.wasKeyPressed(SDL_SCANCODE_X)) {
-      scene.matterSim.clear();
-      scene.removeDynamicSpheres();
-    }
-
-    scene.stepPhysics(dt);
-    {
-      // urti subiti dagli altri corpi (cubi, palla): spingono il giocatore
-      Vec3 dPos, dVel;
-      if (!freefallMode && scene.consumePlayerFeedback(dPos, dVel)) {
-        globe.setPosition(camPos + dPos);
-        camPos = globe.pos;
-        camVel = camVel + dVel;
-      }
-    }
-
-    for (const auto &ev : scene.matterSim.frameAudioEvents) {
-      if (app.audio())
-        app.audio()->triggerTransient(static_cast<float>(ev.frequency),
-                                      static_cast<float>(ev.intensity), 28.0f);
-    }
-    real windMag = scene.currentWind.norm();
-    app.updateAudio(dt, 1.0, 0.0, windMag > 0.5 ? windMag * 0.15 : 0.0, 0.0);
-
-    Image frame = scene.renderView(renderW, renderH, camPos, lookDir, viewUp);
-    app.renderFrame(frame);
-
-    SDL_Renderer *ren = app.renderer();
-    if (ren && app.hud().mode() != HudRenderer::HudMode::Off) {
-      int winW = 0, winH = 0;
-      SDL_GetWindowSize(app.window(), &winW, &winH);
-      SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-
-      SDL_FRect rMat{20, 20, 460, 362};
-      SDL_SetRenderDrawColor(ren, 15, 25, 38, 230);
-      SDL_RenderFillRect(ren, &rMat);
-      SDL_SetRenderDrawColor(ren, 50, 130, 210, 255);
-      SDL_RenderRect(ren, &rMat);
-
-      SDL_SetRenderDrawColor(ren, 100, 220, 255, 255);
-      SDL_RenderDebugText(ren, 30, 28, "=== APPARTAMENTO SU TERRA ===");
-      SDL_SetRenderDrawColor(ren, 230, 240, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 48, "Pos: %.2f, %.2f, %.2f", camPos.x,
-                                camPos.y, camPos.z);
-      SDL_RenderDebugTextFormat(ren, 30, 66, "Piedi/Testa: %.2f / %.2f m",
-                                playerBody.footZ(globe.altitude()),
-                                playerBody.headZ(globe.altitude()));
-      SDL_RenderDebugTextFormat(
-          ren, 30, 84, "In stanza: %s | In spillway: %s",
-          scene.room.insideXY(camPos) ? "SI" : "NO",
-          scene.water.isInsideSpillway(camPos.x, camPos.y) ? "SI" : "NO");
-      SDL_RenderDebugTextFormat(
-          ren, 30, 102, "Alt: %.1f m | giro: %.5f (n=%ld)",
-          scene.currentAltitude, globe.revolutionFraction(), globe.turns);
-      SDL_RenderDebugTextFormat(ren, 30, 120, "Gravita': %.4f m/s^2",
-                                zeroGravity ? 0.0 : scene.currentGravity);
-      SDL_RenderDebugTextFormat(ren, 30, 138, "Pressione: %.0f Pa",
-                                scene.currentPressure);
-      SDL_RenderDebugTextFormat(ren, 30, 156, "Densita': %.5f kg/m^3",
-                                scene.currentDensity);
-      SDL_RenderDebugTextFormat(ren, 30, 174, "Vel. camera: %.2f m/s",
-                                camVel.norm());
-      SDL_RenderDebugTextFormat(ren, 30, 192, "Substep collisione: %d", nSub);
-      SDL_RenderDebugTextFormat(
-          ren, 30, 210, "Acqua livello: %.3f m (vol %.2f m^3)",
-          scene.water.currentLevel(), scene.water.waterVolume);
-      SDL_RenderDebugTextFormat(ren, 30, 228, "Celle bagnate: %zu",
-                                scene.water.wetCells());
-
-      // Stato sleeping/EM dei solidi
-      int nAsleep = 0, nAwake = 0;
-      real maxEM = 0.0;
-      for (const auto &s : scene.solids) {
-        if (s.isStatic)
-          continue;
-        if (s.asleep)
-          ++nAsleep;
-        else
-          ++nAwake;
-        maxEM = std::max(maxEM, s.lastEMForce.norm());
-      }
-      SDL_RenderDebugTextFormat(ren, 30, 246,
-                                "Solidi: awake=%d asleep=%d | |F_EM|max=%.3e",
-                                nAwake, nAsleep, maxEM);
-
-      SDL_SetRenderDrawColor(ren, freefallMode ? 255 : 100,
-                             freefallMode ? 180 : 220, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 264,
-                                "SPACE: tap=salt | hold=vola | 2x=%s",
-                                freefallMode ? "FREE-FALL ON" : "Direct");
-      SDL_SetRenderDrawColor(ren, 230, 240, 255, 255);
-      SDL_RenderDebugTextFormat(ren, 30, 282,
-                                "Stanza 12x10x3.2m + spillway 2x3m");
-      SDL_RenderDebugTextFormat(ren, 30, 300, "Solidi totali: %zu | FPS: %.1f",
-                                scene.solids.size(), app.fps());
-      SDL_RenderDebugTextFormat(ren, 30, 318,
-                                "Render: %dx%d (alza in cpp se vuoi)", renderW,
-                                renderH);
-      SDL_RenderDebugTextFormat(ren, 30, 336, "Pos. spawn: %.2f, %.2f, %.2f",
-                                spawnTarget.x, spawnTarget.y, spawnTarget.z);
-
-      SDL_FRect rAir{static_cast<float>(winW - 360), 20, 340, 120};
-      SDL_SetRenderDrawColor(ren, 15, 25, 38, 230);
-      SDL_RenderFillRect(ren, &rAir);
-      SDL_SetRenderDrawColor(ren, 210, 150, 40, 255);
-      SDL_RenderRect(ren, &rAir);
-
-      SDL_SetRenderDrawColor(ren, 255, 210, 100, 255);
-      SDL_RenderDebugText(ren, winW - 350, 28, "=== AMBIENTE ===");
-      SDL_SetRenderDrawColor(ren, 230, 240, 255, 255);
-      SDL_RenderDebugTextFormat(ren, winW - 350, 48, "Scattering: %.2e /m",
-                                scene.effectiveScattering());
-      SDL_RenderDebugTextFormat(ren, winW - 350, 64, "US Std 1976 (7 strati)");
-      SDL_RenderDebugTextFormat(ren, winW - 350, 80, "Somigliana + free-air");
-      SDL_RenderDebugTextFormat(ren, winW - 350, 96, "Lights: %zu",
-                                scene.lighting.lights.size());
-
-      SDL_SetRenderDrawColor(ren, 80, 210, 255, 200);
-      SDL_RenderLine(ren, winW / 2 - 8, winH / 2, winW / 2 + 8, winH / 2);
-      SDL_RenderLine(ren, winW / 2, winH / 2 - 8, winW / 2, winH / 2 + 8);
-
-      SDL_SetRenderDrawColor(ren, 220, 230, 240, 240);
-      SDL_RenderDebugText(
-          ren, winW / 2 - 540, winH - 24,
-          "[SPACE] tap=Salt | hold=Volo | 2x=FreeFall | [SHIFT] Boost 10x | "
-          "[1] Acqua | [2] Sabbia | [3] Solido | [T] Vento | [G] Grav | "
-          "[L] Luce | [ESC] Esci");
-    }
-
-    app.present();
-  }
-
-  app.shutdown();
-  std::cout << "Appartamento chiuso.\n";
-  return 0;
+inline const Material &get(Id id) {
+  using engine::Rgb;
+  static const Material T[] = {
+      // nome           rho     e     mus   muk   Crr    albedo                     met   rough
+      {"calcestruzzo", 2400.0, 0.10, 0.65, 0.55, 0.020, Rgb{0.62f, 0.62f, 0.60f}, 0.00, 0.90},
+      {"intonaco",     1200.0, 0.05, 0.60, 0.50, 0.020, Rgb{0.88f, 0.86f, 0.82f}, 0.05, 0.80},
+      {"piastrella",   2300.0, 0.05, 0.45, 0.35, 0.010, Rgb{0.78f, 0.76f, 0.72f}, 0.00, 0.65},
+      {"mattone",      1900.0, 0.15, 0.65, 0.55, 0.020, Rgb{0.65f, 0.35f, 0.28f}, 0.00, 0.85},
+      {"pietra",       2700.0, 0.20, 0.60, 0.50, 0.015, Rgb{0.55f, 0.55f, 0.55f}, 0.00, 0.70},
+      {"acciaio",      7850.0, 0.45, 0.60, 0.45, 0.005, Rgb{0.66f, 0.67f, 0.70f}, 0.90, 0.30},
+      {"alluminio",    2700.0, 0.40, 0.55, 0.40, 0.006, Rgb{0.78f, 0.79f, 0.82f}, 0.90, 0.35},
+      {"vetro",        2500.0, 0.55, 0.40, 0.30, 0.004, Rgb{0.80f, 0.90f, 0.90f}, 0.00, 0.05},
+      {"rovere",        750.0, 0.30, 0.55, 0.40, 0.015, Rgb{0.72f, 0.55f, 0.35f}, 0.00, 0.55},
+      {"abete",         500.0, 0.30, 0.50, 0.38, 0.015, Rgb{0.80f, 0.65f, 0.42f}, 0.00, 0.60},
+      {"compensato",    600.0, 0.25, 0.50, 0.38, 0.015, Rgb{0.65f, 0.45f, 0.28f}, 0.00, 0.62},
+      {"cartone",       690.0, 0.10, 0.55, 0.45, 0.020, Rgb{0.70f, 0.55f, 0.38f}, 0.00, 0.85},
+      {"gomma",        1100.0, 0.75, 0.90, 0.75, 0.012, Rgb{0.88f, 0.25f, 0.20f}, 0.00, 0.35},
+      {"plastica",     1050.0, 0.45, 0.40, 0.30, 0.008, Rgb{0.88f, 0.88f, 0.82f}, 0.20, 0.30},
+      {"polistirolo",    30.0, 0.15, 0.50, 0.40, 0.020, Rgb{0.95f, 0.95f, 0.93f}, 0.00, 0.80},
+      {"ghiaccio",      917.0, 0.20, 0.10, 0.05, 0.003, Rgb{0.80f, 0.90f, 0.95f}, 0.00, 0.10},
+      {"corpo umano",   985.0, 0.00, 0.90, 0.70, 0.000, Rgb{0.80f, 0.62f, 0.52f}, 0.00, 0.60},
+      {"sabbia/quarzo",2650.0, 0.15, 0.65, 0.60, 0.050, Rgb{0.86f, 0.74f, 0.44f}, 0.00, 0.88},
+  };
+  return T[int(id)];
 }
+
+// Frazione di volume occupata dalla materia in un guscio di spessore t
+// (inviluppo di semi-lati h): 1 - prod(1 - t/h_i). t=0 -> corpo pieno.
+inline real shellFraction(real hx, real hy, real hz, real t) {
+  if (!(t > 0.0))
+    return 1.0;
+  auto k = [&](real h) { return h > 1e-12 ? std::max(0.0, 1.0 - t / h) : 0.0; };
+  return std::clamp(1.0 - k(hx) * k(hy) * k(hz), 1e-6, 1.0);
+}
+
+} // namespace materials
+} // namespace nqg
+
+#endif // NQG_MATERIALS_HPP
