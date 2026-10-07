@@ -415,24 +415,12 @@ int main(int argc, char *argv[]) {
       std::min(std::max(1u, logicalCores - 1),
            static_cast<unsigned>(std::max(1, renderH)));
 
-  // --- Campo EM di esempio: due solidi carichi (attrazione Coulomb) ---
-  // Attivalo/commentalo per testare.
-  {
-    // i primi room.walls.size() solidi sono le pareti: poi tavolo, cassa
-    // grande e cassa piccola
-    const std::size_t w0 = scene.room.walls.size();
-    if (scene.solids.size() > w0 + 2) {
-      scene.solids[w0 + 1].charge = +1e-3; // cassa grande
-      scene.solids[w0 + 2].charge = -1e-3; // cassa piccola
-    }
-  }
-
   apartment::CapsuleCollider playerBody;
   playerBody.radius = 0.30;
   playerBody.height = 1.80;
   playerBody.eyeHeight = 1.70;
 
-  Vec3 camPos(0, -3.0, playerBody.eyeHeight);
+  Vec3 camPos(0, -3.0, playerBody.eyeHeight + playerBody.spawnClearance);
   earth::GlobeResolver globe;
   globe.setPosition(camPos);
   real camPitch = -0.05;

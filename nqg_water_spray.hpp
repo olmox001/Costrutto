@@ -1052,40 +1052,68 @@ public:
     // griglia 3D adattiva: celle crescenti finche' si rientra nel budget
     real cs = 0.02;
     std::size_t live = drops.size();
-    for (int pass = 0; pass < 8 && live > maxDrops; ++pass, cs *= 2.0) {
+    for (int pass = 0; pass <= 8 && live > maxDrops; ++pass, cs *= 2.0) {
+      Vec3 mergeOrigin(0, 0, 0);
+      if (pass == 8) {
+        Vec3 lo(1e30, 1e30, 1e30), hi(-1e30, -1e30, -1e30);
+        for (const Drop &drop : drops) {
+          if (!(drop.volume > 0.0))
+            continue;
+          lo.x = std::min(lo.x, drop.pos.x);
+          lo.y = std::min(lo.y, drop.pos.y);
+          lo.z = std::min(lo.z, drop.pos.z);
+          hi.x = std::max(hi.x, drop.pos.x);
+          hi.y = std::max(hi.y, drop.pos.y);
+          hi.z = std::max(hi.z, drop.pos.z);
+        }
+        mergeOrigin = lo;
+        cs = std::max({cs, hi.x - lo.x + 1e-6, hi.y - lo.y + 1e-6,
+                       hi.z - lo.z + 1e-6});
+      }
       std::unordered_map<long long, int> first;
       auto k3 = [&](const Vec3 &p) {
-        const long long a = (long long)std::floor(p.x / cs) + 50000;
-        const long long b = (long long)std::floor(p.y / cs) + 50000;
-        const long long c = (long long)std::floor(p.z / cs) + 50000;
+        if (pass == 8)
+          return 0LL;
+        const Vec3 offset = pass == 8 ? mergeOrigin : Vec3(0, 0, 0);
+        const long long a = (long long)std::floor((p.x - offset.x) / cs) + 1;
+        const long long b = (long long)std::floor((p.y - offset.y) / cs) + 1;
+        const long long c = (long long)std::floor((p.z - offset.z) / cs) + 1;
         return (a * 100003LL + b) * 100003LL + c;
       };
       for (std::size_t i = 0; i < drops.size() && live > maxDrops; ++i) {
         Drop &A = drops[i];
         if (A.volume <= 0)
           continue;
-        const long long key = k3(A.pos) * 2 + (A.sessile ? 1 : 0);
+        const long long key = k3(A.pos) * 2 +
+                  ((A.sessile && pass < 8) ? 1 : 0);
         auto it = first.find(key);
         if (it == first.end()) {
           first[key] = int(i);
           continue;
         }
         Drop &B = drops[std::size_t(it->second)];
-        if (B.volume <= 0 || A.sessile != B.sessile)
+        if (B.volume <= 0 || (A.sessile != B.sessile && pass < 8))
           continue;
         // prima si fondono le gocce NON osservate; le osservate solo a
         // budget ancora superato (celle gia' cresciute)
         if ((A.obs || B.obs) && pass < 4)
           continue;
-        if (!A.sessile && (A.vel - B.vel).norm() > 2.0 + 0.5 * B.vel.norm())
+        if (pass < 8 && !A.sessile &&
+            (A.vel - B.vel).norm() > 2.0 + 0.5 * B.vel.norm())
           continue; // velocita' troppo diverse: non fondere
         const real V = A.volume + B.volume;
         const real mA = rhoL * A.volume, mB = rhoL * B.volume;
         B.pos = (B.pos * mB + A.pos * mA) * (1.0 / (mA + mB));
         B.vel = (B.vel * mB + A.vel * mA) * (1.0 / (mA + mB));
         B.volume = V;
-        if (A.sessile)
+        if (A.sessile && B.sessile)
           B.surfaceZ = 0.5 * (A.surfaceZ + B.surfaceZ);
+        else if (A.sessile != B.sessile) {
+          B.surfaceZ = 0.0;
+          B.sessile = false;
+        }
+        B.obs = A.obs || B.obs;
+        B.age = std::max(A.age, B.age);
         A.volume = 0;
         --live;
         ++stats.merges;

@@ -191,6 +191,32 @@ int main() {
                      (P1 - P0).norm() < 1e-12,
           "4000 -> %zu particelle, volume e quantita' di moto conservati",
           sp.drops.size());
+
+    WaterSpray sparse;
+    sparse.maxDrops = 1;
+    real sparseVolume = 0.0;
+    Vec3 sparseMomentum(0, 0, 0);
+    for (int i = 0; i < 4; ++i) {
+      Drop separated;
+      separated.volume = 1e-8;
+      separated.pos = Vec3(100.0 * i, 0, 1.0);
+      separated.vel = Vec3(100.0 * i, 0, -1.0);
+      sparseVolume += separated.volume;
+      sparseMomentum += separated.vel * separated.volume;
+      sparse.drops.push_back(separated);
+    }
+    sparse.limitParticles();
+    real reducedVolume = 0.0;
+    Vec3 reducedMomentum(0, 0, 0);
+    for (const Drop &drop : sparse.drops) {
+      reducedVolume += drop.volume;
+      reducedMomentum += drop.vel * drop.volume;
+    }
+    CHECK("Q7b", sparse.drops.size() <= sparse.maxDrops &&
+                     std::abs(reducedVolume - sparseVolume) < 1e-15 &&
+                     (reducedMomentum - sparseMomentum).norm() < 1e-12,
+          "Budget sparso rigido con volume/quantita' di moto conservati: %zu / %zu",
+          sparse.drops.size(), sparse.maxDrops);
   }
 
   { // rendering: la goccia in volo compare nel buffer

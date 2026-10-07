@@ -438,9 +438,11 @@ struct CapsuleCollider {
   real radius = 0.30;
   real height = 1.80;
   real eyeHeight = 1.70;
+  real spawnClearance = 0.05;   // correzione spawn (metri sopra i piedi a terra)
   real footZ(real camZ) const { return camZ - eyeHeight; }
   real headZ(real camZ) const { return camZ - eyeHeight + height; }
 };
+
 
 struct RoomGeometry {
   real xMin = -6.0, xMax = 6.0;
@@ -761,7 +763,6 @@ public:
       c.ex = Vec3(0.98, 0.20, 0.00).normalized();
       c.ey = Vec3(-0.20, 0.98, 0.00).normalized();
       c.ez = c.ex.cross(c.ey);
-      c.angVel = Vec3(0.4, 0.9, -0.3);
       solids.push_back(c);
     }
     {
@@ -775,7 +776,6 @@ public:
       c.ex = Vec3(0.94, 0.34, 0.00).normalized();
       c.ey = Vec3(-0.34, 0.94, 0.00).normalized();
       c.ez = c.ex.cross(c.ey);
-      c.angVel = Vec3(1.2, -0.8, 0.5);
       solids.push_back(c);
     }
 
@@ -805,8 +805,8 @@ public:
     refreshLightCache();
     updateEnvironment();
 
-    ensurePlayerBody(apartment::CapsuleCollider());
-    solids.back().pos = Vec3(0, -3.0, 0.901); // piedi 1 mm sopra il pavimento
+  ensurePlayerBody(apartment::CapsuleCollider());
+  solids.back().pos = Vec3(0, -3.0, 0.90 + apartment::CapsuleCollider().spawnClearance);
 
     // Massa derivata (density x volume) + cache worldHalf di tutti i solidi.
     for (auto &s : solids) {
@@ -1503,6 +1503,49 @@ public:
     return lit;
   }
 
+  real bodyFilmDepthAt(real x, real y) const {
+    const auto center = water.flow.samplePhysical(x, y);
+    if (!center.wet || !water.flow.bodyBedAt(x, y))
+      return 0.0;
+    const real halfCell = 0.5 * water.flow.dx;
+    const Vec3 offsets[5] = {Vec3(0, 0, 0), Vec3(-halfCell, -halfCell, 0),
+                             Vec3(halfCell, -halfCell, 0),
+                             Vec3(-halfCell, halfCell, 0),
+                             Vec3(halfCell, halfCell, 0)};
+    real depth = 0.0;
+    int count = 0;
+    for (const Vec3 &offset : offsets) {
+      const real sx = x + offset.x, sy = y + offset.y;
+      const auto sample = water.flow.samplePhysical(sx, sy);
+      if (sample.wet && water.flow.bodyBedAt(sx, sy)) {
+        depth += sample.depth;
+        ++count;
+      }
+    }
+    return count > 0 ? depth / real(count) : center.depth;
+  }
+
+  Rgb shadeBodyFilm(const Rgb &substrate, const Vec3 &normal,
+                    const Vec3 &viewDir, real filmDepth) const {
+    if (!(filmDepth > 0.0))
+      return substrate;
+    const real cosIncident = std::clamp(std::abs(normal.dot(viewDir)), 0.0, 1.0);
+    const real fresnel = continuum::ContinuousWaterBody::fresnelDielectric(
+        cosIncident, 1.0, water.refractiveIndex);
+    const real pathLength = filmDepth / std::max(cosIncident, 0.05);
+    const Vec3 transmission = water.beerLambertTransmission(pathLength);
+    const real coverage = 1.0;
+    const real reflected = fresnel * coverage;
+    const real transmitted = 1.0 - reflected;
+    const Rgb waterReflection = cachedAmbientSky;
+    return {float(substrate.r * transmission.x * transmitted +
+                  waterReflection.r * reflected),
+            float(substrate.g * transmission.y * transmitted +
+                  waterReflection.g * reflected),
+            float(substrate.b * transmission.z * transmitted +
+                  waterReflection.b * reflected)};
+  }
+
   Rgb traceRay(const Vec3 &ro, const Vec3 &rd,
                std::uint64_t observerSeed = 0,
                real pixelAngleY = 0.0, real pixelAspect = 1.0) const {
@@ -1847,6 +1890,9 @@ public:
 
     Rgb lit = shadeOpaque(hitPos, normal, hitAlbedo, metallic, roughness,
                           viewDir, tHit, nLights);
+    if (!hitWater)
+      lit = shadeBodyFilm(lit, normal, viewDir,
+                          bodyFilmDepthAt(hitPos.x, hitPos.y));
     if (hitQuantum) {
       const real qDens = quantumField.evaluateDensity(hitPos);
       const real qAlpha = std::min(0.5, qDens * 0.5);
@@ -2344,14 +2390,14 @@ public:
       const real dtAngTarget = 0.25 / std::max(maxAngSpeed, 1e-3);
       const real dtTarget = std::min(dtLinTarget, dtAngTarget);
       if (dt > dtTarget)
-        nSub = std::clamp(int(std::ceil(dt / dtTarget)), 1, 16);
+        nSub = std::max(nSub, int(std::ceil(dt / dtTarget)));
     }
     // Sotto-passo massimo 1/240 s: l'integratore applica la gravita' prima
     // del solver dei contatti, quindi un corpo a riposo "affonda" di
     // 0.5 g dtSub^2 a ogni sotto-passo e la proiezione lo rispinge fuori
     // (jitter, creep laterale e pile che si respingono). A 1/240 s la
     // penetrazione e' ~0.09 mm: invisibile e sotto la soglia di risveglio.
-    nSub = std::clamp(std::max(nSub, int(std::ceil(dt * 240.0 - 1e-9))), 1, 16);
+    nSub = std::max(nSub, int(std::ceil(dt * 240.0 - 1e-9)));
     const real dtSub = dt / nSub;
 
     std::vector<Contact> contacts;
@@ -2363,20 +2409,6 @@ public:
     GroundFn groundFn = [this](real x, real y) -> real {
       return groundHeightAt(x, y);
     };
-
-    // Limite anti-tunneling: nessun corpo percorre piu' di meta' del proprio
-    // semi-lato minimo per sotto-passo (neanche oltre il tetto di 16
-    // sotto-passi).
-    for (auto &s : solids) {
-      if (s.isStatic || s.asleep || s.externalControl)
-        continue;
-      const Vec3 he = s.halfExtents();
-      const real vmax =
-          0.5 * std::max(std::min({he.x, he.y, he.z}), 1e-3) / dtSub;
-      const real vn = s.vel.norm();
-      if (vn > vmax)
-        s.vel = s.vel * (vmax / vn);
-    }
 
     // Stato iniziale pulito: spawn / spinte esterne non devono lasciare
     // alcuna compenetrazione prima di integrare.

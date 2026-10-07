@@ -131,7 +131,7 @@ public:
   real hCap = 1e-3;
   real visibleDepth = 1e-4;
   real smagorinsky = 0.16;
-  real speedLimit = 30.0;
+  real speedLimit = 0.0; // 0 = nessun limite numerico alla velocita' fisica
   real simulatedTime = 0.0;
   real lastIntegratedDt = 0.0;
   std::size_t lastSubsteps = 0;
@@ -701,6 +701,22 @@ public:
     return s;
   }
 
+  Sample samplePhysical(real x, real y) const {
+    Sample s;
+    const Recon r = reconstruct(x, y);
+    if (r.w < 0.25)
+      return s;
+    s.depth = r.dep / r.w;
+    if (!(s.depth > hDry))
+      return s;
+    s.wet = true;
+    s.eta = r.eta / r.w;
+    s.bed = r.bd / r.w;
+    s.u = r.uu / r.w;
+    s.v = r.vv / r.w;
+    return s;
+  }
+
   // Superficie CONTINUA: stessa ricostruzione di sample() ma senza soglia di
   // visibilita' (eta = fondo dove l'acqua e' assente). Serve al ray marching.
   struct Raw {
@@ -730,6 +746,11 @@ public:
     return bedSampleAt(x, y).z;
   }
 
+  bool bodyBedAt(real x, real y) const {
+    const Cell *c = at(cellIndexX(x), cellIndexY(y));
+    return c && !c->solid && c->body;
+  }
+
   real totalVolume() const {
     real v = 0;
     for (const Tile &t : tiles)
@@ -752,13 +773,23 @@ public:
   void step(real dtTotal) {
     lastIntegratedDt = 0.0;
     lastSubsteps = 0;
-    if (!(dtTotal > 0) || !std::isfinite(dtTotal) || tiles.empty())
+    if (!(dtTotal > 0) || !std::isfinite(dtTotal) || tiles.empty() ||
+        !(dx > 0.0) || !(liquid.rho > 0.0) || !(cfl > 0.0))
       return;
     real t = 0;
-    while (t < dtTotal - 1e-12) {
-      const real dt = std::min(dtTotal - t, stableDt());
+    while (t < dtTotal) {
+      const real remaining = dtTotal - t;
+      const real maxStableDt = stableDt();
+      if (!(maxStableDt > 0.0) || !std::isfinite(maxStableDt))
+        break;
+      const real dt = std::min(remaining, maxStableDt);
+      if (!(dt > 0.0) || !std::isfinite(dt))
+        break;
       substep(dt);
-      t += dt;
+      const real next = t + dt;
+      if (!(next > t))
+        break;
+      t = next;
       ++lastSubsteps;
     }
     lastIntegratedDt = t;
@@ -888,13 +919,25 @@ private:
   }
 
   real stableDt() const {
-    const real c = std::max(lastMaxWave, 0.3);
-    real dt = cfl * dx / c;
+    real maxSignalSpeed = 0.3;
+    for (const Tile &tile : tiles) {
+      if (!tile.wet)
+        continue;
+      for (const Cell &cell : tile.c) {
+        if (cell.solid || cell.h <= hDry)
+          continue;
+        const real waveSpeed = std::sqrt(gravity * cell.h);
+        const real signalSpeed =
+            std::max(std::abs(cell.u), std::abs(cell.v)) + waveSpeed;
+        maxSignalSpeed = std::max(maxSignalSpeed, signalSpeed);
+      }
+    }
+    real dt = cfl * dx / maxSignalSpeed;
     const real om =
         std::sqrt(liquid.sigma / liquid.rho * std::max(lastMaxDepth, hCap)) *
         8.0 / (dx * dx);
     dt = std::min(dt, 1.0 / (om + 1e-9));
-    return std::max(dt, 1e-4);
+    return dt;
   }
 
   void growHalo() {
@@ -1167,7 +1210,9 @@ private:
               un = 0.0;
           }
         }
-        c.u = std::clamp(un, -speedLimit, speedLimit);
+        c.u = speedLimit > 0.0
+            ? std::clamp(un, -speedLimit, speedLimit)
+            : un;
       }
 
       hf = faceDepth(*s, c);
@@ -1216,7 +1261,9 @@ private:
               vn = 0.0;
           }
         }
-        c.v = std::clamp(vn, -speedLimit, speedLimit);
+        c.v = speedLimit > 0.0
+            ? std::clamp(vn, -speedLimit, speedLimit)
+            : vn;
       }
     });
 

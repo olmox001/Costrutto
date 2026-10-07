@@ -1549,7 +1549,7 @@ struct RigidSolidElement {
       Vec3 v;
       real w;
     };
-    Ax ax[17];
+    Ax ax[16];
     int na = 0;
     auto add = [&](const Vec3 &v, real w) {
       const real l = v.norm();
@@ -1564,7 +1564,6 @@ struct RigidSolidElement {
     add(B.ex, 1.0);
     add(B.ey, 1.0);
     add(B.ez, 1.0);
-    add(A.pos - B.pos, 1.02);
     const Vec3 aa[3] = {A.ex, A.ey, A.ez};
     const Vec3 bb[3] = {B.ex, B.ey, B.ez};
     for (int i = 0; i < 3; ++i)
@@ -1988,7 +1987,7 @@ struct RigidSolidElement {
       lastReynolds = airDensity * vA * std::max(size.x, size.z) / MU_AIR;
     }
     const real g = std::max(1e-6, gravityVec.norm());
-    const int n = std::clamp(int(std::ceil(dt / 0.004)), 1, 24);
+    const int n = std::max(1, int(std::ceil(dt / 0.004)));
     const real h = dt / n;
     // volume spostato nell'aria: stessa regola dei fluidi (inviluppo se cavo
     // sigillato, materia altrimenti)
@@ -2093,13 +2092,6 @@ struct RigidSolidElement {
       prevAddedMass = 0;
       return;
     }
-
-    const real maxSpeed = 200.0;
-    if (vel.norm2() > maxSpeed * maxSpeed)
-      vel = vel.normalized() * maxSpeed;
-    const real maxOmega = 40.0;
-    if (angVel.norm2() > maxOmega * maxOmega)
-      angVel = angVel.normalized() * maxOmega;
 
     // --- Sleep detection ---
     const real linMag = vel.norm();
@@ -2343,8 +2335,8 @@ inline HydroResult bodyHydro(const ContinuousWaterBody &W,
     real etaMin = 1e30;
     for (int k = 0; k < 8; ++k) {
       const real ang = k * PI / 4.0;
-      auto q = W.flow.sample(b.pos.x + rr * std::cos(ang),
-                             b.pos.y + rr * std::sin(ang));
+      auto q = W.flow.samplePhysical(b.pos.x + rr * std::cos(ang),
+                 b.pos.y + rr * std::sin(ang));
       if (!q.wet)
         continue;
       etaMin = std::min(etaMin, q.eta);
@@ -2362,7 +2354,7 @@ inline HydroResult bodyHydro(const ContinuousWaterBody &W,
     for (int c = 0; c < N; ++c) {
       const real x = b.pos.x + (((a + 0.5) / N) * 2.0 - 1.0) * hw.x;
       const real y = b.pos.y + (((c + 0.5) / N) * 2.0 - 1.0) * hw.y;
-      auto s = W.flow.sample(x, y);
+      auto s = W.flow.samplePhysical(x, y);
       // colonna asciutta ma circondata d'acqua (corpo appena appoggiato o
       // appena sollevato): vale il livello idrostatico circostante
       if (!s.wet && haveRing && W.terrainAt(x, y) <= ringEta) {
@@ -2383,23 +2375,59 @@ inline HydroResult bodyHydro(const ContinuousWaterBody &W,
       const real zHi = std::min(top, s.eta);
       if (zHi <= bottom)
         continue;
-      const int K = std::clamp(int(std::ceil((zHi - bottom) / 0.01)), 1, 12);
-      const real dz = (zHi - bottom) / K;
-      int inside = 0;
-      real zc = 0;
-      for (int k = 0; k < K; ++k) {
-        const real z = bottom + (k + 0.5) * dz;
-        if (b.distanceWorld(Vec3(x, y, z)) < 0.0) {
-          ++inside;
-          zc += z;
+      const int segments =
+          std::clamp(int(std::ceil((zHi - bottom) / 0.02)), 1, 128);
+      const real dz = (zHi - bottom) / segments;
+      auto signedDistanceAt = [&](real z) {
+        return b.distanceWorld(Vec3(x, y, z));
+      };
+      real intervalStart = bottom;
+      real previousZ = bottom;
+      real previousDistance = signedDistanceAt(previousZ);
+      real columnLength = 0.0;
+      real columnMoment = 0.0;
+      bool inside = previousDistance < 0.0;
+      if (inside)
+        intervalStart = bottom;
+      for (int k = 1; k <= segments; ++k) {
+        const real z = bottom + k * dz;
+        const real distance = signedDistanceAt(z);
+        const bool nextInside = distance < 0.0;
+        if (nextInside != inside) {
+          real lo = previousZ, hi = z;
+          const bool loInside = inside;
+          for (int iteration = 0; iteration < 20; ++iteration) {
+            const real mid = 0.5 * (lo + hi);
+            if ((signedDistanceAt(mid) < 0.0) == loInside)
+              lo = mid;
+            else
+              hi = mid;
+          }
+          const real crossing = 0.5 * (lo + hi);
+          if (inside) {
+            const real length = crossing - intervalStart;
+            columnLength += length;
+            columnMoment += 0.5 * length * (crossing + intervalStart);
+          } else {
+            intervalStart = crossing;
+          }
+          inside = nextInside;
         }
+        previousZ = z;
+        previousDistance = distance;
       }
-      if (inside == 0)
+      (void)previousDistance;
+      if (inside) {
+        const real length = zHi - intervalStart;
+        columnLength += length;
+        columnMoment += 0.5 * length * (zHi + intervalStart);
+      }
+      if (!(columnLength > 0.0))
         continue;
-      const real v = inside * dz * cellA;
+      const real v = columnLength * cellA;
       vSub += v;
       footA += cellA;
-      cSum = cSum + Vec3(x, y, zc / inside) * v;
+      cSum = cSum + Vec3(x, y, columnMoment / columnLength) * v;
       minX = std::min(minX, x - 0.5 * (2.0 * hw.x / N));
       maxX = std::max(maxX, x + 0.5 * (2.0 * hw.x / N));
       minY = std::min(minY, y - 0.5 * (2.0 * hw.y / N));

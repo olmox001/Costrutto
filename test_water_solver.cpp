@@ -59,6 +59,80 @@ int main() {
         std::abs(longStep.lastIntegratedDt - 1.0) < 1e-12 &&
         std::abs(longStep.simulatedTime - 1.0) < 1e-12,
         "CFL integra tutto dt=1s oltre 24 sottopassi");
+    ShallowFlow strictCfl(0.1, 8, 8);
+    strictCfl.cfl = 5e-4;
+    strictCfl.fillRect(-2.0, 2.0, -2.0, 2.0, 0.5);
+    strictCfl.step(1e-3);
+    CHECK("W8", strictCfl.lastSubsteps > 10 &&
+                    std::abs(strictCfl.lastIntegratedDt - 1e-3) < 1e-12,
+          "Il passo interno rispetta CFL anche sotto 1e-4 s");
+    ShallowFlow microStep(0.1, 8, 8);
+    microStep.fillRect(-2.0, 2.0, -2.0, 2.0, 0.5);
+    microStep.step(1e-13);
+    CHECK("W9", microStep.lastSubsteps == 1 &&
+            microStep.lastIntegratedDt == 1e-13 &&
+            microStep.simulatedTime == 1e-13,
+        "Il residuo sotto 1e-12 s non viene scartato");
+    ShallowFlow invalidCfl(0.1, 8, 8);
+    invalidCfl.cfl = 0.0;
+    invalidCfl.fillRect(-2.0, 2.0, -2.0, 2.0, 0.5);
+    const real invalidCflVolume = invalidCfl.totalVolume();
+    invalidCfl.step(1e-3);
+    CHECK("W10", invalidCfl.lastSubsteps == 0 &&
+             invalidCfl.lastIntegratedDt == 0.0 &&
+             invalidCfl.simulatedTime == 0.0 &&
+             invalidCfl.totalVolume() == invalidCflVolume,
+        "CFL nullo non avanza il solver ne' altera il volume");
+    ShallowFlow fastFlow(0.1, 8, 8);
+    fastFlow.fillRect(-2.0, 2.0, -2.0, 2.0, 0.5);
+    for (int j = fastFlow.cellIndexY(-2.0); j <= fastFlow.cellIndexY(2.0); ++j)
+      for (int i = fastFlow.cellIndexX(-2.0); i <= fastFlow.cellIndexX(2.0); ++i)
+        if (auto *cell = fastFlow.at(i, j); cell && !cell->solid)
+          cell->u = 80.0;
+    fastFlow.step(1e-3);
+    real maxWaterSpeed = 0.0;
+    for (int j = fastFlow.cellIndexY(-2.0); j <= fastFlow.cellIndexY(2.0); ++j)
+      for (int i = fastFlow.cellIndexX(-2.0); i <= fastFlow.cellIndexX(2.0); ++i)
+        if (const auto *cell = fastFlow.at(i, j); cell && !cell->solid)
+          maxWaterSpeed = std::max(maxWaterSpeed, std::abs(cell->u));
+    std::printf("[INFO] high-speed water: max=%.3f m/s, substeps=%zu\n",
+                maxWaterSpeed, fastFlow.lastSubsteps);
+    CHECK("W11", maxWaterSpeed > 30.0 && fastFlow.lastSubsteps > 1 &&
+                     std::abs(fastFlow.lastIntegratedDt - 1e-3) < 1e-12,
+          "Velocita' acqua non tagliata e CFL adattato");
+        ShallowFlow explicitlyLimited(0.1, 8, 8);
+        explicitlyLimited.speedLimit = 12.0;
+        explicitlyLimited.fillRect(-2.0, 2.0, -2.0, 2.0, 0.5);
+        for (int j = explicitlyLimited.cellIndexY(-2.0);
+             j <= explicitlyLimited.cellIndexY(2.0); ++j) {
+      for (int i = explicitlyLimited.cellIndexX(-2.0);
+               i <= explicitlyLimited.cellIndexX(2.0); ++i) {
+        if (auto *cell = explicitlyLimited.at(i, j); cell && !cell->solid)
+          cell->u = 80.0;
+          }
+        }
+        explicitlyLimited.step(1e-4);
+        real explicitlyLimitedSpeed = 0.0;
+        for (int j = explicitlyLimited.cellIndexY(-2.0);
+             j <= explicitlyLimited.cellIndexY(2.0); ++j) {
+      for (int i = explicitlyLimited.cellIndexX(-2.0);
+               i <= explicitlyLimited.cellIndexX(2.0); ++i) {
+        if (const auto *cell = explicitlyLimited.at(i, j); cell && !cell->solid)
+          explicitlyLimitedSpeed =
+          std::max(explicitlyLimitedSpeed, std::abs(cell->u));
+          }
+        }
+        CHECK("W12", explicitlyLimitedSpeed <= 12.0,
+          "speedLimit positivo resta un limite opzionale del modello");
+        ShallowFlow invalidDensity(0.1, 8, 8);
+        invalidDensity.liquid.rho = 0.0;
+        invalidDensity.fillRect(-2.0, 2.0, -2.0, 2.0, 0.5);
+        const real invalidDensityVolume = invalidDensity.totalVolume();
+        invalidDensity.step(1e-3);
+        CHECK("W13", invalidDensity.lastSubsteps == 0 &&
+             invalidDensity.simulatedTime == 0.0 &&
+             invalidDensity.totalVolume() == invalidDensityVolume,
+          "Densita' non fisica non avvia un CFL indefinito");
       longStep.clear();
       CHECK("W7", longStep.simulatedTime == 0.0 &&
           longStep.lastIntegratedDt == 0.0 &&

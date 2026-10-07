@@ -125,6 +125,53 @@ int main() {
              std::to_string(fullHydro.centroid.z) + "/" +
              std::to_string(halfHydro.centroid.z));
 
+    ContinuousWaterBody stillPool;
+    stillPool.initialFill(-2.0, 2.0, -2.0, 2.0, 0.6);
+    RigidSolidElement floatingCube;
+    floatingCube.size = Vec3(0.4, 0.4, 0.4);
+    floatingCube.density = 700.0;
+    floatingCube.pos = Vec3(0, 0, 0.25);
+    floatingCube.syncMass();
+    ContinuousWindField noWind;
+    noWind.baseDrift = Vec3(0, 0, 0);
+    noWind.turbulenceIntensity = 0;
+    real maxTailVerticalSpeed = 0.0;
+    for (int i = 0; i < 600; ++i) {
+      stillPool.step(0.01);
+      floatingCube.stepDynamics(0.01, Vec3(0, 0, -9.80665), stillPool,
+                                noWind, 0.0, 0.0);
+      if (i >= 500)
+        maxTailVerticalSpeed =
+            std::max(maxTailVerticalSpeed, std::abs(floatingCube.vel.z));
+    }
+    CHECK(maxTailVerticalSpeed < 0.05,
+          "K1q", "Cubo galleggiante in acqua ferma senza jitter persistente: max |vz|=" +
+              std::to_string(maxTailVerticalSpeed) + " m/s");
+
+    bool hydrostaticSweepAccurate = true;
+    real maxHydrostaticVolumeError = 0.0;
+    ContinuousWaterBody sweepPool;
+    sweepPool.initialFill(-2.0, 2.0, -2.0, 2.0, 0.6);
+    for (const real centerZ : {0.35, 0.45, 0.55, 0.65}) {
+      RigidSolidElement probe;
+      probe.size = Vec3(0.4, 0.4, 0.4);
+      probe.pos = Vec3(0, 0, centerZ);
+      probe.syncMass();
+      const HydroResult sampled =
+          bodyHydro(sweepPool, probe, Vec3(0, 0, 0), 9.80665);
+      const real expected = 0.4 * 0.4 *
+                std::clamp(0.6 - (centerZ - 0.2), 0.0, 0.4);
+        maxHydrostaticVolumeError =
+          std::max(maxHydrostaticVolumeError,
+               std::abs(sampled.submergedVolume - expected));
+      hydrostaticSweepAccurate =
+        hydrostaticSweepAccurate &&
+        std::abs(sampled.submergedVolume - expected) < 1e-5;
+    }
+    CHECK(hydrostaticSweepAccurate,
+          "K1r", "Volume idrostatico del cubo, errore massimo=" +
+            std::to_string(maxHydrostaticVolumeError) + " m^3");
+
     fluid::ShallowFlow visualField(0.1, 8, 8);
     visualField.fillRect(-3.0, 3.0, -3.0, 3.0, 0.5);
     const real visualVolume = visualField.totalVolume();
@@ -182,6 +229,35 @@ int main() {
     CHECK(soil.totalVolume() < 0.2 * vs0, "K1j",
           "Infiltrazione: volume " + std::to_string(vs0) + " -> " +
               std::to_string(soil.totalVolume()) + " m^3 (fronte fermo)");
+
+    ContinuousWaterBody thinFilm;
+    thinFilm.initialFill(-1.0, 1.0, -1.0, 1.0, 5e-5);
+    RigidSolidElement filmBody;
+    filmBody.size = Vec3(0.2, 0.2, 0.2);
+    filmBody.pos = Vec3(0.0, 0.0, 0.1);
+    filmBody.setMaterial(materials::Id::HardPlastic);
+    const HydroResult thinFilmHydro =
+      bodyHydro(thinFilm, filmBody, Vec3(0, 0, 0), 9.80665);
+    const auto visualThinFilm = thinFilm.flow.sample(0.0, 0.0);
+    CHECK(thinFilmHydro.wet && thinFilmHydro.film > 0.0 &&
+          thinFilmHydro.film < thinFilm.flow.visibleDepth &&
+          !visualThinFilm.wet,
+        "K1n", "Film fisico sotto la soglia visiva rilevato: h=" +
+          std::to_string(thinFilmHydro.film) + " m");
+    const HydroResult slidingHydro =
+      bodyHydro(thinFilm, filmBody, Vec3(0.1, 0, 0), 9.80665);
+    CHECK(slidingHydro.dragCoeff.x > 0.0 &&
+          std::isfinite(slidingHydro.dragCoeff.x),
+        "K1o", "Resistenza viscosa del film sottile finita: c=" +
+          std::to_string(slidingHydro.dragCoeff.x) + " kg/s");
+    filmBody.vel = Vec3(0.1, 0, 0);
+    ContinuousWindField stillAir;
+    stillAir.baseDrift = Vec3(0, 0, 0);
+    stillAir.turbulenceIntensity = 0.0;
+    filmBody.stepDynamics(0.01, Vec3(0, 0, 0), thinFilm, stillAir, 0.0, 0.0);
+    CHECK(filmBody.vel.x >= 0.0 && filmBody.vel.x < 0.1,
+        "K1p", "Il film dissipa lo scorrimento senza invertirlo: vx=" +
+          std::to_string(filmBody.vel.x) + " m/s");
   }
 
   // --------------------------------------------------------------------------

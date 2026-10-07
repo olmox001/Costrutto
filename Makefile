@@ -19,11 +19,15 @@ TARGETS = test_nqg_core test_engine3d test_window_sdl3 test_cleanroom \
           nqg_sample_game nqg_cleanroom_game
 
 COMMON_HDRS = nqg_physics_core.hpp nqg_engine3d.hpp nqg_sdf.hpp \
-              nqg_earth_environment.hpp nqg_apartment.hpp nqg_air_physics.hpp \
+              nqg_earth_environment.hpp nqg_apartment.hpp nqg_drag_physics.hpp \
+              nqg_air_physics.hpp \
               nqg_matter_physics.hpp nqg_continuum_physics.hpp \
               nqg_water_solver.hpp nqg_water_spray.hpp nqg_cleanroom_engine.hpp
 
 BINARIES = $(addprefix $(BUILD_DIR)/,$(addsuffix $(EXE_EXT),$(TARGETS)))
+
+# prepare-test is declared in mk/platform.mk before BINARIES is defined.
+prepare-test: $(BINARIES)
 
 # ---------------------------------------------------------------------------
 # Default goal – everything runs automatically
@@ -48,12 +52,13 @@ $(BUILD_DIR)/test_cleanroom$(EXE_EXT): test_cleanroom.cpp $(COMMON_HDRS) | dirs
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD_DIR)/test_matter_physics$(EXE_EXT): test_matter_physics.cpp \
-        nqg_matter_physics.hpp nqg_sdf.hpp nqg_air_physics.hpp \
+        nqg_matter_physics.hpp nqg_sdf.hpp nqg_air_physics.hpp nqg_drag_physics.hpp \
         nqg_engine3d.hpp nqg_physics_core.hpp | dirs
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD_DIR)/test_continuum_physics$(EXE_EXT): test_continuum_physics.cpp \
         nqg_continuum_physics.hpp nqg_water_solver.hpp nqg_sdf.hpp nqg_air_physics.hpp \
+        nqg_drag_physics.hpp \
         nqg_engine3d.hpp nqg_physics_core.hpp | dirs
 	$(CXX) $(CXXFLAGS) $< -o $@
 

@@ -381,6 +381,7 @@
 #define NQG_AIR_PHYSICS_HPP
 
 #include "nqg_engine3d.hpp"
+#include "nqg_drag_physics.hpp"
 #include "nqg_physics_core.hpp"
 
 namespace nqg {
@@ -388,17 +389,6 @@ namespace cleanroom {
 
 using engine::Rgb;
 using engine::Vec3;
-
-// Legge di resistenza quadratica UNICA (aria, acqua, qualunque forma):
-//   F = -1/2 rho Cd A |v| v           (v = velocita' relativa al fluido)
-//   k = 1/2 rho Cd A |v|  [kg/s]      (F = -k v, utile per integrazione implicita)
-inline real quadraticDragCoeff(real rho, real Cd, real area, real speed) {
-  return 0.5 * rho * Cd * area * speed;
-}
-inline Vec3 quadraticDrag(real rho, real Cd, real area, const Vec3 &vRel) {
-  const real k = quadraticDragCoeff(rho, Cd, area, vRel.norm());
-  return Vec3(-vRel.x * k, -vRel.y * k, -vRel.z * k);
-}
 
 struct AirProperties {
   real temperatureK = 293.15;

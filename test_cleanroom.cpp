@@ -376,6 +376,49 @@ int main() {
           std::hypot(diagonalSlip.jt1, diagonalSlip.jt2),
           0.4 * diagonalSlip.jn);
 
+            continuum::RigidSolidElement fastBody;
+            fastBody.vel = Vec3(250.0, 0.0, 0.0);
+            fastBody.angVel = Vec3(0.0, 0.0, 45.0);
+            continuum::ContinuousWaterBody emptyWater;
+            continuum::ContinuousWindField stillAir;
+            emptyWater.clear();
+            fastBody.stepDynamics(1e-4, Vec3(0, 0, 0), emptyWater, stillAir,
+                0.0, 0.0);
+            CHECK("C7i", std::abs(fastBody.vel.x - 250.0) < 1e-9 &&
+                     fastBody.vel.y == 0.0 && fastBody.vel.z == 0.0 &&
+                     fastBody.angVel.z > 40.0,
+              "stepDynamics non tronca velocita' lineare o angolare: %.3f m/s, %.3f rad/s",
+              fastBody.vel.x, fastBody.angVel.z);
+
+            continuum::RigidSolidElement longStepBody;
+            longStepBody.pos = Vec3(0, 0, 0);
+            longStepBody.vel = Vec3(1.0, 0.0, 0.0);
+            continuum::ContinuousWaterBody longStepWater;
+            longStepWater.clear();
+            longStepBody.stepDynamics(0.1, Vec3(0, 0, 0), longStepWater,
+                      stillAir, 0.0, 0.0);
+            CHECK("C7j", std::abs(longStepBody.pos.x - 0.1) < 1e-9,
+              "Rigid-body integra interamente dt oltre 24 sottopassi: x=%.6f",
+              longStepBody.pos.x);
+
+            CleanRoomScene highSpeedScene;
+            highSpeedScene.solids.clear();
+            highSpeedScene.water.clear();
+            highSpeedScene.setZeroGravity(true);
+            continuum::RigidSolidElement fastSceneBody;
+            fastSceneBody.size = Vec3(10, 10, 10);
+            fastSceneBody.density = 7850.0;
+            fastSceneBody.pos = Vec3(0, 0, 1000);
+            fastSceneBody.vel = Vec3(5000.0, 0, 0);
+            fastSceneBody.syncMass();
+            highSpeedScene.solids.push_back(fastSceneBody);
+            highSpeedScene.stepPhysics(0.1);
+            CHECK("C7k", highSpeedScene.solids[0].vel.x > 4900.0 &&
+                         highSpeedScene.solids[0].pos.x > 490.0,
+              "stepPhysics non riduce l'impulso per un cap di percorrenza: v=%.2f x=%.3f",
+              highSpeedScene.solids[0].vel.x,
+              highSpeedScene.solids[0].pos.x);
+
   }
 
   // --------------------------------------------------------------------------
@@ -388,6 +431,19 @@ int main() {
       if (so.isStatic && !so.isRoomSlab && so.waterGrounded)
         ++nStaticGrounded;
     CHECK("C8a", nStaticGrounded > 0, "Solidi statici appoggiati = fondo per l'acqua: %d", nStaticGrounded);
+    const std::size_t wallCount = sc.room.walls.size();
+    bool presetCratesNeutral = sc.solids.size() > wallCount + 2;
+    if (presetCratesNeutral) {
+      for (std::size_t index = wallCount + 1; index <= wallCount + 2;
+           ++index) {
+        const auto &crate = sc.solids[index];
+        presetCratesNeutral =
+            presetCratesNeutral && crate.effectiveCharge() == 0.0 &&
+            crate.angVel.norm2() == 0.0;
+      }
+    }
+    CHECK("C8f", presetCratesNeutral,
+          "Le casse predefinite partono neutre e senza spin artificiale");
 
     continuum::RigidSolidElement c;
     c.setMaterial(materials::Id::Concrete);
@@ -409,6 +465,35 @@ int main() {
           "Acqua versata sopra il solido mobile resta sopra: eta=%.3f fondo=%.3f sommita'=%.3f", sm.eta, sm.bed, top);
     CHECK("C8d", std::abs((sc.water.totalVolume() - v0) - 0.05) < 0.015,
           "Volume conservato dopo il versamento: dV=%.4f (atteso 0.05)", sc.water.totalVolume() - v0);
+  }
+
+  // --------------------------------------------------------------------------
+  // C8e: Film sottile su corpi (invisibile come acqua libera ma coating)
+  // --------------------------------------------------------------------------
+  {
+    CleanRoomScene sc;
+    sc.water.clear();
+    sc.water.setBedProvider([](real, real) {
+      fluid::BedSample bed;
+      bed.z = 0.8;
+      bed.body = true;
+      return bed;
+    });
+    sc.water.refreshBed();
+    sc.water.flow.clear();
+    sc.water.flow.fillRect(-0.5, 0.5, -0.5, 0.5, 5e-5);
+    const auto visualSample = sc.water.flow.sample(0.0, 0.0);
+    const real filmDepth = sc.bodyFilmDepthAt(0.0, 0.0);
+    const Rgb dry{0.4f, 0.5f, 0.6f};
+    const Rgb coated = sc.shadeBodyFilm(dry, Vec3(0, 0, 1),
+                                        Vec3(0, 0, 1), filmDepth);
+    const real colorChange = std::abs(coated.r - dry.r) +
+                             std::abs(coated.g - dry.g) +
+                             std::abs(coated.b - dry.b);
+    CHECK("C8e", !visualSample.wet && std::abs(filmDepth - 5e-5) < 1e-9 &&
+                     colorChange > 1e-4,
+          "Film 50 um invisibile come acqua libera ma applicato al coating: h=%.6g m dRGB=%.6g",
+          filmDepth, colorChange);
   }
 
   // --------------------------------------------------------------------------

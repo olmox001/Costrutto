@@ -107,6 +107,34 @@ int main() {
     CHECK("M0d", totalCapillaryMagnitude > 0.0 &&
                      netInternalForce.norm() < 1e-12 * totalCapillaryMagnitude,
           "CSF produce trazione interna non nulla con risultante globale nulla");
+
+    MatterSimulator sandWater;
+    sandWater.gravity = Vec3(0, 0, 0);
+    sandWater.waterProperties_.sigma = 0.0;
+    sandWater.waterProperties_.mu = 0.0;
+    Particle grain, fluid;
+    grain.type = MatterType::Sand;
+    grain.pos = Vec3(-0.05, 0, 0);
+    grain.vel = Vec3(1, 0, 0);
+    grain.radius = 0.045;
+    grain.mass = 0.04;
+    fluid.type = MatterType::Water;
+    fluid.pos = Vec3(0.05, 0, 0);
+    fluid.vel = Vec3(-1, 0, 0);
+    fluid.radius = 0.055;
+    fluid.mass = 0.025;
+    fluid.density = 1000.0;
+    sandWater.particles = {grain, fluid};
+    cleanroom::AirProperties noAir;
+    noAir.pressurePa = 0.0;
+    sandWater.computeForces(noAir);
+    const Vec3 sandWaterDrag = sandWater.particles[0].force;
+    const Vec3 waterDrag = sandWater.particles[1].force;
+    const Vec3 relativeDrag = sandWaterDrag - waterDrag;
+    CHECK("M0e", sandWaterDrag.x < 0.0 &&
+             (sandWaterDrag + waterDrag).norm() < 1e-12 &&
+             relativeDrag.dot(grain.vel - fluid.vel) < 0.0,
+        "Drag sabbia-acqua usa la legge condivisa, conserva quantita' di moto e dissipa");
   }
 
   // --------------------------------------------------------------------------

@@ -947,20 +947,19 @@ public:
             (pi.type == MatterType::Water && pj.type == MatterType::Sand)) {
           Particle &sand = (pi.type == MatterType::Sand) ? pi : pj;
           Particle &water = (pi.type == MatterType::Water) ? pi : pj;
-          if (dist < h && gMag > 1e-9) {
+          if (dist < h) {
             const real vol =
                 (4.0 / 3.0) * PI * sand.radius * sand.radius * sand.radius;
-            const real Fb = water.density * gMag * vol / 8.0;
-            sand.force.z += Fb;
-            const Vec3 vRel = sand.vel - water.vel;
-            const real vMag = vRel.norm();
-            if (vMag > 1e-6) {
-              const real A = PI * sand.radius * sand.radius;
-              const real dragMag = 0.5 * water.density * 0.5 * A * vMag * vMag;
-              const real kf = -dragMag / (8.0 * vMag);
-              sand.force =
-                  sand.force + Vec3(vRel.x * kf, vRel.y * kf, vRel.z * kf);
+            if (gMag > 1e-9) {
+              const real Fb = water.density * gMag * vol / 8.0;
+              sand.force.z += Fb;
             }
+            const Vec3 vRel = sand.vel - water.vel;
+            const real area = PI * sand.radius * sand.radius / 8.0;
+            const Vec3 drag = cleanroom::quadraticDrag(
+                water.density, 0.5, area, vRel);
+            sand.force = sand.force + drag;
+            water.force = water.force - drag;
           }
         }
       });
