@@ -12,3 +12,7 @@ test_sdf
 diff.txt
 Makefile
 test_water_spray
+SDL
+test
+build
+dist
