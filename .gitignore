@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 .DS_Store
 nqg_cleanroom_game
 nqg_sample_game
@@ -16,3 +17,4 @@ SDL
 test
 build
 dist
+doc

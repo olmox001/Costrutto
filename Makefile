@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ============================================================================
 # NQG Project Makefile
 # Project sources, targets and compilation rules only.
@@ -14,13 +15,13 @@ include mk/test.mk
 # Project targets
 # ---------------------------------------------------------------------------
 TARGETS = test_nqg_core test_engine3d test_window_sdl3 test_cleanroom \
-          test_matter_physics test_continuum_physics test_sdf test_water_spray \
+          test_matter_physics test_continuum_physics test_water_solver test_sdf test_water_spray \
           nqg_sample_game nqg_cleanroom_game
 
 COMMON_HDRS = nqg_physics_core.hpp nqg_engine3d.hpp nqg_sdf.hpp \
               nqg_earth_environment.hpp nqg_apartment.hpp nqg_air_physics.hpp \
               nqg_matter_physics.hpp nqg_continuum_physics.hpp \
-              nqg_water_spray.hpp nqg_cleanroom_engine.hpp
+              nqg_water_solver.hpp nqg_water_spray.hpp nqg_cleanroom_engine.hpp
 
 BINARIES = $(addprefix $(BUILD_DIR)/,$(addsuffix $(EXE_EXT),$(TARGETS)))
 
@@ -52,8 +53,12 @@ $(BUILD_DIR)/test_matter_physics$(EXE_EXT): test_matter_physics.cpp \
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD_DIR)/test_continuum_physics$(EXE_EXT): test_continuum_physics.cpp \
-        nqg_continuum_physics.hpp nqg_sdf.hpp nqg_air_physics.hpp \
+        nqg_continuum_physics.hpp nqg_water_solver.hpp nqg_sdf.hpp nqg_air_physics.hpp \
         nqg_engine3d.hpp nqg_physics_core.hpp | dirs
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD_DIR)/test_water_solver$(EXE_EXT): test_water_solver.cpp \
+        nqg_water_solver.hpp nqg_physics_core.hpp | dirs
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD_DIR)/test_sdf$(EXE_EXT): test_sdf.cpp $(COMMON_HDRS) | dirs

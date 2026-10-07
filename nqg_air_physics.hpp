@@ -464,6 +464,15 @@ struct AirProperties {
                                 const Vec3 &pos, const Vec3 &vel, Vec3 &fDrag,
                                 Vec3 &fBuoyancy, real &ReOut,
                                 real gravityMag = 9.80665) const {
+    computeAerodynamicForces(sphereRadius, sphereMass, pos, vel, fDrag,
+                 fBuoyancy, ReOut,
+                 Vec3(0, 0, -std::abs(gravityMag)));
+    }
+
+    void computeAerodynamicForces(real sphereRadius, real sphereMass,
+                  const Vec3 &pos, const Vec3 &vel, Vec3 &fDrag,
+                  Vec3 &fBuoyancy, real &ReOut,
+                  const Vec3 &gravityVec) const {
     (void)pos;
     (void)sphereMass;
     const real rho = density();
@@ -474,7 +483,7 @@ struct AirProperties {
     const real area = PI * r2;
     const real volume = (4.0 / 3.0) * PI * r2 * sphereRadius;
 
-    fBuoyancy = Vec3(0, 0, rho * volume * gravityMag);
+    fBuoyancy = gravityVec * (-rho * volume);
 
     const Vec3 vRel = vel - windVelocity;
     const real v2 = vRel.dot(vRel);

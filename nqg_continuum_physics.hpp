@@ -397,6 +397,7 @@
 #include "nqg_materials.hpp"
 #include "nqg_physics_core.hpp"
 #include "nqg_sdf.hpp"
+#include "nqg_water_solver.hpp"
 
 #include <algorithm>
 #include <array>
@@ -754,13 +755,15 @@ public:
            d * std::sqrt(std::max(0.0, 2.0 * r * h - h * h));
   }
 
-  void couple(real cx, real cy, real hx, real hy, bool circular, real dVolume,
+  real couple(real cx, real cy, real hx, real hy, bool circular, real dVolume,
               real px, real py) {
     const real margin = 1.5 * flow.dx;
-    displacedVolume +=
+    const real appliedVolume =
         flow.addVolumeRing(cx, cy, hx, hy, circular, margin, dVolume);
+    displacedVolume += appliedVolume;
     flow.addMomentum(cx, cy, std::max(hx, hy) + 2.0 * flow.dx, px, py);
     updateVolume();
+    return appliedVolume;
   }
 };
 
@@ -1067,6 +1070,8 @@ struct RigidSolidElement {
 
   Vec3 lastGravity = Vec3(0, 0, 0);
   Vec3 lastBuoyancy = Vec3(0, 0, 0);
+  Vec3 lastHydroForce = Vec3(0, 0, 0);
+  Vec3 lastAirBuoyancy = Vec3(0, 0, 0);
   Vec3 lastWindForce = Vec3(0, 0, 0);
   Vec3 lastEMForce = Vec3(0, 0, 0);
 
@@ -1178,6 +1183,14 @@ struct RigidSolidElement {
     restTimer = 0.0;
   }
 
+  Vec3 estimatedAcceleration() const {
+    if (isStatic || externalControl)
+      return Vec3(0, 0, 0);
+    const real effectiveMass = std::max(mass + prevAddedMass, 1e-9);
+    return (lastGravity + lastHydroForce + lastAirBuoyancy + lastWindForce +
+            lastEMForce) * (1.0 / effectiveMass);
+  }
+
   // Fattore di volume spostato nei fluidi: inviluppo intero se la cavita' e'
   // sigillata, altrimenti solo la materia.
   real displacedFactor() const {
@@ -1203,6 +1216,8 @@ struct RigidSolidElement {
   void setHollow(real wallThickness) {
     hollowWall = std::max(0.0, wallThickness);
     sealedCavity = hollowWall > 0.0;
+    if (!sealedCavity)
+      fillFraction = 1.0;
     syncMass();
   }
 
@@ -1288,7 +1303,12 @@ struct RigidSolidElement {
       return Vec3(1, 1, 1);
     if (shape == Shape::Sphere) {
       const real r = 0.5 * std::min({size.x, size.y, size.z});
-      const real i = 0.4 * mass * r * r;
+      real i = 0.4 * mass * r * r;
+      if (hollowWall > 0.0 && hollowWall < r) {
+        const real inner = r - hollowWall;
+        i *= (r * r * r * r * r - inner * inner * inner * inner * inner) /
+             (r * r * r - inner * inner * inner) / (r * r);
+      }
       return Vec3(i, i, i);
     }
     if (shape == Shape::Cylinder || shape == Shape::Capsule) {
@@ -1999,6 +2019,7 @@ struct RigidSolidElement {
       prevAddedMass = H.addedMass;
       const real meff = mass + H.addedMass;
       lastBuoyancy = Vec3(0, 0, H.buoyancy);
+      lastHydroForce = H.force;
       // spinta applicata al baricentro del volume immerso: il momento
       // raddrizza i corpi che galleggiano (stessa regola per ogni forma)
       if (!lockRotation && H.buoyancy > 0.0)
@@ -2010,6 +2031,7 @@ struct RigidSolidElement {
       const Vec3 airBuoy = (gravityVec * -1.0) *
                            (airDensity * vol *
                             (1.0 - std::clamp(H.submergedFraction, 0.0, 1.0)));
+      lastAirBuoyancy = airBuoy;
 
       // Forze: gravita' (CoM), spinta+resistenza (acqua), campo EM, Archimede
       // in aria. La resistenza dell'aria e' UNA sola, relativa al vento, ed e'
@@ -2102,11 +2124,12 @@ struct RigidSolidElement {
       return;
     }
     const Vec3 hw = halfW();
-    water.couple(pos.x, pos.y, hw.x, hw.y,
-                 shape == Shape::Sphere || shape == Shape::Cylinder ||
-                     shape == Shape::Capsule,
-                 Hf.submergedVolume - prevSubmerged, reaction.x, reaction.y);
-    prevSubmerged = Hf.submergedVolume;
+    const real appliedDisplacement = water.couple(
+      pos.x, pos.y, hw.x, hw.y,
+      shape == Shape::Sphere || shape == Shape::Cylinder ||
+        shape == Shape::Capsule,
+      Hf.submergedVolume - prevSubmerged, reaction.x, reaction.y);
+    prevSubmerged += appliedDisplacement;
   }
 
 private:
@@ -2392,6 +2415,7 @@ inline HydroResult bodyHydro(const ContinuousWaterBody &W,
   r.film = std::max(0.0, r.level - r.bedZ);
   if (vSub <= 0.0)
     return r;
+  const real geometricSubmergedVolume = vSub;
   const real rho = W.flow.liquid.rho, mu = W.flow.liquid.mu;
   const real V = std::max(b.volume(), 1e-12);
   // volume spostato: inviluppo (cavo sigillato) o sola materia (corpo pieno)
@@ -2399,7 +2423,7 @@ inline HydroResult bodyHydro(const ContinuousWaterBody &W,
   vSub *= dispF;
   r.submergedVolume = vSub;
   r.submergedFraction = std::min(1.0, vSub / (V * dispF));
-  r.centroid = cSum * (1.0 / vSub);
+  r.centroid = cSum * (1.0 / geometricSubmergedVolume);
   r.buoyancy = rho * g * vSub;
   r.force.z += r.buoyancy;
   r.addedMass = b.addedMassCoeff(W) * rho * vSub;
@@ -2543,30 +2567,41 @@ public:
 
   // Coulomb mutuo tra solidi carichi. ACCUMULA (+=).
   void applyCoulombBetweenSolids(std::vector<RigidSolidElement> &solids) const {
+    struct ChargedBody {
+      std::size_t index;
+      real charge;
+    };
+    std::vector<ChargedBody> charged;
+    charged.reserve(solids.size());
     for (std::size_t i = 0; i < solids.size(); ++i) {
-      if (solids[i].isStatic)
-        continue;
-      for (std::size_t j = i + 1; j < solids.size(); ++j) {
-        // carica limitata dalla scarica a corona dell'aria
-        real qi = solids[i].effectiveCharge(), qj = solids[j].effectiveCharge();
-        if (std::abs(qi) < 1e-15 || std::abs(qj) < 1e-15)
+      const real charge = solids[i].effectiveCharge();
+      if (std::abs(charge) >= 1e-15)
+        charged.push_back({i, charge});
+    }
+
+    for (std::size_t a = 0; a < charged.size(); ++a) {
+      auto &A = solids[charged[a].index];
+      for (std::size_t b = a + 1; b < charged.size(); ++b) {
+        auto &B = solids[charged[b].index];
+        if (A.isStatic && B.isStatic)
           continue;
-        Vec3 rVec = solids[i].pos - solids[j].pos;
+        Vec3 rVec = A.pos - B.pos;
         real r = rVec.norm();
         // i corpi non si compenetrano: il centro non puo' stare piu' vicino
         // della somma dei raggi equivalenti
-        const real rMin = std::max(0.05, solids[i].effectiveRadius() +
-                                             solids[j].effectiveRadius());
+        const real rMin =
+            std::max(0.05, A.effectiveRadius() + B.effectiveRadius());
         if (r < rMin)
           r = rMin;
         Vec3 rHat =
             rVec.normalized(); // direzione vera (non quella del r limitato)
-        real fMag = phys::k_coulomb * qi * qj / (r * r);
+        real fMag =
+            phys::k_coulomb * charged[a].charge * charged[b].charge / (r * r);
         Vec3 force = rHat * fMag;
-        if (!solids[i].isStatic)
-          solids[i].lastEMForce = solids[i].lastEMForce + force;
-        if (!solids[j].isStatic)
-          solids[j].lastEMForce = solids[j].lastEMForce - force;
+        if (!A.isStatic)
+          A.lastEMForce = A.lastEMForce + force;
+        if (!B.isStatic)
+          B.lastEMForce = B.lastEMForce - force;
       }
     }
   }

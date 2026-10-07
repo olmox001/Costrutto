@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  test_continuum_physics.cpp  -  Test Suite Fisica dei Mezzi Continui (NQG)
 // ============================================================================
@@ -77,7 +78,14 @@ int main() {
       return b;
     });
     pool.initialFill(-3.0, 3.0, -3.0, 3.0, 0.5);
+    const real volumeBeforeImpulse = pool.totalVolume();
     pool.addImpulse(Vec3(0, 0, 0.5), 0.0, 0.05);
+    const real volumeAfterImpulse = pool.totalVolume();
+    const real etaAfterImpulse = pool.surfaceHeight(0.0, 0.0);
+    CHECK(std::abs(volumeAfterImpulse - volumeBeforeImpulse) < 1e-12 &&
+          etaAfterImpulse > 0.5,
+        "K1m", "Impulso d'onda modifica la superficie senza cambiare volume: dV=" +
+             std::to_string(volumeAfterImpulse - volumeBeforeImpulse));
     const real eta0 = pool.surfaceHeight(1.5, 0.0);
     real tArrive = -1.0;
     for (int i = 0; i < 300 && tArrive < 0; ++i) {
@@ -94,6 +102,52 @@ int main() {
       pool.step(0.01);
     CHECK(std::abs(pool.totalVolume() - v0) < 1e-6 * v0 + 1e-9, "K1h",
           "Volume conservato dopo l'impulso e la propagazione");
+
+    ContinuousWaterBody centroidPool;
+    centroidPool.initialFill(-2.0, 2.0, -2.0, 2.0, 0.6);
+    RigidSolidElement fullBody;
+    fullBody.size = Vec3(0.8, 0.8, 1.0);
+    fullBody.pos = Vec3(0.0, 0.0, 0.5);
+    fullBody.syncMass();
+    RigidSolidElement halfBody = fullBody;
+    halfBody.fillFraction = 0.5;
+    halfBody.syncMass();
+    const HydroResult fullHydro =
+      bodyHydro(centroidPool, fullBody, Vec3(0, 0, 0), 9.80665);
+    const HydroResult halfHydro =
+      bodyHydro(centroidPool, halfBody, Vec3(0, 0, 0), 9.80665);
+    CHECK(fullHydro.wet && halfHydro.wet &&
+          std::abs(halfHydro.submergedVolume /
+                 fullHydro.submergedVolume -
+               0.5) < 1e-10 &&
+          (halfHydro.centroid - fullHydro.centroid).norm() < 1e-10,
+        "K1l", "Frazione piena 0.5 dimezza la spinta senza spostare il centro: z=" +
+             std::to_string(fullHydro.centroid.z) + "/" +
+             std::to_string(halfHydro.centroid.z));
+
+    fluid::ShallowFlow visualField(0.1, 8, 8);
+    visualField.fillRect(-3.0, 3.0, -3.0, 3.0, 0.5);
+    const real visualVolume = visualField.totalVolume();
+    const auto fullCoverage = fluid::estimateObserverSurface(
+      visualField, 0.0, 0.0, 0.1, 0.1, 64, 0x1234);
+    const auto fullCoverageRepeat = fluid::estimateObserverSurface(
+      visualField, 0.0, 0.0, 0.1, 0.1, 64, 0x1234);
+    fluid::ShallowFlow visualShore(0.1, 8, 8);
+    visualShore.fillRect(-3.0, 0.0, -3.0, 3.0, 0.5);
+    const auto partialCoverage = fluid::estimateObserverSurface(
+      visualShore, 0.0, 0.0, 0.4, 0.4, 256, 0x5678);
+    CHECK(fullCoverage.wetProbability == 1.0 &&
+          std::abs(fullCoverage.meanEta - 0.5) < 1e-10 &&
+          fullCoverage.etaVariance < 1e-20 &&
+          fullCoverage.wetProbability == fullCoverageRepeat.wetProbability &&
+          fullCoverage.meanEta == fullCoverageRepeat.meanEta &&
+          partialCoverage.wetProbability > 0.0 &&
+          partialCoverage.wetProbability < 1.0 &&
+          visualField.totalVolume() == visualVolume,
+          "K1k", "Stima Monte Carlo observer-only: copertura=" +
+               std::to_string(partialCoverage.wetProbability) +
+               ", eta=" + std::to_string(fullCoverage.meanEta) +
+               ", var=" + std::to_string(fullCoverage.etaVariance));
 
     // riva: profondita' continua (nessun salto sul bordo)
     ContinuousWaterBody beach;

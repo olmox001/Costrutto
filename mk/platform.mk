@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ============================================================================
 # NQG Platform Makefile
 # OS / architecture detection, SDL3, universal binaries, .app bundle,

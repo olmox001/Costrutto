@@ -409,6 +409,11 @@ int main(int argc, char *argv[]) {
   // Se hai una GPU veloce e vuoi piu' dettaglio, alza a 480x360 o 640x480.
   int renderW = 480;
   int renderH = 360;
+    const unsigned logicalCores =
+      std::max(1u, std::thread::hardware_concurrency());
+    const unsigned renderWorkers =
+      std::min(std::max(1u, logicalCores - 1),
+           static_cast<unsigned>(std::max(1, renderH)));
 
   // --- Campo EM di esempio: due solidi carichi (attrazione Coulomb) ---
   // Attivalo/commentalo per testare.
@@ -451,7 +456,9 @@ int main(int argc, char *argv[]) {
 
   std::cout
       << "Appartamento: 12m x 10m x 3.2m con porta sud.\n"
-         "SPACE: tap=salto | hold=volo | 2xTap=FREE-FALL\n"
+       "Core logici: "
+      << logicalCores << " | thread render: " << renderWorkers << "\n"
+      << "SPACE: tap=salto | hold=volo | 2xTap=FREE-FALL\n"
          "SHIFT: boost 10x\n"
          "[1] Acqua | [2] Sabbia | [3] Solido | [T] Vento | [G] Gravita'\n"
          "[L] Luce | [X] Pulisci | [ESC] Esci\n";
@@ -647,6 +654,7 @@ int main(int argc, char *argv[]) {
       scene.removeDynamicSpheres();
     }
 
+    scene.setPhysicsObserver(globe.pos, lookDir, renderW, renderH);
     scene.stepPhysics(dt);
     {
       // urti subiti dagli altri corpi (cubi, palla): spingono il giocatore

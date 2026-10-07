@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ============================================================================
 # NQG – Linux Environment Setup Script
 # Detects the distribution and installs SDL3 development packages

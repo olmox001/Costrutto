@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+
 ##COSTRUTTO
 
 Costrutto is a simple 3D engine with basic physics.

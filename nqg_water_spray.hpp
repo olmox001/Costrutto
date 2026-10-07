@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  nqg_water_spray.hpp  -  Acqua: gocce, getti, cascate, pioggia, film sottili
 //
@@ -59,6 +60,7 @@
 #define NQG_WATER_SPRAY_HPP
 
 #include "nqg_continuum_physics.hpp"
+#include "nqg_water_solver.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -207,7 +209,7 @@ public:
   std::vector<Drop> drops; // in volo + sessili
   Stats stats;
   std::size_t maxDrops = 6000;
-  mutable Observer observer; // impostato dal motore (ultima vista renderizzata)
+  Observer simulationObserver; // politica osservativa usata dal passo fisico
   void invalidate() const { ready_ = false; }
   real hangVolume() const {
     real v = 0;
@@ -334,9 +336,8 @@ public:
     real chord = 0.0;
     bool sessile = false;
   };
-  void prepare() const {
-    if (ready_)
-      return;
+  void prepare(const Observer &renderObserver) const {
+    ready_ = false;
     items_.clear();
     cells_.clear();
     ready_ = true;
@@ -351,7 +352,8 @@ public:
     for (std::size_t i = 0; i < drops.size(); ++i) {
       const Drop &d = drops[i];
       // solo cio' che l'osservatore puo' vedere entra nella griglia di render
-      if (observer.valid && !observer.inView(d.pos, d.radius() + 1e-3, 0.02))
+      if (renderObserver.valid &&
+          !renderObserver.inView(d.pos, d.radius() + 1e-3, 0.02))
         continue;
       Item it;
       it.idx = int(i);
@@ -398,6 +400,11 @@ public:
           for (int a = i0; a <= i1; ++a)
             cells_[(std::size_t(c) * ny_ + b) * nx_ + a].push_back(int(k));
     }
+  }
+
+  void prepare() const {
+    if (!ready_)
+      prepare(Observer{});
   }
 
   bool raycast(const Vec3 &ro, const Vec3 &rd, real tMax, Hit &out) const {
@@ -734,7 +741,8 @@ private:
       if (d.sessile)
         continue;
       d.age += dt;
-      d.obs = observer.inView(d.pos, d.radius() + 1e-3, observer.turnMargin);
+      d.obs = simulationObserver.inView(d.pos, d.radius() + 1e-3,
+                    simulationObserver.turnMargin);
       real tRem = dt;
       int guard = 0;
       while (tRem > 1e-9 && !d.sessile && d.volume > 0 && guard++ < 24) {

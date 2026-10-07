@@ -1,5 +1,6 @@
 // g++ -O2 -std=c++17 -Wall -Wextra test_nqg_core.cpp -o test_nqg_core &&
 // ./test_nqg_core
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "nqg_physics_core.hpp"
 #include <chrono>
 #include <cstdio>

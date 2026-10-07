@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  test_sdf.cpp  -  Validazione del core geometrico a Signed Distance Field
 //  Primitive, CSG, normali analitiche, sphere tracing, contatti e collisioni.

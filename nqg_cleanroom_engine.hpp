@@ -631,21 +631,32 @@ public:
     rainYb = yb;
     rainZ = zTop;
   }
-  // Ultima vista dell'osservatore (scritta SOLO dal rendering/observe(), letta
-  // dalla fisica): unico canale fra render e motore fisico (regola
-  // dell'osservatore). Il render non modifica altro stato fisico.
-  mutable spray::Observer lastView_;
+  // Stato fisico dell'osservatore, aggiornato dal game loop prima del tick.
+  spray::Observer physicalObserver;
+  Vec3 physicalObserverPos = Vec3(0, -3, 1.7);
+  Vec3 physicalObserverECEF = Vec3(0, 0, 0);
   mutable std::vector<int> visIdx_; // solidi nel cono (cache di render)
   mutable bool visValid_ = false;
-  void observe(const Vec3 &eye, const Vec3 &fwd, int width, int height) const {
+  spray::Observer makeObserverView(const Vec3 &eye, const Vec3 &fwd,
+                                  int width, int height) const {
+    spray::Observer view;
     const real th = std::tan(camera.fovY / 2.0);
     const real asp = real(width) / real(std::max(1, height));
-    lastView_.valid = true;
-    lastView_.pos = eye;
-    lastView_.fwd = apartment::safeNormalize(fwd, Vec3(0, 1, 0));
-    lastView_.halfDiag = std::atan(th * std::sqrt(1.0 + asp * asp));
-    lastView_.pixelAngle = 2.0 * th / real(std::max(1, height));
-    lastView_.turnMargin = 0.5 * camera.fovY; // puo' ruotare di mezzo fov/frame
+    view.valid = true;
+    view.pos = eye;
+    view.fwd = apartment::safeNormalize(fwd, Vec3(0, 1, 0));
+    view.halfDiag = std::atan(th * std::sqrt(1.0 + asp * asp));
+    view.pixelAngle = 2.0 * th / real(std::max(1, height));
+    view.turnMargin = 0.5 * camera.fovY;
+    return view;
+  }
+  void setPhysicsObserver(const Vec3 &globePosition, const Vec3 &fwd,
+                          int width, int height) {
+    physicalObserverPos = globePosition;
+    physicalObserverECEF = resolveGlobePosition(globePosition);
+    physicalObserver =
+        makeObserverView(globePosition, fwd, width, height);
+    spray.simulationObserver = physicalObserver;
   }
   continuum::ContinuousWindField wind;
   continuum::ContinuousSandDuneField sand;
@@ -667,7 +678,6 @@ public:
 
   RoomGeometry room;
 
-  mutable Vec3 lastObserverPos = Vec3(0, -3, 1.7);
   mutable real currentAltitude = 1.7;
   mutable real currentLatitude = 0.0;
   mutable real currentLongitude = 0.0;
@@ -705,6 +715,7 @@ public:
   CleanRoomScene() {
     homeECEF = globe.toECEF({homeLat, homeLon, 0.0});
     earth::EarthGlobe::enuBasis(homeLat, homeLon, homeUp, homeEast, homeNorth);
+    physicalObserverECEF = resolveGlobePosition(physicalObserverPos);
     windProfile = earth::WindField::profileFor(0.15, homeLat);
     currentLatitude = homeLat;
     currentLongitude = homeLon;
@@ -964,6 +975,9 @@ public:
     return earth::EarthGlobe::enuToECEF(local, homeECEF, homeUp, homeEast,
                                         homeNorth);
   }
+  Vec3 resolveGlobePosition(const Vec3 &globePosition) const {
+    return localToECEF(globePosition);
+  }
   Vec3 ecefToLocal(const Vec3 &p) const {
     return earth::EarthGlobe::ecefToENU(p, homeECEF, homeUp, homeEast,
                                         homeNorth);
@@ -973,7 +987,7 @@ public:
   }
 
   void updateEnvironment() {
-    Vec3 obsECEF = localToECEF(lastObserverPos);
+    const Vec3 obsECEF = physicalObserverECEF;
     earth::EarthGlobe::ecefToLatLon(obsECEF, currentLatitude, currentLongitude,
                                     currentAltitude);
     real hGeo = earth::StandardAtmosphere::geopotential(currentAltitude);
@@ -989,7 +1003,7 @@ public:
         zeroGravityEnabled ? Vec3(0, 0, 0) : Vec3(0, 0, -currentGravity);
     const Vec3 localWind = earth::WindField::velocityAt(
         earth::WindField::profileFor(0.15, currentLatitude), currentAltitude);
-    Vec3 curlWind = wind.evaluateVelocity(lastObserverPos, simTime);
+    Vec3 curlWind = wind.evaluateVelocity(physicalObserverPos, simTime);
     real blend = std::clamp(currentAltitude / 2000.0, 0.0, 1.0);
     currentWind = curlWind * (1.0 - blend) + localWind * blend;
     air.windVelocity = currentWind;
@@ -1201,10 +1215,10 @@ public:
       reaction = (vr - vn) * meff;
     }
     const Vec3 hw = P.halfW();
-    water.couple(P.pos.x, P.pos.y, hw.x, hw.y, true,
-                 H.submergedVolume - playerPrevSubmerged, reaction.x,
-                 reaction.y);
-    playerPrevSubmerged = H.submergedVolume;
+    const real appliedDisplacement = water.couple(
+      P.pos.x, P.pos.y, hw.x, hw.y, true,
+      H.submergedVolume - playerPrevSubmerged, reaction.x, reaction.y);
+    playerPrevSubmerged += appliedDisplacement;
     playerSubmerged = H.submergedVolume;
   }
 
@@ -1489,7 +1503,9 @@ public:
     return lit;
   }
 
-  Rgb traceRay(const Vec3 &ro, const Vec3 &rd) const {
+  Rgb traceRay(const Vec3 &ro, const Vec3 &rd,
+               std::uint64_t observerSeed = 0,
+               real pixelAngleY = 0.0, real pixelAspect = 1.0) const {
     const std::size_t nLights = cachedLightColors.size();
 
     bool cameraUnderwater = false;
@@ -1617,7 +1633,9 @@ public:
         const Vec3 rf = rd - dh.n * (2.0 * rd.dot(dh.n));
         const Rgb refl = skyColor(rf);
         ++dropDepth;
-        const Rgb behind = traceRay(hp + rd * (dh.chord + 2e-4), rd);
+        const Rgb behind = traceRay(
+          hp + rd * (dh.chord + 2e-4), rd,
+          observerSeed ^ 0xD1B54A32D192ED03ull, pixelAngleY, pixelAspect);
         --dropDepth;
         const Vec3 tr = water.beerLambertTransmission(dh.chord);
         Rgb specSum = {0.0f, 0.0f, 0.0f};
@@ -1675,6 +1693,22 @@ public:
     Vec3 viewDir = rd * (-1.0);
 
     if (hitWater) {
+      real observerCoverage = 1.0;
+      if (!cameraUnderwater && waterDepth >= 0.0 && pixelAngleY > 0.0) {
+        const real footprintY = tHit * pixelAngleY;
+        const real footprintX = footprintY * pixelAspect;
+        const real cellScale = std::max(water.flow.dx, 1e-9);
+        const real footprintCells =
+            std::max(footprintX, footprintY) / cellScale;
+        if (footprintCells > 1.0) {
+          const std::size_t samples = std::clamp<std::size_t>(
+              std::size_t(std::ceil(footprintCells * 2.0)), 4, 8);
+          observerCoverage = fluid::estimateObserverSurface(
+                                 water.flow, hitPos.x, hitPos.y, footprintX,
+                                 footprintY, samples, observerSeed)
+                                 .wetProbability;
+        }
+      }
       if (cameraUnderwater) {
         Rgb below = hitAlbedo;
         Rgb amb = {cachedAmbientSky.r * 0.4f, cachedAmbientSky.g * 0.55f,
@@ -1792,7 +1826,8 @@ public:
       // deve raccordarsi in modo continuo col fondo asciutto (niente linea).
       const real filmBlend =
           waterDepth >= 0.0 ? std::clamp(waterDepth / 0.003, 0.0, 1.0) : 1.0;
-      const real wb = filmBlend * filmBlend * (3.0 - 2.0 * filmBlend);
+        const real wb =
+          filmBlend * filmBlend * (3.0 - 2.0 * filmBlend) * observerCoverage;
       const real Fb = F * wb;
       Rgb litWater;
       litWater.r =
@@ -1839,12 +1874,6 @@ public:
 
   Image renderView(int width, int height, const Vec3 &camEye, const Vec3 &fwd,
                    const Vec3 &camUp) const {
-    lastObserverPos = camEye;
-    currentAltitude =
-        (camEye - Vec3(0, 0, -earth::planet::R_E)).norm() - earth::planet::R_E;
-    real hGeo = earth::StandardAtmosphere::geopotential(currentAltitude);
-    currentDensity = globe.atmo.density(hGeo);
-
     if (cachedLightColors.size() != lighting.lights.size())
       refreshLightCache();
 
@@ -1852,16 +1881,17 @@ public:
       sol.prepare(); // cache SDF pronte prima dei thread di rendering
     sand.hMaxCached(); // cache dell'altezza massima prima dei thread
     // --- osservatore: vista corrente + solidi nel cono ---
-    observe(camEye, fwd, width, height);
-    spray.observer = lastView_; // la griglia gocce contiene solo il visibile
+    const spray::Observer renderObserver =
+      makeObserverView(camEye, fwd, width, height);
     spray.invalidate();
+    spray.prepare(renderObserver);
     {
       visIdx_.clear();
       for (std::size_t i = 0; i < solids.size(); ++i) {
         const auto &s = solids[i];
         if (!s.visible)
           continue;
-        if (lastView_.inView(s.pos, s.boundRadius(), 0.0))
+        if (renderObserver.inView(s.pos, s.boundRadius(), 0.0))
           visIdx_.push_back(int(i));
       }
       visValid_ = true;
@@ -1878,16 +1908,24 @@ public:
     const real th = std::tan(camera.fovY / 2.0);
     const real aspect = real(width) / real(height);
     std::atomic<int> nextY{0};
-    unsigned numThreads = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned availableThreads =
+      std::max(1u, std::thread::hardware_concurrency());
+    const unsigned workerCount =
+      std::min(std::max(1u, availableThreads - 1),
+           static_cast<unsigned>(std::max(1, height)));
     std::vector<std::thread> workers;
-    workers.reserve(numThreads);
+    workers.reserve(workerCount);
     auto worker = [&] {
       for (int y; (y = nextY++) < height;) {
         for (int x = 0; x < width; ++x) {
           real sx = ((x + 0.5) / width * 2.0 - 1.0) * aspect * th;
           real sy = (1.0 - (y + 0.5) / height * 2.0) * th;
           Vec3 dir = apartment::safeNormalize(f + right * sx + up * sy);
-          Rgb c = traceRay(camEye, dir);
+            const std::uint64_t observerSeed =
+              (std::uint64_t(static_cast<std::uint32_t>(y)) << 32) |
+              static_cast<std::uint32_t>(x);
+            Rgb c = traceRay(camEye, dir, observerSeed,
+                     2.0 * th / real(height), aspect);
           float *out = img.at(x, y);
           out[0] =
               std::clamp(std::pow(c.r / (1.0f + c.r), 1.0f / 2.2f), 0.0f, 1.0f);
@@ -1898,7 +1936,7 @@ public:
         }
       }
     };
-    for (unsigned t = 0; t < numThreads; ++t)
+    for (unsigned t = 0; t < workerCount; ++t)
       workers.emplace_back(worker);
     for (auto &t : workers)
       t.join();
@@ -1931,10 +1969,21 @@ public:
           B.wake();
       }
       c.pt[k] = Contact::Pt();
-      c.pt[k].bounce = vn < -0.5 ? -e * vn : 0.0;
-      if (dt > 0.0 && c.pt[k].bounce == 0.0) {
-        const real gap = std::max(0.0, -c.manifold.depth[k]);
-        c.pt[k].bounce = -gap / dt;
+      const real restitutionTarget = vn < -0.5 ? -e * vn : 0.0;
+      if (dt > 0.0) {
+        const real pointDepth = c.manifold.depth[k] == 0.0
+                                    ? c.overlap
+                                    : c.manifold.depth[k];
+        const Vec3 relativeAcceleration =
+            A.estimatedAcceleration() - B.estimatedAcceleration();
+        const real normalAcceleration = relativeAcceleration.dot(n);
+        const real speculativeTarget =
+            pointDepth / dt - 0.5 * normalAcceleration * dt;
+        c.pt[k].bounce =
+          vn < -0.5 ? std::max(restitutionTarget, speculativeTarget)
+                : speculativeTarget;
+      } else {
+        c.pt[k].bounce = restitutionTarget;
       }
     }
   }
@@ -1956,10 +2005,53 @@ public:
   struct WarmImpulse {
     real jn = 0.0;
     Vec3 jt = Vec3(0, 0, 0);
+    Vec3 normal = Vec3(0, 0, 1);
+    real dt = 0.0;
   };
   std::unordered_map<std::uint64_t, WarmImpulse> warm_;
   static std::uint64_t pairKey(int i, int j) {
     return (std::uint64_t(std::uint32_t(i)) << 32) | std::uint32_t(j);
+  }
+
+  std::vector<std::pair<std::size_t, std::size_t>>
+  broadphasePairs(real margin) const {
+    struct Interval {
+      std::size_t index;
+      real minX, maxX;
+    };
+    std::vector<Interval> intervals;
+    intervals.reserve(solids.size());
+    for (std::size_t i = 0; i < solids.size(); ++i) {
+      const real radius = solids[i].boundRadius() + margin;
+      intervals.push_back({i, solids[i].pos.x - radius,
+                           solids[i].pos.x + radius});
+    }
+    std::sort(intervals.begin(), intervals.end(),
+              [](const Interval &a, const Interval &b) {
+                return a.minX == b.minX ? a.index < b.index
+                                        : a.minX < b.minX;
+              });
+
+    std::vector<std::pair<std::size_t, std::size_t>> pairs;
+    for (std::size_t a = 0; a < intervals.size(); ++a) {
+      const auto &ia = intervals[a];
+      const auto &A = solids[ia.index];
+      for (std::size_t b = a + 1; b < intervals.size(); ++b) {
+        const auto &ib = intervals[b];
+        if (ib.minX > ia.maxX)
+          break;
+        const auto &B = solids[ib.index];
+        if (A.isStatic && B.isStatic)
+          continue;
+        const real radius = A.boundRadius() + B.boundRadius() + margin;
+        if ((A.pos - B.pos).norm2() > radius * radius)
+          continue;
+        pairs.emplace_back(std::min(ia.index, ib.index),
+                           std::max(ia.index, ib.index));
+      }
+    }
+    std::sort(pairs.begin(), pairs.end());
+    return pairs;
   }
 
   static void solveContactPoint(continuum::RigidSolidElement &A,
@@ -2010,12 +2102,22 @@ public:
       const real Kt = kEff(*dirT[a]);
       if (Kt < 1e-12)
         continue;
-      real nt = *accT[a] - relVel(*dirT[a]) / Kt;
-      if (std::abs(nt) > muS * pt.jn)
-        nt = std::copysign(muK * pt.jn, nt);
+      const real nt = *accT[a] - relVel(*dirT[a]) / Kt;
       const real l = nt - *accT[a];
       *accT[a] = nt;
       applyJ(*dirT[a] * l);
+    }
+
+    const real tangentMagnitude = std::hypot(pt.jt1, pt.jt2);
+    const real staticLimit = muS * pt.jn;
+    if (tangentMagnitude > staticLimit && tangentMagnitude > 0.0) {
+      const real kineticLimit = muK * pt.jn;
+      const real scale = kineticLimit / tangentMagnitude;
+      const real jt1 = pt.jt1 * scale;
+      const real jt2 = pt.jt2 * scale;
+      applyJ(t1 * (jt1 - pt.jt1) + t2 * (jt2 - pt.jt2));
+      pt.jt1 = jt1;
+      pt.jt2 = jt2;
     }
 
     const Vec3 w = (sA ? zero : A.angVel) - (sB ? zero : B.angVel);
@@ -2108,14 +2210,9 @@ public:
     const real skin = 1.0e-5; // gap lasciato dopo la separazione
     for (int it = 0; it < maxIter; ++it) {
       bool moved = false;
-      for (std::size_t i = 0; i < solids.size(); ++i) {
-        for (std::size_t j = i + 1; j < solids.size(); ++j) {
+      for (const auto &[i, j] : broadphasePairs(0.0)) {
           auto &A = solids[i];
           auto &B = solids[j];
-          if (A.isStatic && B.isStatic)
-            continue;
-          if ((A.pos - B.pos).norm() > A.boundRadius() + B.boundRadius())
-            continue;
           Vec3 n;
           real depth;
           if (!continuum::RigidSolidElement::sdfOverlap(A, B, n, depth, 0.0))
@@ -2139,7 +2236,6 @@ public:
               B.wake();
           }
           moved = true;
-        }
       }
       if (groundFn) {
         for (auto &s : solids) {
@@ -2213,7 +2309,6 @@ public:
           s.vel = s.vel + J * (1.0 / std::max(s.mass, 1e-6));
         }
       };
-      spray.observer = lastView_; // fisica a risoluzione dell'osservatore
       if (rainMmPerHour > 0.0)
         spray.rain(rainMmPerHour, rainXa, rainXb, rainYa, rainYb, rainZ, dt, env,
                    Vec3(currentWind.x, currentWind.y, 0));
@@ -2293,16 +2388,10 @@ public:
                        groundFn);
 
       contacts.clear();
-      for (std::size_t i = 0; i < solids.size(); ++i) {
-        for (std::size_t j = i + 1; j < solids.size(); ++j) {
+      for (const auto &[i, j] : broadphasePairs(contactMargin)) {
           auto &A = solids[i];
           auto &B = solids[j];
-          if (A.isStatic && B.isStatic)
-            continue;
           if ((A.isStatic || A.asleep) && (B.isStatic || B.asleep))
-            continue;
-          if ((A.pos - B.pos).norm() >
-              A.boundRadius() + B.boundRadius() + contactMargin)
             continue;
           Vec3 n;
           real overlap;
@@ -2331,7 +2420,6 @@ public:
             continue;
           prepareContact(A, B, c, dtSub);
           contacts.push_back(c);
-        }
       }
 
       // Warm starting: stesso impulso di riposo del passo precedente
@@ -2340,6 +2428,9 @@ public:
         auto it = warm_.find(pairKey(c.i, c.j));
         if (it == warm_.end())
           continue;
+        const real normalAgreement = c.normal.dot(it->second.normal);
+        if (normalAgreement < 0.95 || !(it->second.dt > 0.0))
+          continue;
         bool resting = true;
         for (int k = 0; k < c.manifold.count; ++k)
           resting = resting && c.pt[k].bounce <= 0.0 && c.pt[k].bounce > -1.0;
@@ -2347,10 +2438,11 @@ public:
           continue;
         auto &A = solids[std::size_t(c.i)];
         auto &B = solids[std::size_t(c.j)];
+        const real scale = dtSub / it->second.dt;
         const real inv = 1.0 / real(c.manifold.count);
-        const real jn = it->second.jn * inv;
-        const real jt1 = it->second.jt.dot(c.t1) * inv;
-        const real jt2 = it->second.jt.dot(c.t2) * inv;
+        const real jn = it->second.jn * scale * inv;
+        const real jt1 = it->second.jt.dot(c.t1) * scale * inv;
+        const real jt2 = it->second.jt.dot(c.t2) * scale * inv;
         for (int k = 0; k < c.manifold.count; ++k) {
           c.pt[k].jn = jn;
           c.pt[k].jt1 = jt1;
@@ -2375,6 +2467,8 @@ public:
       warm_.clear();
       for (auto &c : contacts) {
         WarmImpulse w;
+        w.normal = c.normal;
+        w.dt = dtSub;
         for (int k = 0; k < c.manifold.count; ++k) {
           w.jn += c.pt[k].jn;
           w.jt = w.jt + c.t1 * c.pt[k].jt1 + c.t2 * c.pt[k].jt2;

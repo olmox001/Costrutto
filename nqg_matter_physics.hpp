@@ -379,6 +379,7 @@
 #include "nqg_air_physics.hpp"
 #include "nqg_engine3d.hpp"
 #include "nqg_physics_core.hpp"
+#include "nqg_water_solver.hpp"
 
 #include <algorithm>
 #include <array>
@@ -579,10 +580,11 @@ public:
   std::vector<MolecularBond> bonds;
 
   real sphRadius_ = 0.22;
-  real waterRestDensity_ = 1000.0;
+  real waterTemperatureK_ = 293.15;
+  fluid::Liquid waterProperties_ = fluid::waterAtKelvin(waterTemperatureK_);
+  // Weakly-compressible SPH closure parameter, not the physical bulk modulus
+  // of water; its numerical calibration is independent of liquid viscosity.
   real waterBulkModulus_ = 2000.0;
-  real waterViscosity_ = 0.045;
-  real waterSurfaceTension_ = 0.15;
 
   real sandFrictionCoeff_ = 0.65;
   real sandStiffness_ = 3500.0;
@@ -591,6 +593,11 @@ public:
   real coulombConstant_ = 50.0;
 
   Vec3 gravity = Vec3(0, 0, -9.80665);
+
+  void setWaterTemperature(real kelvin) {
+    waterTemperatureK_ = std::clamp(kelvin, 273.16, 373.0);
+    waterProperties_ = fluid::waterAtKelvin(waterTemperatureK_);
+  }
 
   struct AudioEvent {
     enum class Kind { Splash, SandClick, SolidImpact } kind;
@@ -615,7 +622,7 @@ public:
       p.vel = Vec3(dist(rng) * 0.5, dist(rng) * 0.5, -0.5);
       p.mass = 0.025;
       p.radius = 0.055;
-      p.density = waterRestDensity_;
+      p.density = waterProperties_.rho;
       p.color = {0.18f, 0.55f, 0.95f};
       particles.push_back(p);
     }
@@ -735,7 +742,7 @@ public:
       Vec3 fDrag, fBuoyancy;
       real re;
       air.computeAerodynamicForces(p.radius, p.mass, p.pos, p.vel, fDrag,
-                                   fBuoyancy, re, gravity.norm());
+                                   fBuoyancy, re, gravity);
       p.force = p.force + fDrag + fBuoyancy;
     }
     if (N < 2)
@@ -760,13 +767,82 @@ public:
         if (dist < h)
           rho += particles[j].mass * sphKernel(dist, h);
       });
-      const real rhoMin = waterRestDensity_ * 0.5;
+      const real rhoMin = waterProperties_.rho * 0.5;
       particles[i].density = rho > rhoMin ? rho : rhoMin;
-      const real ratio = particles[i].density / waterRestDensity_;
+      const real ratio = particles[i].density / waterProperties_.rho;
       // pow(ratio,7) = exp(7*ln(ratio))
       const real p7 = std::exp(7.0 * std::log(ratio));
       const real pv = waterBulkModulus_ * (p7 - 1.0);
       particles[i].pressure = pv > 0.0 ? pv : 0.0;
+    }
+
+    // Continuum-surface-force SPH: f_sigma = sigma * kappa * grad(C).
+    // grad(C) has units 1/m, kappa 1/m; multiplying by particle volume gives N.
+    std::vector<Vec3> colorGradient(N, Vec3(0, 0, 0));
+    std::vector<Vec3> surfaceNormal(N, Vec3(0, 0, 0));
+    std::vector<real> curvature(N, 0.0);
+    for (std::size_t i = 0; i < N; ++i) {
+      if (particles[i].type != MatterType::Water)
+        continue;
+      const Vec3 position = particles[i].pos;
+      grid_.forAll(int(i), [&](int j) {
+        const Particle &neighbor = particles[std::size_t(j)];
+        if (neighbor.type != MatterType::Water)
+          return;
+        const Vec3 displacement = position - neighbor.pos;
+        const real distance = displacement.norm();
+        if (distance < h) {
+          colorGradient[i] =
+              colorGradient[i] +
+              sphKernelGradient(displacement, distance, h) *
+                  (neighbor.mass / std::max(neighbor.density, 1e-12));
+        }
+      });
+      const real gradientLength = colorGradient[i].norm();
+      if (gradientLength > 1e-12)
+        surfaceNormal[i] = colorGradient[i] * (-1.0 / gradientLength);
+    }
+    for (std::size_t i = 0; i < N; ++i) {
+      if (particles[i].type != MatterType::Water ||
+          surfaceNormal[i].norm2() == 0.0)
+        continue;
+      const Vec3 position = particles[i].pos;
+      grid_.forAll(int(i), [&](int j) {
+        const Particle &neighbor = particles[std::size_t(j)];
+        if (neighbor.type != MatterType::Water ||
+            surfaceNormal[std::size_t(j)].norm2() == 0.0)
+          return;
+        const Vec3 displacement = position - neighbor.pos;
+        const real distance = displacement.norm();
+        if (distance < h) {
+          const Vec3 gradW = sphKernelGradient(displacement, distance, h);
+          curvature[i] +=
+              (neighbor.mass / std::max(neighbor.density, 1e-12)) *
+              (surfaceNormal[std::size_t(j)] - surfaceNormal[i]).dot(gradW);
+        }
+      });
+    }
+    Vec3 surfaceForceSum(0, 0, 0);
+    real waterMassSum = 0.0;
+    for (std::size_t i = 0; i < N; ++i) {
+      if (particles[i].type != MatterType::Water)
+        continue;
+      const real particleVolume =
+          particles[i].mass / std::max(particles[i].density, 1e-12);
+      const Vec3 surfaceForce =
+          colorGradient[i] *
+          (waterProperties_.sigma * curvature[i] * particleVolume);
+      particles[i].force = particles[i].force + surfaceForce;
+      surfaceForceSum = surfaceForceSum + surfaceForce;
+      waterMassSum += particles[i].mass;
+    }
+    if (waterMassSum > 0.0) {
+      for (std::size_t i = 0; i < N; ++i) {
+        if (particles[i].type == MatterType::Water)
+          particles[i].force =
+              particles[i].force -
+              surfaceForceSum * (particles[i].mass / waterMassSum);
+      }
     }
 
     // 3. Coppie (SPH, DEM, coulomb, acqua-sabbia) via forHalf -> O(N*k)
@@ -823,14 +899,13 @@ public:
           real vDotR = vDiff.dot(rVec);
           Vec3 fVisc(0, 0, 0);
           if (vDotR < 0) {
-            real muIJ = (h * vDotR) / (dist * dist + 0.01 * h * h);
-            real piIJ =
-                -waterViscosity_ * muIJ / (0.5 * (pi.density + pj.density));
-            fVisc = gradW * (-pi.mass * pj.mass * piIJ);
+            const real viscosityTerm =
+                4.0 * waterProperties_.mu * vDotR /
+                (std::max(pi.density * pj.density, 1e-12) *
+                 (dist * dist + 0.01 * h * h));
+            fVisc = gradW * (pi.mass * pj.mass * viscosityTerm);
           }
-          real surfCoeff = waterSurfaceTension_ * (1.0 - dist / h);
-          Vec3 fSurf = n * (-surfCoeff * pi.mass * pj.mass);
-          Vec3 fWaterTotal = fPress + fVisc + fSurf;
+          Vec3 fWaterTotal = fPress + fVisc;
           pi.force = pi.force + fWaterTotal;
           pj.force = pj.force - fWaterTotal;
         }

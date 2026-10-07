@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ============================================================================
 # NQG Test targets
 # Independent from platform and project sources.
@@ -13,6 +14,7 @@ run-tests: prepare-test
 	$(TEST_DIR)/test_cleanroom$(EXE_EXT)
 	$(TEST_DIR)/test_matter_physics$(EXE_EXT)
 	$(TEST_DIR)/test_continuum_physics$(EXE_EXT)
+	$(TEST_DIR)/test_water_solver$(EXE_EXT)
 	$(TEST_DIR)/test_sdf$(EXE_EXT)
 	$(TEST_DIR)/test_water_spray$(EXE_EXT)
 	@echo "✓ All unit tests finished"

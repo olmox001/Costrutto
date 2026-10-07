@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  test_cleanroom.cpp  -  Test di validazione fisica della Infinite Clean Room
 //  Verifica termodinamica dell'aria, fluidodinamica, illuminazione e DP45
@@ -83,6 +84,21 @@ int main() {
   // --------------------------------------------------------------------------
   {
     CleanRoomScene scene;
+    real resolvedLat = 0, resolvedLon = 0, resolvedAltitude = 0;
+    earth::EarthGlobe::ecefToLatLon(
+        scene.resolveGlobePosition(Vec3(0, 0, 1.7)), resolvedLat,
+        resolvedLon, resolvedAltitude);
+    CHECK("C4e", std::abs(resolvedLat - scene.homeLat) < 1e-6 &&
+          std::abs(resolvedLon - scene.homeLon) < 1e-6 &&
+          std::abs(resolvedAltitude - 1.7) < 1e-5,
+          "Risoluzione GlobeResolver: lat=%.4f lon=%.4f quota=%.2f m",
+          resolvedLat * 180.0 / PI, resolvedLon * 180.0 / PI,
+          resolvedAltitude);
+        const Vec3 globeProbe(12000, -8000, 2500);
+        CHECK("C4f", (scene.resolveGlobePosition(globeProbe) -
+           scene.localToECEF(globeProbe))
+              .norm() < 1e-7,
+          "Resolver globo coerente con ENU-ECEF per posizioni estese");
     Vec3 ro(0, 0, 2.0);
     Vec3 rd(0, 0, -1.0); // Raggio puntato dritto sul pavimento
     real t;
@@ -102,6 +118,33 @@ int main() {
     Vec3 nSph;
     bool hitSph = scene.intersectSphere(ro, rdSph, sphCenter, ball ? ball->sphereRadius() : 0.35, tSph, nSph);
     CHECK("C4b", hitSph && tSph > 0, "Intersezione sfera di prova: t = %.3f m", tSph);
+
+    scene.setPhysicsObserver(Vec3(3, 4, 5), Vec3(0, -1, 0), 8, 4);
+    const Vec3 physicsObserverPos = scene.physicalObserverPos;
+    const spray::Observer physicsObserver = scene.physicalObserver;
+    Image image = scene.renderView(8, 4, ro, Vec3(0, 1, 0), Vec3(0, 0, 1));
+    bool validPixels = image.px.size() == 8u * 4u * 3u;
+    for (real pixel : image.px)
+      validPixels = validPixels && std::isfinite(pixel);
+    CHECK("C4c", image.w == 8 && image.h == 4 && validPixels,
+          "Rendering parallelo 8x4: %dx%d, pixel validi=%s", image.w, image.h,
+          validPixels ? "si" : "no");
+    const bool physicsObserverPreserved =
+        (scene.physicalObserverPos - physicsObserverPos).norm() < 1e-12 &&
+        scene.physicalObserver.valid == physicsObserver.valid &&
+        (scene.physicalObserver.pos - physicsObserver.pos).norm() < 1e-12 &&
+        (scene.physicalObserver.fwd - physicsObserver.fwd).norm() < 1e-12;
+    CHECK("C4d", physicsObserverPreserved,
+          "Il render non modifica posizione e vista fisica nel core");
+    const Vec3 waterEye(0, 0, 2.0);
+    const Vec3 waterForward(0, 0, -1);
+    const Vec3 waterUp(0, 1, 0);
+    const Image waterFrameA =
+      scene.renderView(8, 4, waterEye, waterForward, waterUp);
+    const Image waterFrameB =
+      scene.renderView(8, 4, waterEye, waterForward, waterUp);
+    CHECK("C4g", waterFrameA.px == waterFrameB.px,
+        "Shading Monte Carlo deterministico a camera e stato invariati");
   }
 
   // --------------------------------------------------------------------------
@@ -224,6 +267,115 @@ int main() {
     }
     CHECK("C7c", sc.solids[std::size_t(ci)].pos.y > y0 + 0.2,
           "Il giocatore sposta la cassa leggera: y %.2f -> %.2f", y0, sc.solids[std::size_t(ci)].pos.y);
+
+    CleanRoomScene spatialScene;
+    spatialScene.solids.clear();
+    for (int i = 0; i < 2048; ++i) {
+      continuum::RigidSolidElement candidate;
+      candidate.size = Vec3(1, 1, 1);
+      candidate.pos = i < 2 ? Vec3(0.75 * i, 0, 0)
+                            : Vec3(10.0 * i, 0, 0);
+      spatialScene.solids.push_back(candidate);
+    }
+    const auto candidatePairs = spatialScene.broadphasePairs(0.0);
+    CHECK("C7d", spatialScene.solids.size() == 2048 &&
+                     candidatePairs.size() == 1 &&
+                     candidatePairs[0].first == 0 &&
+                     candidatePairs[0].second == 1,
+          "Broadphase conserva 2048 corpi illimitati e individua la coppia vicina");
+
+        std::vector<continuum::RigidSolidElement> chargedPair(2);
+        chargedPair[0].charge = 1e-7;
+        chargedPair[1].charge = -1e-7;
+        chargedPair[1].pos = Vec3(1, 0, 0);
+        continuum::ElectromagneticField em;
+        em.resetForces(chargedPair);
+        em.applyCoulombBetweenSolids(chargedPair);
+        const Vec3 referenceForce = chargedPair[0].lastEMForce;
+        std::vector<continuum::RigidSolidElement> chargedWithNeutral(2050);
+        chargedWithNeutral[0] = chargedPair[0];
+        chargedWithNeutral[1] = chargedPair[1];
+        em.resetForces(chargedWithNeutral);
+        em.applyCoulombBetweenSolids(chargedWithNeutral);
+        CHECK("C7g", (chargedWithNeutral[0].lastEMForce - referenceForce).norm() < 1e-12 &&
+             (chargedWithNeutral[0].lastEMForce +
+              chargedWithNeutral[1].lastEMForce).norm() < 1e-12,
+          "Coulomb conserva la coppia e azione-reazione con 2048 corpi neutri");
+
+    auto makeDropScene = []() {
+      auto testScene = std::make_unique<CleanRoomScene>();
+      testScene->water.clear();
+      testScene->solids.erase(
+          std::remove_if(testScene->solids.begin(), testScene->solids.end(),
+                         [](const continuum::RigidSolidElement &solid) {
+                           return !solid.isStatic;
+                         }),
+          testScene->solids.end());
+      continuum::RigidSolidElement drop;
+      drop.shape = continuum::RigidSolidElement::Shape::Sphere;
+      drop.size = Vec3(0.5, 0.5, 0.5);
+      drop.pos = Vec3(-4.5, -3.0, 1.5);
+      drop.setMaterial(materials::Id::RubberBall);
+      testScene->addSolid(drop);
+      return testScene;
+    };
+    auto sixtyHz = makeDropScene();
+    auto oneTwentyHz = makeDropScene();
+    for (int i = 0; i < 120; ++i)
+      sixtyHz->stepPhysics(1.0 / 60.0);
+    for (int i = 0; i < 240; ++i)
+      oneTwentyHz->stepPhysics(1.0 / 120.0);
+    const auto &drop60 = sixtyHz->solids.back();
+    const auto &drop120 = oneTwentyHz->solids.back();
+    CHECK("C7e", std::abs(drop60.pos.z - drop120.pos.z) < 0.01 &&
+                     drop60.vel.norm() < 0.05 && drop120.vel.norm() < 0.05,
+          "Assestamento a 60/120 Hz: z=%.4f/%.4f m, |v|=%.3f/%.3f m/s",
+          drop60.pos.z, drop120.pos.z, drop60.vel.norm(), drop120.vel.norm());
+
+    continuum::RigidSolidElement contactA, contactB;
+    contactA.mass = contactB.mass = 1.0;
+    CleanRoomScene::Contact speculative;
+    speculative.normal = Vec3(0, 1, 0);
+    speculative.overlap = -1e-3;
+    speculative.manifold.count = 1;
+    CleanRoomScene::prepareContact(contactA, contactB, speculative, 0.01);
+    const real targetAt100Hz = speculative.pt[0].bounce;
+    CleanRoomScene::prepareContact(contactA, contactB, speculative, 0.02);
+    const real targetAt50Hz = speculative.pt[0].bounce;
+    contactA.isStatic = true;
+    contactB.lastGravity = Vec3(0, 0, -9.80665);
+    speculative.normal = Vec3(0, 0, -1);
+    CleanRoomScene::prepareContact(contactA, contactB, speculative, 0.01);
+    const real targetWithGravity = speculative.pt[0].bounce;
+    contactA.isStatic = false;
+    contactA.lastGravity = Vec3(0, 0, -9.80665);
+    CleanRoomScene::prepareContact(contactA, contactB, speculative, 0.01);
+    const real targetWithCommonGravity = speculative.pt[0].bounce;
+    CHECK("C7f", std::abs(targetAt100Hz + 0.1) < 1e-12 &&
+             std::abs(targetAt50Hz + 0.05) < 1e-12 &&
+             std::abs(targetWithGravity - (-0.1 + 0.5 * 9.80665 * 0.01)) <
+               1e-12 &&
+             std::abs(targetWithCommonGravity + 0.1) < 1e-12,
+        "Contatto speculativo: gap/dt %.3f/%.3f, gravita' %.3f, comune %.3f m/s",
+        targetAt100Hz, targetAt50Hz, targetWithGravity,
+        targetWithCommonGravity);
+
+      continuum::RigidSolidElement slidingBody, staticGround;
+      slidingBody.mass = 1.0;
+      slidingBody.pos = Vec3(0, 0, 0);
+      slidingBody.vel = Vec3(1, 1, -1);
+      staticGround.isStatic = true;
+      CleanRoomScene::Contact::Pt diagonalSlip;
+      CleanRoomScene::solveContactPoint(
+        slidingBody, staticGround, Vec3(0, 0, 0), Vec3(0, 0, 1),
+        Vec3(0, 1, 0), Vec3(-1, 0, 0), diagonalSlip, 0.5, 0.4);
+      CHECK("C7h", std::abs(diagonalSlip.jn - 1.0) < 1e-12 &&
+               std::abs(std::hypot(diagonalSlip.jt1, diagonalSlip.jt2) -
+                    0.4 * diagonalSlip.jn) < 1e-12,
+          "Attrito Coulomb isotropo: |Jt|=%.3f <= mu_k Jn=%.3f",
+          std::hypot(diagonalSlip.jt1, diagonalSlip.jt2),
+          0.4 * diagonalSlip.jn);
+
   }
 
   // --------------------------------------------------------------------------
@@ -278,6 +430,27 @@ int main() {
     }
     CHECK("C9a", derived && nDyn >= 4, "Massa = rho x fill x V per tutti i %d solidi mobili", nDyn);
     CHECK("C9b", std::abs(ballMass - 2.5) < 0.2, "Palla di gomma cava (guscio 1.5 mm): m=%.2f kg", ballMass);
+
+    continuum::RigidSolidElement shell;
+    shell.shape = continuum::RigidSolidElement::Shape::Sphere;
+    shell.size = Vec3(0.7, 0.7, 0.7);
+    shell.density = 1100.0;
+    shell.setHollow(0.0015);
+    const real outerRadius = 0.35;
+    const real innerRadius = outerRadius - shell.hollowWall;
+    const real expectedInertia =
+      0.4 * shell.mass *
+      (std::pow(outerRadius, 5) - std::pow(innerRadius, 5)) /
+      (std::pow(outerRadius, 3) - std::pow(innerRadius, 3));
+    CHECK("C9c", std::abs(shell.localInertiaDiag().x - expectedInertia) <
+             1e-12 * expectedInertia,
+        "Inerzia guscio sferico integrata radialmente: I=%.6g kg m^2",
+        shell.localInertiaDiag().x);
+    const real solidMass = shell.density * shell.volume();
+    shell.setHollow(0.0);
+    CHECK("C9d", shell.fillFraction == 1.0 && !shell.sealedCavity &&
+             std::abs(shell.mass - solidMass) < 1e-12 * solidMass,
+        "Rimozione cavita' ripristina volume pieno e massa materiale");
   }
 
   std::printf("\n====================================================\n");

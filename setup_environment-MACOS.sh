@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ============================================================================
 # NQG – macOS Environment Setup Script
 # Installs a Universal (arm64 + x86_64) SDL3

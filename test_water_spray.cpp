@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  test_water_spray.cpp - gocce, getti, cascate, pioggia, film sottili
 // ============================================================================
@@ -204,6 +205,28 @@ int main() {
     const bool hit = sc.spray.raycast(Vec3(0, -2, 1.7), Vec3(0, 1, 0), 1e9, h);
     CHECK("Q8a", hit && std::abs(h.t - (3.0 - 0.05)) < 1e-6 && h.n.y < -0.99,
           "raggio su goccia: t = %.4f, normale uscente", h.t);
+
+    Observer simulationView;
+    simulationView.valid = true;
+    simulationView.pos = Vec3(0, -2, 1.7);
+    simulationView.fwd = Vec3(0, 1, 0);
+    simulationView.halfDiag = 0.2;
+    sc.spray.simulationObserver = simulationView;
+    Observer renderView;
+    renderView.valid = true;
+    renderView.pos = Vec3(0, -2, 1.7);
+    renderView.fwd = Vec3(0, -1, 0);
+    renderView.halfDiag = 0.2;
+    sc.spray.prepare(renderView);
+    WaterSpray::Hit hidden;
+    const bool hiddenFromRender =
+      !sc.spray.raycast(Vec3(0, -2, 1.7), Vec3(0, 1, 0), 1e9, hidden);
+    const bool simulationViewPreserved =
+      sc.spray.simulationObserver.valid &&
+      (sc.spray.simulationObserver.pos - simulationView.pos).norm() < 1e-12 &&
+      (sc.spray.simulationObserver.fwd - simulationView.fwd).norm() < 1e-12;
+    CHECK("Q8b", hiddenFromRender && simulationViewPreserved,
+        "vista render filtra la goccia senza alterare la vista fisica");
   }
 
   std::printf("\n====================================================\n");
