@@ -6,6 +6,14 @@
 # Independent from project sources – safe to share or replace alone.
 # ============================================================================
 
+
+# Serialize critical package steps across parallel make / multi-arch
+NQG_BUILD_LOCK ?= $(abspath .)/.nqg_build.lock
+define nqg_with_lock
+	@mkdir -p "$(dir $(NQG_BUILD_LOCK))"
+	@exec 9>"$(NQG_BUILD_LOCK)"; flock -w 120 9; $(1)
+endef
+
 # ---------------------------------------------------------------------------
 # Basic settings
 # ---------------------------------------------------------------------------
@@ -29,6 +37,10 @@ ifeq ($(OS),Windows_NT)
     ifeq ($(shell which clang++ 2>/dev/null),)
         CXX := g++
     endif
+    # MinGW / MSYS2 / clang-cl portable defaults
+    CXXFLAGS_WIN := -D_WIN32_WINNT=0x0601 -DNOMINMAX -DWIN32_LEAN_AND_MEAN
+    CXXFLAGS += $(CXXFLAGS_WIN)
+    LDFLAGS  += -static-libgcc -static-libstdc++
 else ifeq ($(UNAME_S),Darwin)
     DETECTED_OS := macos
     CXX         := clang++
@@ -209,7 +221,7 @@ ifeq ($(DETECTED_OS),macos)
 APP_EXEC = NQG_CleanRoom
 APP_ICON = icon.icns
 
-app: $(BUILD_DIR)/nqg_cleanroom_game$(EXE_EXT) $(APP_ICON) | dirs
+app-legacy-single: $(BUILD_DIR)/nqg_cleanroom_game$(EXE_EXT) $(APP_ICON) | dirs
 	@echo "→ Creating $(APP_BUNDLE)  [$(BUILD_TYPE)]"
 	cp $(BUILD_DIR)/nqg_cleanroom_game$(EXE_EXT) $(APP_BUNDLE)/Contents/MacOS/$(APP_EXEC)
 	chmod +x $(APP_BUNDLE)/Contents/MacOS/$(APP_EXEC)
@@ -255,7 +267,7 @@ app: $(BUILD_DIR)/nqg_cleanroom_game$(EXE_EXT) $(APP_ICON) | dirs
 	@echo "✓ $(APP_BUNDLE) ready"
 
 else
-app:
+app-legacy-single:
 	@echo "Note: .app bundle is macOS-only (current OS = $(DETECTED_OS))"
 endif
 
@@ -339,15 +351,7 @@ endif
 	@echo "================================================================"
 	@echo ""
 
-# ---------------------------------------------------------------------------
-# test/ folder
-# ---------------------------------------------------------------------------
-prepare-test: $(BINARIES) | dirs
-	@echo "→ Populating $(TEST_DIR)..."
-	@for f in $(BINARIES); do \
-		cp "$$f" $(TEST_DIR)/; \
-	done
-	@echo "✓ $(TEST_DIR) ready"
+# prepare-test is defined in mk/test.mk
 
 # ---------------------------------------------------------------------------
 # Clean / Info / Help
@@ -369,22 +373,24 @@ info:
 	@echo "LDFLAGS           : $(LDFLAGS)"
 
 help:
-	@echo "NQG Clean Universal Makefile"
+	@echo "Costrutto / NQG Makefile"
 	@echo ""
-	@echo "  make                          Build + app + verify + tests + report"
-	@echo "  make BUILD_TYPE=macos-arm64   Force specific architecture"
-	@echo "  make BUILD_TYPE=macos-x86_64"
-	@echo "  make BUILD_TYPE=macos-universal"
+	@echo "  make                 Full pipeline (core + apps + packages + tests)"
+	@echo "  make core            Engine unit tests only (no SDL)"
+	@echo "  make apps            Build cleanroom + sample games"
+	@echo "  make app             macOS .app bundles (Costrutto + NQG_Sample)"
+	@echo "  make ios             iOS unsigned IPAs (needs Xcode + SDL3.framework)"
+	@echo "  make dist            Collect binaries/apps into dist/"
+	@echo "  make verify          Dynamic link + architecture checks"
+	@echo "  make test            Re-run unit tests"
+	@echo "  make run             Run sample game"
+	@echo "  make run_cleanroom   Run apartment/cleanroom game"
+	@echo "  make clean / info"
+	@echo ""
+	@echo "  make BUILD_TYPE=macos-universal   Fat binary arm64+x86_64"
+	@echo "  make BUILD_TYPE=macos-arm64"
 	@echo "  make BUILD_TYPE=linux-x86_64"
-	@echo "  make BUILD_TYPE=linux-aarch64"
-	@echo "  make app                      Create Costrutto.app (macOS only)"
-	@echo "  make verify                   Check binary + library + rpaths"
-	@echo "  make test                     Re-run unit tests only"
-	@echo "  make run                      Run sample game"
-	@echo "  make run_cleanroom            Run clean-room game"
-	@echo "  make clean                    Remove build/ and dist/"
-	@echo "  make info                     Show environment"
 	@echo ""
-	@echo "Setup scripts:"
-	@echo "  ./setup_environment-MACOS.sh  → Universal SDL3 on macOS"
-	@echo "  ./setup_environment-LINUX.sh  → SDL3 on any Linux distro"
+	@echo "  SDL3_IOS_FRAMEWORK=/path/to/SDL3.framework make ios"
+	@echo ""
+	@echo "Setup: ./setup_environment-MACOS.sh | ./setup_environment-LINUX.sh"

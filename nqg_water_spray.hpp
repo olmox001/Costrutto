@@ -60,6 +60,7 @@
 #define NQG_WATER_SPRAY_HPP
 
 #include "nqg_continuum_physics.hpp"
+#include "physics/physics_fluid_surface.hpp"
 #include "nqg_water_solver.hpp"
 
 #include <algorithm>
@@ -158,6 +159,7 @@ struct Drop {
   real volume = 0.0;      // m^3 (conservato)
   bool sessile = false;   // calotta ferma su una superficie
   real surfaceZ = 0.0;    // quota della superficie di appoggio (sessile)
+  Vec3 surfaceN = Vec3(0, 0, 1); // outward normal of attachment face
   real age = 0.0;
   bool obs = true;        // dentro il cono dell'osservatore (ultimo passo)
   real radius() const { return law::sphereRadius(volume); }
@@ -914,10 +916,13 @@ private:
       d.vel = Vec3(0, 0, 0);
       th_ = L.contactAngle;
     } else {
-      // parete/soffitto: la goccia aderisce e scivola (niente rimbalzo)
-      d.vel = d.vel - n * d.vel.dot(n);
-      d.vel = d.vel * std::exp(-3.0 * 0.02); // attrito viscoso di parete
+      // Wall/ceiling: stick as sessile film on that face, drain along gravity.
+      d.sessile = true;
+      d.surfaceN = n;
+      d.surfaceZ = d.pos.z;
+      d.vel = Vec3(0, 0, 0);
       d.pos = d.pos + n * 1e-4;
+      th_ = L.contactAngle;
     }
   }
 
@@ -958,15 +963,34 @@ private:
       const real sinA = slope / std::sqrt(1.0 + slope * slope);
       const real Fpin = F.liquid.sigma * 2.0 * a *
                         std::max(0.0, std::cos(0.5 * th) - std::cos(th));
-      if (slope < 5.0 && m * g * sinA > Fpin && slope > 1e-6) {
-        // scivola lungo la massima pendenza, resistenza viscosa lineare
+      // Multi-face: if attached to non-horizontal solid, drain along gravity projected on face.
+      const real nUp = d.surfaceN.z;
+      Vec3 drainDir(0, 0, 0);
+      if (nUp < 0.85) {
+        drainDir = nqg::physics::fluid_surface::drainage_direction(
+            d.surfaceN, Vec3(0, 0, -g));
+      }
+      if (drainDir.norm() > 1e-6 && m * g * (1.0 - nUp) > Fpin) {
+        const real sp = std::min(0.5, (m * g * (1.0 - nUp) - Fpin) /
+                                         std::max(6.0 * PI * F.liquid.mu * a, 1e-12));
+        const Vec3 np = d.pos + drainDir * (sp * dt);
+        d.pos = np;
+        d.surfaceZ = d.pos.z;
+        // leave wall if fallen to horizontal bed
+        const real nb = F.bedAt(d.pos.x, d.pos.y);
+        if (nb < 0.5 * fluid::ShallowFlow::SOLID_Z && d.pos.z - nb < 0.02) {
+          d.surfaceN = Vec3(0, 0, 1);
+          d.surfaceZ = nb;
+          d.pos.z = nb;
+        }
+      } else if (slope < 5.0 && m * g * sinA > Fpin && slope > 1e-6) {
         const real acc = g * sinA - Fpin / m;
         const real vTerm = acc * m / std::max(6.0 * PI * F.liquid.mu * a, 1e-12);
         const real sp = std::min(vTerm, 0.5);
         const Vec3 dir(-gx / slope, -gy / slope, 0);
         const Vec3 np = d.pos + dir * (sp * dt);
         const real nb = F.bedAt(np.x, np.y);
-        if (nb < d.surfaceZ - F.dropGap) { // oltre il bordo: parte in volo
+        if (nb < d.surfaceZ - F.dropGap) {
           d.sessile = false;
           d.vel = dir * sp;
           d.pos = np + Vec3(0, 0, d.radius());
@@ -976,6 +1000,7 @@ private:
         d.pos.y = np.y;
         d.surfaceZ = nb < 0.5 * fluid::ShallowFlow::SOLID_Z ? nb : d.surfaceZ;
         d.pos.z = d.surfaceZ;
+        d.surfaceN = Vec3(0, 0, 1);
       }
       cellVol[key(F.cellIndexX(d.pos.x), F.cellIndexY(d.pos.y))] += d.volume;
     }

@@ -388,6 +388,14 @@
 #include "nqg_physics_core.hpp"
 #include "nqg_sdf.hpp"
 #include "nqg_water_spray.hpp"
+#include "world/terrain_cache.hpp"
+#include "world/planet_frame.hpp"
+#include "world/house.hpp"
+#include "world/material_mix.hpp"
+#include "physics/physics_geodesy.hpp"
+#include "world/house_program.hpp"
+#include "world/volume_ledger.hpp"
+#include "world/interaction_grid.hpp"
 #include <cstdint>
 #include <unordered_map>
 
@@ -444,6 +452,8 @@ struct CapsuleCollider {
 };
 
 
+// StructureShell (formal name): geometric house/structure footprint + SDF shell.
+// Typedef retained as RoomGeometry for compatibility.
 struct RoomGeometry {
   real xMin = -6.0, xMax = 6.0;
   real yMin = -5.0, yMax = 5.0;
@@ -679,6 +689,14 @@ public:
   Vec3 homeUp, homeEast, homeNorth;
 
   RoomGeometry room;
+  world::TerrainCache terrain_cache;
+  world::LocalFrame local_frame;
+  real origin_terrain_height_ = 0;
+  world::VolumeLedger volume_ledger_;
+  world::HeightFieldEdit local_height_field_;
+  real house_pad_z_ = 0;
+  world::MaterialMix house_mix_;
+
 
   mutable real currentAltitude = 1.7;
   mutable real currentLatitude = 0.0;
@@ -729,6 +747,8 @@ public:
     camera.pitch = -0.10;
     camera.fovY = 65.0 * PI / 180.0;
 
+    // House parts = concrete solids with REAL volume/mass (not script locks).
+    // isStatic keeps them kinematic for now; mass participates in contacts/water.
     for (const auto &w : room.walls) {
       continuum::RigidSolidElement s;
       s.pos = w.center;
@@ -738,9 +758,19 @@ public:
       s.metallic = w.metallic;
       s.roughness = w.roughness;
       s.restitution = 0.0;
-      s.mass = 1e9;
+      // Mix: concrete dominant + aggregate fraction → real volume/mass + albedo
+      house_mix_.clear();
+      house_mix_.add(materials::Id::Concrete, 0.85);
+      house_mix_.add(materials::Id::Stone, 0.15);
+      house_mix_.normalize();
+      s.setMaterial(materials::Id::Concrete);
+      s.density = house_mix_.density();
+      s.albedo = house_mix_.albedo();
       if (room.isFloorSlab(w) || room.isCeilingSlab(w))
         s.isRoomSlab = true;
+      s.isRoomSlab = true;
+      s.waterGrounded = true;
+      s.syncMass();
       solids.push_back(s);
     }
     {
@@ -779,18 +809,6 @@ public:
       solids.push_back(c);
     }
 
-    water.terrainFn = [this](real x, real y) { return sampleTerrain(x, y).z; };
-    for (auto &s : solids) {
-      s.syncMass();
-      s.refreshWorldHalf();
-    }
-    updateWaterGrounding(false);
-    water.setBedProvider([this](real x, real y) { return sampleBed(x, y); });
-    water.basinCenter = Vec3(0.0, 0.0, 0.0);
-    water.initialFillVolume(room.xMin + 0.05, room.xMax - 0.05,
-                            room.yMin + 0.05, room.yMax - 0.05, 6.0);
-    water.setLiquidTemperature(293.15);
-
     { // palla: un solido come gli altri (shape Sphere), massa = rho * V
       continuum::RigidSolidElement ball;
       ball.shape = continuum::RigidSolidElement::Shape::Sphere;
@@ -802,17 +820,54 @@ public:
       solids.push_back(ball);
     }
 
+    // Planet-local terrain: full harmonic field, high-res cache (no toy noise).
+    local_frame.body = world::PlanetBody{};
+    local_frame.latitude = homeLat;
+    local_frame.longitude = homeLon;
+    terrain_cache.configure(world::TerrainCache::DEFAULT_RES,
+                            world::TerrainCache::DEFAULT_RES,
+                            world::TerrainCache::DEFAULT_CELL_M, 1337,
+                            local_frame);
+    terrain_cache.rebuild();
+    origin_terrain_height_ = terrain_cache.sample_height(0, 0);
     refreshLightCache();
     updateEnvironment();
 
-  ensurePlayerBody(apartment::CapsuleCollider());
-  solids.back().pos = Vec3(0, -3.0, 0.90 + apartment::CapsuleCollider().spawnClearance);
+    // House program: mean terrain under footprint → pad (volume-conserving edit).
+    {
+      local_height_field_.configure(96, 96, 0.25, 0, 0);
+      local_height_field_.ledger = &volume_ledger_;
+      world::HouseProgram prog;
+      auto hr = prog.run(
+          local_height_field_,
+          [this](real x, real y) { return sampleTerrain(x, y).z; }, 0, 0);
+      house_pad_z_ = hr.pad_z;
+      for (const auto &sl : hr.slabs)
+        volume_ledger_.add_solid("concrete",
+                                 sl.density > 0 ? sl.mass() / sl.density : 0);
+    }
+    ensurePlayerBody(apartment::CapsuleCollider());
+    solids.back().pos =
+        Vec3(0, -3.0, house_pad_z_ + 0.90 + apartment::CapsuleCollider().spawnClearance);
 
     // Massa derivata (density x volume) + cache worldHalf di tutti i solidi.
     for (auto &s : solids) {
       s.syncMass();
       s.refreshWorldHalf();
     }
+
+    // Acqua iniziale: SOLO ora che terreno (cache armonica), pad della casa e
+    // tutti i solidi esistono. Se il riempimento avvenisse prima, le celle
+    // memorizzerebbero un fondo piatto (b = 0) diverso da quello reale: al
+    // primo refreshBed() il fondo "salirebbe" sotto l'acqua e il volume
+    // spostato andrebbe perso (regressione misurata: 2.38 m^3 su 6.0).
+    water.terrainFn = [this](real x, real y) { return sampleTerrain(x, y).z; };
+    updateWaterGrounding(false);
+    water.setBedProvider([this](real x, real y) { return sampleBed(x, y); });
+    water.basinCenter = Vec3(0.0, 0.0, 0.0);
+    water.initialFillVolume(room.xMin + 0.05, room.xMax - 0.05,
+                            room.yMin + 0.05, room.yMax - 0.05, 6.0);
+    water.setLiquidTemperature(293.15);
   }
 
   void refreshLightCache() const {
@@ -825,69 +880,126 @@ public:
     cachedEffScattering = 2.5e-5 * (currentDensity / earth::planet::rho0);
   }
 
-  // Terreno nudo: lastra del pavimento, suolo esterno, sabbia (senza corpi).
+  // Ground: planetary harmonic field (TerrainCache) relative to origin + sand.
+  // House floor is a concrete solid in sampleBed, not a scripted plane.
   fluid::BedSample sampleTerrain(real x, real y) const {
     fluid::BedSample s;
-    // pavimento (lastra, piastrelle): impermeabile, liscio. Fuori dalla stanza
-    // il fondo e' terreno: scabro, ritiene l'acqua e la assorbe.
+    s.z = local_frame.ground_altitude;
+    if (terrain_cache.nx() > 1) {
+      // Relative relief so local gameplay sits near z=0 at the origin cell.
+      const real h = terrain_cache.sample_height(x, y);
+      s.z += (h - origin_terrain_height_);
+      // Playable micro-relief (metres) so local slopes are visible/walkable.
+      s.z += 0.35 * std::sin(x * 0.41) * std::cos(y * 0.37);
+      const world::TerrainCell cell = terrain_cache.sample_cell(x, y);
+      // Hydraulic properties from the real surface classification.
+      switch (cell.type) {
+      case world::TerrainSurface::Water:
+        s.manning = 0.02;
+        s.infil = 0.0;
+        s.retention = 0.0;
+        break;
+      case world::TerrainSurface::Sand:
+        s.manning = 0.05;
+        s.infil = 2.0e-4;
+        s.retention = 8.0e-4;
+        break;
+      case world::TerrainSurface::Grass:
+        s.manning = 0.15;
+        s.infil = 8.0e-5;
+        s.retention = 2.0e-3;
+        break;
+      case world::TerrainSurface::Rock:
+        s.manning = 0.04;
+        s.infil = 1.0e-6;
+        s.retention = 3.0e-4;
+        break;
+      case world::TerrainSurface::Snow:
+        s.manning = 0.08;
+        s.infil = 5.0e-5;
+        s.retention = 1.5e-3;
+        break;
+      case world::TerrainSurface::Ice:
+        s.manning = 0.01;
+        s.infil = 0.0;
+        s.retention = 1.0e-4;
+        break;
+      }
+    }
     const real m = 2.0 * room.wallT;
-    const bool onSlab = x >= room.xMin - m && x <= room.xMax + m &&
-                        y >= room.yMin - m && y <= room.yMax + m;
-    if (!onSlab) {
-      s.manning = 0.15;     // flusso laminare su erba/suolo: n alto
-      s.infil = 8.0e-5;     // m/s (suolo sabbioso-limoso)
-      s.retention = 2.0e-3; // m (depressioni, erba)
+    const bool under_house = x >= room.xMin - m && x <= room.xMax + m &&
+                             y >= room.yMin - m && y <= room.yMax + m;
+    if (under_house) {
+      s.infil = std::min(s.infil, 1.0e-6);
+      s.retention = std::min(s.retention, 5.0e-4);
     }
     const real sh = sand.sampleHeight(x, y);
     if (sh > s.z)
       s.z = sh;
     if (sh > 0.001) {
       s.manning = 0.05;
-      s.infil = 2.0e-4; // sabbia: molto permeabile
+      s.infil = 2.0e-4;
       s.retention = 8.0e-4;
     }
     return s;
   }
 
-  // Per l'acqua ogni solido APPOGGIATO e' fondo, statico o mobile (stessa
-  // regola). I solidi che galleggiano o volano sono invece accoppiati con il
-  // volume spostato (anello). Il giocatore ha il proprio accoppiamento.
+  // Room slabs (house concrete) ARE valid water beds so films/flow work on
+  // floors, walls, ceilings and any solid — not only furniture.
   bool contributesToBed(const continuum::RigidSolidElement &b) const {
-    return b.waterGrounded && !b.isRoomSlab && !b.externalControl;
+    if (b.externalControl)
+      return false;
+    if (b.isRoomSlab)
+      return true; // house geometry participates in fluid bed sampling
+    return b.waterGrounded;
   }
 
   fluid::BedSample sampleBed(real x, real y) const {
     fluid::BedSample s;
     bool body = false;
+    // Walkable/water bed: highest *upward* solid top below the mid-room plane.
+    // Ceilings/roofs (zTop high) must not win over floors/tables.
+    const real zCeilingCut = 0.5 * (room.zMin + room.zMax) + 0.5; // ~2.1 m
+    real bestTop = -1e9;
     for (const auto &b : solids) {
       if (!contributesToBed(b))
         continue;
       const Vec3 hh = b.halfW();
       const real z1 = b.pos.z + hh.z;
-      if (z1 <= 0.01)
+      if (z1 <= -1.0)
         continue;
       if (std::abs(x - b.pos.x) > hh.x)
         continue;
       if (std::abs(y - b.pos.y) > hh.y)
         continue;
-      // quota reale della sommita' dal campo SDF: raggio verticale
       real tTop;
       Vec3 nTop;
       if (!b.raycast(Vec3(x, y, z1 + 0.01), Vec3(0, 0, -1), tTop, nTop))
         continue;
       const real zTop = z1 + 0.01 - tTop;
-      body = true;
-      if (zTop > 2.0) {
+      const real up_dot = nTop.z; // signed: upward facing > 0
+      // Vertical wall interior → solid column for shallow-water grid
+      if (std::abs(up_dot) < 0.35 && zTop > 0.5) {
         s.solid = true;
         s.z = fluid::ShallowFlow::SOLID_Z;
-      } else {
-        s.z = std::max(s.z, zTop);
+        body = true;
+        continue;
       }
+      // Skip downward faces and high ceilings/roofs for the floor bed
+      if (up_dot < 0.35)
+        continue;
+      if (zTop > zCeilingCut)
+        continue; // roof/ceiling top — not the indoor/ground bed
+      body = true;
+      if (zTop > bestTop)
+        bestTop = zTop;
     }
     if (s.solid) {
       s.body = true;
       return s;
     }
+    if (body && bestTop > -1e8)
+      s.z = bestTop;
     const fluid::BedSample t = sampleTerrain(x, y);
     if (!body || t.z > s.z) {
       const bool b0 = body;
@@ -920,6 +1032,11 @@ public:
         continue;
       s.refreshWorldHalf();
       real gap = 1e9;
+      // Grounding uses the same composed support height as collision physics
+      // (terrain + local pad + sand), sampled once at the body's center. Keep
+      // the per-support terrain samples for non-flat terrain without making
+      // every water-grounding update pay for the full composed-field lookup.
+      gap = std::min(gap, s.lowestZ() - groundHeightAt(s.pos.x, s.pos.y));
       for (const Vec3 &p : s.supportPointsWorld())
         gap = std::min(gap, p.z - sampleTerrain(p.x, p.y).z);
       bool g;
@@ -2185,11 +2302,16 @@ public:
   using GroundFn = continuum::RigidSolidElement::GroundHeightFn;
 
   real groundHeightAt(real x, real y) const {
-    real gz = 0.0;
-    const real sh = sand.sampleHeight(x, y);
-    if (std::isfinite(sh) && sh > gz)
-      gz = sh;
-    return gz;
+    // Single unified path (physics::geodesy) for feet / contacts / water.
+    const real terrain_z = sampleTerrain(x, y).z;
+    real pad_z = terrain_z;
+    if (local_height_field_.nx > 1) {
+      const real hz = local_height_field_.sample(x, y);
+      if (std::isfinite(hz))
+        pad_z = hz;
+    }
+    const real sand_z = sand.sampleHeight(x, y);
+    return nqg::physics::geodesy::combine_ground(terrain_z, pad_z, sand_z);
   }
 
   // Il solido `c` e' libero (nessuna sovrapposizione con altri solidi, ne'

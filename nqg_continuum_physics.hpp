@@ -1229,7 +1229,9 @@ struct RigidSolidElement {
       const real hz = shape == Shape::Sphere ? hx : h.z;
       fillFraction = materials::shellFraction(hx, hy, hz, hollowWall);
     }
-    if (!isStatic && density > 0.0)
+    // Mass always from density × volume (static/kinematic still has real mass
+    // for contacts, water displacement, and stability checks).
+    if (density > 0.0)
       mass = std::max(1e-6, density * fillFraction * volume());
   }
 
@@ -2266,6 +2268,17 @@ private:
       const real dwMax = muK * Jtot * 0.25 * D * iz;
       const real wn = angVel.dot(gN);
       angVel = angVel - gN * std::clamp(wn, -dwMax, dwMax);
+
+      // Final non-penetrating velocity projection.  Position projection can
+      // legally move a body back onto a support after integration; do not let
+      // the same substep leave an inward normal velocity that immediately
+      // re-enters the support on the next step. Tangential motion is untouched.
+      for (int k = 0; k < nc; ++k) {
+        const Vec3 r = contacts[k] - pos;
+        const real vn = relVel(r, gN);
+        if (vn < 0.0)
+          applyJ(r, gN * (-vn / std::max(kEff(r, gN), 1e-12)));
+      }
     }
 
     if (rolling > 0.0 && mass > 0.0) {

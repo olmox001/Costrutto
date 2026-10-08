@@ -375,7 +375,8 @@
 #include "nqg_physics_core.hpp"
 
 #include <SDL3/SDL.h>
-#ifdef __APPLE__
+// NSApplication activate is macOS-only (not iOS / not other platforms)
+#if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX
 #include <objc/objc-runtime.h>
 inline void macosBringToFront() {
   id nsAppClass = (id)objc_getClass("NSApplication");
@@ -394,6 +395,7 @@ inline void macosBringToFront() {
   ((void (*)(id, SEL, BOOL))objc_msgSend)(app, activateSel, YES);
 }
 #endif
+#include "nqg_commands.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -401,6 +403,7 @@ inline void macosBringToFront() {
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nqg {
@@ -423,7 +426,7 @@ struct WindowConfig {
 };
 
 // ----------------------------------------------------------------------------
-// Gestione degli Input (Tastiera + Mouse + Mappatura Comandi Motore)
+// Gestione degli Input (Tastiera + Mouse + Touch / Virtual Joystick)
 // ----------------------------------------------------------------------------
 class InputManager {
 public:
@@ -431,6 +434,8 @@ public:
     mouseDeltaX_ = 0.0f;
     mouseDeltaY_ = 0.0f;
     mouseWheelY_ = 0.0f;
+    lookDeltaX_ = 0.0f;
+    lookDeltaY_ = 0.0f;
     justPressedKeys_.clear();
   }
 
@@ -473,6 +478,85 @@ public:
       mouseWheelY_ += event.wheel.y;
       break;
     }
+    // ---- Touch / Virtual joystick (iOS, Android, trackpad) ----
+    case SDL_EVENT_FINGER_DOWN: {
+      const SDL_FingerID id = event.tfinger.fingerID;
+      const float nx = event.tfinger.x; // 0..1
+      const float ny = event.tfinger.y;
+      FingerState fs;
+      fs.id = id;
+      fs.startX = nx;
+      fs.startY = ny;
+      fs.curX = nx;
+      fs.curY = ny;
+      // Left half of screen → movement stick, right half → look
+      if (nx < 0.45f) {
+        fs.role = FingerRole::Move;
+        // Only one move stick at a time
+        if (moveFingerId_ == 0) {
+          moveFingerId_ = id;
+          moveOriginX_ = nx;
+          moveOriginY_ = ny;
+        } else {
+          fs.role = FingerRole::None; // ignore extra left fingers
+        }
+      } else {
+        fs.role = FingerRole::Look;
+        if (lookFingerId_ == 0) {
+          lookFingerId_ = id;
+        } else {
+          fs.role = FingerRole::None;
+        }
+      }
+      fingers_[id] = fs;
+      break;
+    }
+    case SDL_EVENT_FINGER_MOTION: {
+      const SDL_FingerID id = event.tfinger.fingerID;
+      auto it = fingers_.find(id);
+      if (it == fingers_.end())
+        break;
+      FingerState &fs = it->second;
+      fs.curX = event.tfinger.x;
+      fs.curY = event.tfinger.y;
+      if (fs.role == FingerRole::Move && id == moveFingerId_) {
+        // dead-zone + clamp radius
+        const float dx = fs.curX - moveOriginX_;
+        const float dy = fs.curY - moveOriginY_;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        const float maxR = 0.12f; // ~12% of screen width
+        const float dead = 0.015f;
+        if (len > dead) {
+          const float scale = std::min(1.0f, (len - dead) / (maxR - dead));
+          moveAxisX_ = (dx / len) * scale;
+          moveAxisY_ = (dy / len) * scale; // +Y = down on screen → backward
+        } else {
+          moveAxisX_ = 0.0f;
+          moveAxisY_ = 0.0f;
+        }
+      } else if (fs.role == FingerRole::Look && id == lookFingerId_) {
+        // Relative motion (screen-space delta, inverted Y for look)
+        lookDeltaX_ += event.tfinger.dx * 400.0f; // sensitivity scale
+        lookDeltaY_ += event.tfinger.dy * 400.0f;
+      }
+      break;
+    }
+    case SDL_EVENT_FINGER_UP: {
+      const SDL_FingerID id = event.tfinger.fingerID;
+      auto it = fingers_.find(id);
+      if (it == fingers_.end())
+        break;
+      if (id == moveFingerId_) {
+        moveFingerId_ = 0;
+        moveAxisX_ = 0.0f;
+        moveAxisY_ = 0.0f;
+      }
+      if (id == lookFingerId_) {
+        lookFingerId_ = 0;
+      }
+      fingers_.erase(it);
+      break;
+    }
     default:
       break;
     }
@@ -498,21 +582,43 @@ public:
   bool isMouseLeftDown() const { return mouseLeft_; }
   bool isMouseRightDown() const { return mouseRight_; }
 
+  // Virtual joystick axes (-1..+1). Y positive = screen-down = backward.
+  float moveAxisX() const { return moveAxisX_; }
+  float moveAxisY() const { return moveAxisY_; }
+  bool hasTouchMove() const { return moveFingerId_ != 0; }
+  bool hasTouchLook() const { return lookFingerId_ != 0; }
+  float lookDeltaX() const { return lookDeltaX_; }
+  float lookDeltaY() const { return lookDeltaY_; }
+
+  // Convenience: is any movement input active (keys or touch)
+  bool wantsForward() const {
+    return isKeyDown(SDL_SCANCODE_W) || (hasTouchMove() && moveAxisY_ < -0.25f);
+  }
+  bool wantsBack() const {
+    return isKeyDown(SDL_SCANCODE_S) || (hasTouchMove() && moveAxisY_ > 0.25f);
+  }
+  bool wantsLeft() const {
+    return isKeyDown(SDL_SCANCODE_A) || (hasTouchMove() && moveAxisX_ < -0.25f);
+  }
+  bool wantsRight() const {
+    return isKeyDown(SDL_SCANCODE_D) || (hasTouchMove() && moveAxisX_ > 0.25f);
+  }
+
   // Mappatura automatica sui controlli del motore (thrust radiale, yaw, pitch,
   // orbita)
   engine::Input toEngineInput(real sensitivity = 1.0) const {
     engine::Input in;
 
     // Spinta radiale: W (in avanti / verso il buco nero) vs S (indietro / fuga)
-    if (isKeyDown(SDL_SCANCODE_W))
+    if (isKeyDown(SDL_SCANCODE_W) || (hasTouchMove() && moveAxisY_ < -0.2f))
       in.thrustR -= 1.0 * sensitivity;
-    if (isKeyDown(SDL_SCANCODE_S))
+    if (isKeyDown(SDL_SCANCODE_S) || (hasTouchMove() && moveAxisY_ > 0.2f))
       in.thrustR += 1.0 * sensitivity;
 
     // Orbita circolare: A (progrado / rotazione attorno) vs D (retrogrado)
-    if (isKeyDown(SDL_SCANCODE_A))
+    if (isKeyDown(SDL_SCANCODE_A) || (hasTouchMove() && moveAxisX_ < -0.2f))
       in.orbitRate -= 0.6 * sensitivity;
-    if (isKeyDown(SDL_SCANCODE_D))
+    if (isKeyDown(SDL_SCANCODE_D) || (hasTouchMove() && moveAxisX_ > 0.2f))
       in.orbitRate += 0.6 * sensitivity;
 
     // Pitch & Yaw da tastiera (Frecce direzionali)
@@ -525,16 +631,100 @@ public:
     if (isKeyDown(SDL_SCANCODE_DOWN))
       in.pitchRate -= 1.0 * sensitivity;
 
-    // Controllo vista col mouse (tasto sinistro premuto)
+    // Controllo vista col mouse (tasto sinistro premuto) o touch look
     if (mouseLeft_) {
       in.yawRate += mouseDeltaX_ * 0.005 * sensitivity;
       in.pitchRate -= mouseDeltaY_ * 0.005 * sensitivity;
+    }
+    if (hasTouchLook()) {
+      in.yawRate += lookDeltaX_ * 0.005 * sensitivity;
+      in.pitchRate -= lookDeltaY_ * 0.005 * sensitivity;
     }
 
     return in;
   }
 
+  // ---------------------------------------------------------------------------
+  // Produce abstract Commands for the capsule observer / game logic.
+  // Completely decoupled from SDL once the Commands object is returned.
+  // ---------------------------------------------------------------------------
+  nqg::cmd::Commands toCommands(float lookSensitivity = 0.0035f) const {
+    nqg::cmd::Commands c;
+
+    // Movement: prefer analog stick when active, else digital keys
+    if (hasTouchMove()) {
+      c.moveX = moveAxisX_;
+      c.moveY = -moveAxisY_; // screen-down → back → negative forward
+    } else {
+      if (isKeyDown(SDL_SCANCODE_W))
+        c.moveY += 1.0f;
+      if (isKeyDown(SDL_SCANCODE_S))
+        c.moveY -= 1.0f;
+      if (isKeyDown(SDL_SCANCODE_A))
+        c.moveX -= 1.0f;
+      if (isKeyDown(SDL_SCANCODE_D))
+        c.moveX += 1.0f;
+      // normalize diagonal
+      const float len2 = c.moveX * c.moveX + c.moveY * c.moveY;
+      if (len2 > 1.0f) {
+        const float inv = 1.0f / std::sqrt(len2);
+        c.moveX *= inv;
+        c.moveY *= inv;
+      }
+    }
+
+    // Look: mouse (while LMB) + touch look + arrows
+    if (mouseLeft_) {
+      c.lookYaw += mouseDeltaX_ * lookSensitivity;
+      c.lookPitch += mouseDeltaY_ * lookSensitivity;
+    }
+    if (hasTouchLook()) {
+      c.lookYaw += lookDeltaX_ * lookSensitivity;
+      c.lookPitch += lookDeltaY_ * lookSensitivity;
+    }
+    // continuous arrow look (rate * ~1 frame; caller multiplies by dt if needed)
+    // Here we leave rate-based for arrows as instantaneous delta scaled outside
+    // or treat as held → observer can integrate with dt. For simplicity we
+    // inject a small per-frame delta; game may also read keys directly.
+    if (isKeyDown(SDL_SCANCODE_LEFT))
+      c.lookYaw -= 1.6f * 0.016f; // approx one frame at 60 Hz
+    if (isKeyDown(SDL_SCANCODE_RIGHT))
+      c.lookYaw += 1.6f * 0.016f;
+    if (isKeyDown(SDL_SCANCODE_UP))
+      c.lookPitch -= 1.2f * 0.016f;
+    if (isKeyDown(SDL_SCANCODE_DOWN))
+      c.lookPitch += 1.2f * 0.016f;
+
+    c.jumpHeld = isKeyDown(SDL_SCANCODE_SPACE);
+    c.jumpPressed = wasKeyPressed(SDL_SCANCODE_SPACE);
+    // jumpReleased is set by observer edge logic if needed; here we only
+    // expose held/pressed. Observer still tracks release via previous state.
+    c.crouch = isKeyDown(SDL_SCANCODE_C);
+    c.boost = isKeyDown(SDL_SCANCODE_LSHIFT) || isKeyDown(SDL_SCANCODE_RSHIFT);
+
+    c.action1 = wasKeyPressed(SDL_SCANCODE_1) || isKeyDown(SDL_SCANCODE_1);
+    c.action2 = wasKeyPressed(SDL_SCANCODE_2) || isKeyDown(SDL_SCANCODE_2);
+    c.action3 = wasKeyPressed(SDL_SCANCODE_3);
+    c.toggleWind = wasKeyPressed(SDL_SCANCODE_T);
+    c.toggleGravity = wasKeyPressed(SDL_SCANCODE_G);
+    c.toggleLight = wasKeyPressed(SDL_SCANCODE_L);
+    c.clearDynamics = wasKeyPressed(SDL_SCANCODE_X);
+    c.quit = wasKeyPressed(SDL_SCANCODE_ESCAPE);
+    c.toggleHud = wasKeyPressed(SDL_SCANCODE_H);
+    c.toggleMute = wasKeyPressed(SDL_SCANCODE_M);
+
+    return c;
+  }
+
 private:
+  enum class FingerRole { None, Move, Look };
+  struct FingerState {
+    SDL_FingerID id = 0;
+    FingerRole role = FingerRole::None;
+    float startX = 0, startY = 0;
+    float curX = 0, curY = 0;
+  };
+
   std::vector<bool> keys_ = std::vector<bool>(SDL_SCANCODE_COUNT, false);
   std::vector<SDL_Scancode> justPressedKeys_;
   float mouseX_ = 0.0f;
@@ -544,6 +734,17 @@ private:
   float mouseWheelY_ = 0.0f;
   bool mouseLeft_ = false;
   bool mouseRight_ = false;
+
+  // Touch state
+  std::unordered_map<SDL_FingerID, FingerState> fingers_;
+  SDL_FingerID moveFingerId_ = 0;
+  SDL_FingerID lookFingerId_ = 0;
+  float moveOriginX_ = 0.0f;
+  float moveOriginY_ = 0.0f;
+  float moveAxisX_ = 0.0f;
+  float moveAxisY_ = 0.0f;
+  float lookDeltaX_ = 0.0f;
+  float lookDeltaY_ = 0.0f;
 };
 
 // ----------------------------------------------------------------------------
@@ -1049,7 +1250,7 @@ public:
       return false;
     }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX
     macosBringToFront();
 #endif
     SDL_ShowWindow(window_);

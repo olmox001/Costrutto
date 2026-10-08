@@ -732,6 +732,8 @@ public:
   }
 
   void computeForces(const AirProperties &air) {
+    NQG_REQUIRE(particles.size() <= NQG_MAX_PARTICLES);
+
     const std::size_t N = particles.size();
     frameAudioEvents.clear();
 

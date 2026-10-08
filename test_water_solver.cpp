@@ -139,6 +139,58 @@ int main() {
           longStep.lastSubsteps == 0 && longStep.totalVolume() == 0.0,
         "clear azzera stato fluido e diagnostica temporale");
 
+  // ---- Conservazione del volume spostato (regressione 2.38 m^3 su 6.0) ----
+  {
+    // W14: il fondo sale sotto l'acqua ed e' marcato `body` OVUNQUE (nessuna
+    // cella bagnata libera vicina): il volume non deve sparire.
+    ShallowFlow w(0.1, 8, 8);
+    w.bed = [](real, real) { return BedSample(); };
+    w.fillRect(-1.0, 1.0, -1.0, 1.0, 0.05);
+    const real v0 = w.totalVolume();
+    w.bed = [](real, real) {
+      BedSample b;
+      b.z = 0.2;
+      b.body = true;
+      return b;
+    };
+    w.refreshBed();
+    CHECK("W14", std::abs(w.totalVolume() - v0) < 1e-9 * v0 &&
+                     w.absorbedBy.noNeighbour == 0.0 &&
+                     w.absorbedVolume == 0.0,
+          "fondo che sale (body ovunque): volume spostato conservato");
+
+    // W15: tutto solido -> nessun posto dove mettere l'acqua: resta in coda
+    // (conteggiata nel totale), non e' assorbita; riaperto il fondo, torna.
+    ShallowFlow q(0.1, 8, 8);
+    q.bed = [](real, real) { return BedSample(); };
+    q.fillRect(-0.2, 0.2, -0.2, 0.2, 0.05);
+    const real q0 = q.totalVolume();
+    q.bed = [](real, real) {
+      BedSample b;
+      b.solid = true;
+      b.body = true;
+      b.z = ShallowFlow::SOLID_Z;
+      return b;
+    };
+    q.refreshBed();
+    const bool pendingKept = q.pendingVolume() > 0.0;
+    CHECK("W15", pendingKept && std::abs(q.totalVolume() - q0) < 1e-9 * q0 &&
+                     q.absorbedVolume == 0.0,
+          "nessun vicino disponibile: volume in coda, non cancellato");
+    q.bed = [](real, real) { return BedSample(); };
+    q.refreshBed();
+    CHECK("W16", q.pendingVolume() == 0.0 &&
+                     std::abs(q.totalVolume() - q0) < 1e-9 * q0,
+          "riaperto il fondo la coda viene ricollocata per intero");
+
+    // W17: i contatori per canale sommano a absorbedVolume
+    const auto &a = w.absorbedBy;
+    const real sum = a.infiltration + a.retention + a.compaction + a.bedRise +
+                     a.noNeighbour;
+    CHECK("W17", std::abs(sum - w.absorbedVolume) < 1e-12,
+          "absorbedBy: somma dei canali == absorbedVolume");
+  }
+
   std::printf("\nRISULTATO WATER SOLVER: %d PASS, %d FAIL\n", passed, failed);
   return failed == 0 ? 0 : 1;
 }

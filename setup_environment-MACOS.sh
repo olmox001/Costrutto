@@ -85,7 +85,7 @@ success "Homebrew found: $(brew --prefix)"
 # Required build tools
 # ---------------------------------------------------------------------------
 info "Installing / updating build dependencies..."
-brew install cmake git pkg-config || true
+brew install git pkg-config || true
 success "cmake, git, pkg-config ready"
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ cd SDL
 info "Configuring Universal build (arm64 + x86_64)..."
 mkdir build && cd build
 
-cmake .. \
+.. \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
@@ -147,10 +147,10 @@ cmake .. \
     -DSDL_INSTALL_TESTS=OFF
 
 info "Compiling (this may take a few minutes)..."
-cmake --build . --parallel "$(sysctl -n hw.ncpu)"
+--build . --parallel "$(sysctl -n hw.ncpu)"
 
 info "Installing into $SDL_PREFIX (requires sudo)..."
-sudo cmake --install .
+sudo --install .
 
 # ---------------------------------------------------------------------------
 # Verification
@@ -168,7 +168,7 @@ if ! echo "$ARCHS" | grep -qE "arm64.*x86_64|x86_64.*arm64"; then
     error "The installed SDL3 is NOT Universal!
 Expected both arm64 and x86_64.
 Something went wrong during the build.
-Please check the cmake output above."
+Please check the output above."
 fi
 
 success "Universal SDL3 successfully installed!"
@@ -185,3 +185,12 @@ echo "    make clean"
 echo "    make"
 echo
 success "Setup finished. Project directory restored: $PROJECT_DIR"
+# ---------------------------------------------------------------------------
+# Build system note (Makefile + mk/ only — no CMake)
+# ---------------------------------------------------------------------------
+info "Build system: Makefile + mk/platform.mk (unified)"
+info "  make core                 → engine tests without SDL"
+info "  make nqg_cleanroom_game   → full game (needs SDL3)"
+info "iOS: build SDL3.framework for iOS, then use Xcode project or"
+info "     cross-compile with clang -isysroot \$(xcrun --sdk iphoneos --show-sdk-path)"
+success "Environment ready. Run: make core && make nqg_cleanroom_game"

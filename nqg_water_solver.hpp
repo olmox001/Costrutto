@@ -1,3 +1,4 @@
+#include "physics/nasa_rules.hpp"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #ifndef NQG_WATER_SOLVER_HPP
 #define NQG_WATER_SOLVER_HPP
@@ -151,6 +152,15 @@ public:
   real volumeBudget = 60.0;
   std::size_t maxTiles = 4096;
   real absorbedVolume = 0.0;
+  // Ripartizione di absorbedVolume per canale (diagnostica di bilancio):
+  // absorbedVolume == somma dei cinque canali.
+  struct AbsorbBreakdown {
+    real infiltration = 0.0; // Darcy su fondo permeabile
+    real retention = 0.0;    // film sotto c.ret (fondo senza sink)
+    real compaction = 0.0;   // tile asciutti scartati da compact()
+    real bedRise = 0.0;      // fondo/sabbia che sale sotto l'acqua
+    real noNeighbour = 0.0;  // volume spostato senza celle bagnate vicine
+  } absorbedBy;
   real lastMaxWave = 1.0, lastMaxDepth = 0.0;
   bool hasWet = false;
   real bxMin = 0, bxMax = 0, byMin = 0, byMax = 0, bzMin = 0, bzMax = 0;
@@ -262,7 +272,10 @@ public:
             if (s.body)
               lostQ.push_back({gi, gj, lost * dx * dx});
             else
+            {
               absorbedVolume += lost * dx * dx;
+              absorbedBy.bedRise += lost * dx * dx;
+            }
           }
         }
         c.solid = s.solid;
@@ -280,34 +293,66 @@ public:
 
   // Ridistribuisce nelle celle bagnate piu' vicine (anelli crescenti) il
   // volume spostato da un corpo; se non c'e' acqua vicina e' assorbito.
-  void redistributeLost() {
-    for (const Lost &q : lostQ) {
-      bool placed = false;
-      for (int r = 1; r <= 64 && !placed; ++r) {
-        std::vector<std::pair<int, int>> sel;
-        for (int dj = -r; dj <= r; ++dj)
-          for (int di = -r; di <= r; ++di) {
-            if (std::max(std::abs(di), std::abs(dj)) != r)
-              continue;
-            const Cell *c = at(q.i + di, q.j + dj);
-            if (!c || c->solid || c->body || c->h <= hDry)
-              continue;
-            sel.emplace_back(q.i + di, q.j + dj);
-          }
-        if (sel.empty())
-          continue;
-        const real dh = q.v / (real(sel.size()) * dx * dx);
-        for (const auto &ij : sel) {
-          Cell *c = at(ij.first, ij.second);
-          c->h += dh;
-          markWet(ij.first, ij.second, c->h);
+  // Volume spostato non ancora ricollocato. NON e' perso: resta nel bilancio
+  // (totalVolume) e viene riprovato a ogni chiamata. Coda limitata (regola
+  // NASA n.2); solo l'overflow e' una perdita esplicita e contata.
+  static constexpr std::size_t kMaxPendingDisplaced = 4096;
+  std::vector<Lost> pendingQ;
+  real pendingVolume() const {
+    real v = 0.0;
+    for (const Lost &q : pendingQ)
+      v += q.v;
+    return v;
+  }
+
+  // Deposita q.v negli anelli crescenti attorno a (q.i, q.j). `wetOnly`:
+  // prima passata = solo celle gia' bagnate e libere (comportamento storico);
+  // seconda passata = qualunque cella non solida (anche asciutta o su un
+  // piano d'appoggio), cosi' il volume spostato non sparisce mai.
+  bool depositRings(const Lost &q, bool wetOnly) {
+    for (int r = 1; r <= 64; ++r) {
+      std::vector<std::pair<int, int>> sel;
+      for (int dj = -r; dj <= r; ++dj)
+        for (int di = -r; di <= r; ++di) {
+          if (std::max(std::abs(di), std::abs(dj)) != r)
+            continue;
+          const Cell *c = at(q.i + di, q.j + dj);
+          if (!c || c->solid)
+            continue;
+          if (wetOnly && (c->body || c->h <= hDry))
+            continue;
+          sel.emplace_back(q.i + di, q.j + dj);
         }
-        placed = true;
+      if (sel.empty())
+        continue;
+      const real dh = q.v / (real(sel.size()) * dx * dx);
+      for (const auto &ij : sel) {
+        Cell *c = at(ij.first, ij.second);
+        c->h += dh;
+        markWet(ij.first, ij.second, c->h);
       }
-      if (!placed)
-        absorbedVolume += q.v;
+      return true;
     }
+    return false;
+  }
+
+  void redistributeLost() {
+    std::vector<Lost> work;
+    work.swap(pendingQ);
+    work.insert(work.end(), lostQ.begin(), lostQ.end());
     lostQ.clear();
+    for (const Lost &q : work) {
+      if (!(q.v > 0.0) || !std::isfinite(q.v))
+        continue;
+      if (depositRings(q, true) || depositRings(q, false))
+        continue;
+      if (pendingQ.size() < kMaxPendingDisplaced) {
+        pendingQ.push_back(q); // ritenta al prossimo refresh
+      } else {
+        absorbedVolume += q.v; // overflow esplicito della coda
+        absorbedBy.noNeighbour += q.v;
+      }
+    }
   }
 
   void refreshBed() {
@@ -371,6 +416,8 @@ public:
       t.run = false;
     }
     run.clear();
+    pendingQ.clear();
+    lostQ.clear();
     hasWet = false;
     lastMaxWave = 1.0;
     lastMaxDepth = 0.0;
@@ -757,7 +804,7 @@ public:
       if (t.wet)
         for (const Cell &c : t.c)
           v += c.h;
-    return v * dx * dx;
+    return v * dx * dx + pendingVolume();
   }
   std::size_t wetCells() const {
     std::size_t n = 0;
@@ -856,6 +903,8 @@ private:
     volumeBudget = o.volumeBudget;
     maxTiles = o.maxTiles;
     absorbedVolume = o.absorbedVolume;
+    absorbedBy = o.absorbedBy;
+    pendingQ = o.pendingQ;
     pruneCounter = 0;
     lastMaxWave = o.lastMaxWave;
     lastMaxDepth = o.lastMaxDepth;
@@ -984,8 +1033,10 @@ private:
       }
       dropped = true;
       for (const Cell &c : t.c)
-        if (!c.solid)
+        if (!c.solid) {
           absorbedVolume += c.h * dx * dx;
+          absorbedBy.compaction += c.h * dx * dx;
+        }
     }
     if (!dropped)
       return;
@@ -1095,6 +1146,9 @@ private:
   }
 
   void substep(real dt) {
+    NQG_REQUIRE(dt > 0 && dt < 1.0);
+    NQG_REQUIRE(TX > 0 && TY > 0);
+
     growHalo();
     buildRunList();
     if (run.empty())
@@ -1333,6 +1387,7 @@ private:
         const real di = std::min(c.h, c.inf * dt);
         c.h -= di;
         absorbedVolume += di * dx * dx;
+        absorbedBy.infiltration += di * dx * dx;
       }
       // film sotto la ritenzione di superficie (scabrezza/depressioni del
       // fondo): intrappolato/assorbito. Lo spessore minimo di pozza NON e' piu'
@@ -1354,8 +1409,10 @@ private:
         r.j = j;
         r.v += rem * dx * dx;
         r.z = c.b;
-      } else
+      } else {
         absorbedVolume += rem * dx * dx;
+        absorbedBy.retention += rem * dx * dx;
+      }
     });
 
     updateFlags();

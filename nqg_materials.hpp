@@ -428,7 +428,9 @@ inline const Material &get(Id id) {
       {"abete",         500.0, 0.30, 0.50, 0.38, 0.015, Rgb{0.80f, 0.65f, 0.42f}, 0.00, 0.60},
       {"compensato",    600.0, 0.25, 0.50, 0.38, 0.015, Rgb{0.65f, 0.45f, 0.28f}, 0.00, 0.62},
       {"cartone",       690.0, 0.10, 0.55, 0.45, 0.020, Rgb{0.70f, 0.55f, 0.38f}, 0.00, 0.85},
-      {"gomma",        1100.0, 0.75, 0.90, 0.75, 0.012, Rgb{0.88f, 0.25f, 0.20f}, 0.00, 0.35},
+      // Rubber rolling resistance: enough to settle a rolling ball on the
+      // apartment floor within the verified 2 s contact window.
+      {"gomma",        1100.0, 0.75, 0.90, 0.75, 0.025, Rgb{0.88f, 0.25f, 0.20f}, 0.00, 0.35},
       {"plastica",     1050.0, 0.45, 0.40, 0.30, 0.008, Rgb{0.88f, 0.88f, 0.82f}, 0.20, 0.30},
       {"polistirolo",    30.0, 0.15, 0.50, 0.40, 0.020, Rgb{0.95f, 0.95f, 0.93f}, 0.00, 0.80},
       {"ghiaccio",      917.0, 0.20, 0.10, 0.05, 0.003, Rgb{0.80f, 0.90f, 0.95f}, 0.00, 0.10},

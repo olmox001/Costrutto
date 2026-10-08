@@ -44,63 +44,63 @@ if command -v apt-get >/dev/null 2>&1; then
     UPDATE_CMD="sudo apt-get update -y"
     INSTALL_CMD="sudo apt-get install -y"
     # Debian / Ubuntu / Pop!_OS / Mint / elementary …
-    PACKAGES="libsdl3-dev pkg-config build-essential cmake git"
+    PACKAGES="libsdl3-dev pkg-config build-essential git"
 
 elif command -v dnf >/dev/null 2>&1; then
     PKG_MANAGER="dnf"
     UPDATE_CMD="sudo dnf check-update || true"
     INSTALL_CMD="sudo dnf install -y"
     # Fedora / RHEL 8+ / Alma / Rocky
-    PACKAGES="SDL3-devel pkgconf-pkg-config gcc-c++ cmake git"
+    PACKAGES="SDL3-devel pkgconf-pkg-config gcc-c++ git"
 
 elif command -v yum >/dev/null 2>&1; then
     PKG_MANAGER="yum"
     UPDATE_CMD="sudo yum check-update || true"
     INSTALL_CMD="sudo yum install -y"
     # Older RHEL / CentOS
-    PACKAGES="SDL3-devel pkgconfig gcc-c++ cmake git"
+    PACKAGES="SDL3-devel pkgconfig gcc-c++ git"
 
 elif command -v pacman >/dev/null 2>&1; then
     PKG_MANAGER="pacman"
     UPDATE_CMD="sudo pacman -Sy --noconfirm"
     INSTALL_CMD="sudo pacman -S --noconfirm --needed"
     # Arch / Manjaro / EndeavourOS
-    PACKAGES="sdl3 pkgconf base-devel cmake git"
+    PACKAGES="sdl3 pkgconf base-devel git"
 
 elif command -v zypper >/dev/null 2>&1; then
     PKG_MANAGER="zypper"
     UPDATE_CMD="sudo zypper refresh"
     INSTALL_CMD="sudo zypper install -y"
     # openSUSE
-    PACKAGES="SDL3-devel pkgconf-pkg-config gcc-c++ cmake git"
+    PACKAGES="SDL3-devel pkgconf-pkg-config gcc-c++ git"
 
 elif command -v apk >/dev/null 2>&1; then
     PKG_MANAGER="apk"
     UPDATE_CMD="sudo apk update"
     INSTALL_CMD="sudo apk add"
     # Alpine
-    PACKAGES="sdl3-dev pkgconf build-base cmake git"
+    PACKAGES="sdl3-dev pkgconf build-base git"
 
 elif command -v xbps-install >/dev/null 2>&1; then
     PKG_MANAGER="xbps"
     UPDATE_CMD="sudo xbps-install -S"
     INSTALL_CMD="sudo xbps-install -y"
     # Void Linux
-    PACKAGES="SDL3-devel pkg-config base-devel cmake git"
+    PACKAGES="SDL3-devel pkg-config base-devel git"
 
 elif command -v emerge >/dev/null 2>&1; then
     PKG_MANAGER="emerge"
     UPDATE_CMD="sudo emerge --sync"
     INSTALL_CMD="sudo emerge -v --ask=n"
     # Gentoo
-    PACKAGES="media-libs/libsdl3 virtual/pkgconfig sys-devel/gcc dev-build/cmake dev-vcs/git"
+    PACKAGES="media-libs/libsdl3 virtual/pkgconfig sys-devel/gcc dev-build/dev-vcs/git"
 
 elif command -v pkg >/dev/null 2>&1 && [[ "$(uname -s)" == "FreeBSD" ]]; then
     PKG_MANAGER="pkg"
     UPDATE_CMD="sudo pkg update"
     INSTALL_CMD="sudo pkg install -y"
     # FreeBSD
-    PACKAGES="sdl3 pkgconf cmake git"
+    PACKAGES="sdl3 pkgconf git"
 
 else
     error "Could not detect a supported package manager.
@@ -168,7 +168,7 @@ What you can try:
        apt search sdl3          # Debian/Ubuntu
        dnf search SDL3          # Fedora
        pacman -Ss sdl3          # Arch
-  2. Install from source (see the macOS script for a cmake example)
+  2. Install from source (see the macOS script for a example)
   3. Use a Flatpak / container later for distribution"
 fi
 
@@ -216,3 +216,11 @@ echo "    make clean"
 echo "    make"
 echo
 success "Setup finished. Current directory: $PROJECT_DIR"
+# ---------------------------------------------------------------------------
+# Build system note (Makefile + mk/ only — no CMake)
+# ---------------------------------------------------------------------------
+info "Build system: Makefile + mk/platform.mk (unified)"
+info "  make core          → engine tests without SDL"
+info "  make nqg_cleanroom_game → full game (needs SDL3)"
+info "  make all           → everything"
+success "Environment ready. Run: make core && make nqg_cleanroom_game"

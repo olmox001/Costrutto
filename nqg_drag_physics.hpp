@@ -2,24 +2,24 @@
 #ifndef NQG_DRAG_PHYSICS_HPP
 #define NQG_DRAG_PHYSICS_HPP
 
-#include "nqg_engine3d.hpp"
-#include "nqg_physics_core.hpp"
+#include "physics/physics_drag.hpp"
 
 namespace nqg {
 namespace cleanroom {
 
 using engine::Vec3;
+using real = double;
 
+// Legacy aliases → modular English API
 inline real quadraticDragCoeff(real rho, real Cd, real area, real speed) {
-  return 0.5 * rho * Cd * area * speed;
+  return physics::drag::quadratic_coefficient(rho, Cd, area, speed);
 }
 
 inline Vec3 quadraticDrag(real rho, real Cd, real area, const Vec3 &vRel) {
-  const real k = quadraticDragCoeff(rho, Cd, area, vRel.norm());
-  return Vec3(-vRel.x * k, -vRel.y * k, -vRel.z * k);
+  return physics::drag::quadratic_force(rho, Cd, area, vRel);
 }
 
 } // namespace cleanroom
 } // namespace nqg
 
-#endif // NQG_DRAG_PHYSICS_HPP
+#endif

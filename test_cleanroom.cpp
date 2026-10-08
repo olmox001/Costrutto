@@ -304,6 +304,11 @@ int main() {
 
     auto makeDropScene = []() {
       auto testScene = std::make_unique<CleanRoomScene>();
+      // Settling regression is a deterministic contact/integrator test:
+      // remove environmental wind so residual velocity measures physics,
+      // not the default atmospheric field.
+      testScene->wind.baseDrift = Vec3(0, 0, 0);
+      testScene->wind.turbulenceIntensity = 0.0;
       testScene->water.clear();
       testScene->solids.erase(
           std::remove_if(testScene->solids.begin(), testScene->solids.end(),
