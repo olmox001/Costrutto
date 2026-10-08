@@ -50,7 +50,8 @@ static real deflection(real M, real b) {
 int main() {
   const real M = 1;
   // ---- fisica del tracciamento
-  CHECK("E1", std::abs(deflection(M, 2000) - 4 * M / 2000) / (4 * M / 2000) < 0.01,
+  CHECK("E1",
+        std::abs(deflection(M, 2000) - 4 * M / 2000) / (4 * M / 2000) < 0.01,
         "Einstein: deflessione(b=2000M)=%.6f vs 4M/b=%.6f", deflection(M, 2000),
         4.0 * M / 2000);
   CHECK(
@@ -108,8 +109,8 @@ int main() {
           gp, gm);
     CHECK("E7",
           std::abs(schw::lapse(M, 6) / schw::lapse(M, 20) -
-                   diskG(M, 6, schw::lapse(M, 20), 0) *
-                       schw::lapse(M, 6) / std::sqrt(1 - 3 * M / 6.0)) < 1e-12,
+                   diskG(M, 6, schw::lapse(M, 20), 0) * schw::lapse(M, 6) /
+                       std::sqrt(1 - 3 * M / 6.0)) < 1e-12,
           "coerenza con 1+z=alpha_o/alpha_e del core");
   }
   // ---- capacita' dell'osservatore
@@ -120,7 +121,7 @@ int main() {
           "capacita' sufficiente: %dx%d @ %.0f Hz, uso %.0f%%", p.width,
           p.height, p.fsEff, p.usage * 100);
     ObserverCapacity lo = c;
-    lo.Cops = 4e8;
+    lo.Cops = 1e9;
     auto q = negotiate(lo);
     CHECK("O2",
           q.width < c.width && q.fsEff * q.width * q.height * lo.opsPerPixel *
@@ -292,9 +293,10 @@ int main() {
     for (int i = 0; i < 300; ++i)
       hi.step(1.0 / 30, in);
     CHECK("G2",
-          lo.plan.usage <= 1.0001 && hi.plan.usage < lo.plan.usage + 1e-9 + 1.0,
-          "uso capacita': %.2f (basso C_ops) vs %.2f (alto)", lo.plan.usage,
-          hi.plan.usage);
+          lo.plan.usage <= 1.0001 && hi.plan.usage <= 1.0001 &&
+              hi.plan.width >= lo.plan.width,
+          "uso capacita': %.2f (basso C_ops, %dpx) vs %.2f (alto, %dpx)",
+          lo.plan.usage, lo.plan.width, hi.plan.usage, hi.plan.width);
     Game f;
     f.cam.r = 6;
     real tid0 = f.tidal();

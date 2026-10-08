@@ -26,6 +26,117 @@ int main() {
 
   cleanroom::AirProperties air;
 
+  {
+    MatterSimulator cold;
+    MatterSimulator warm;
+    cold.setWaterTemperature(283.15);
+    warm.setWaterTemperature(313.15);
+    const fluid::Liquid coldWater = fluid::waterAtKelvin(283.15);
+    const fluid::Liquid warmWater = fluid::waterAtKelvin(313.15);
+    CHECK("M0a", cold.waterProperties_.mu == coldWater.mu &&
+                     warm.waterProperties_.mu == warmWater.mu &&
+                     cold.waterProperties_.mu > warm.waterProperties_.mu,
+          "Viscosita' derivata da T: mu(10C)=%.6f > mu(40C)=%.6f Pa*s",
+          cold.waterProperties_.mu, warm.waterProperties_.mu);
+
+    Vec3 airDrag, airBuoyancy;
+    real reynolds = 0.0;
+    const Vec3 rotatedGravity(0, -9.80665, 0);
+    air.computeAerodynamicForces(0.1, 1.0, Vec3(0, 0, 0), Vec3(0, 0, 0),
+                   airDrag, airBuoyancy, reynolds,
+                   rotatedGravity);
+    const real expectedBuoyancy =
+      air.density() * (4.0 / 3.0) * PI * 0.1 * 0.1 * 0.1 * 9.80665;
+    CHECK("M0c", airBuoyancy.y > 0.0 && std::abs(airBuoyancy.x) < 1e-12 &&
+             std::abs(airBuoyancy.z) < 1e-12 &&
+             std::abs(airBuoyancy.y - expectedBuoyancy) < 1e-12,
+        "Archimede sotto g vettoriale: Fb=(%.4g,%.4g,%.4g) N",
+        airBuoyancy.x, airBuoyancy.y, airBuoyancy.z);
+
+    auto makePair = [](real viscosity) {
+      MatterSimulator sim;
+      sim.gravity = Vec3(0, 0, 0);
+      sim.waterProperties_.mu = viscosity;
+      Particle left, right;
+      left.type = right.type = MatterType::Water;
+      left.pos = Vec3(-0.05, 0, 0);
+      right.pos = Vec3(0.05, 0, 0);
+      left.vel = Vec3(1, 0, 0);
+      right.vel = Vec3(-1, 0, 0);
+      left.mass = right.mass = 0.025;
+      left.radius = right.radius = 0.055;
+      sim.particles = {left, right};
+      return sim;
+    };
+    cleanroom::AirProperties vacuum;
+    vacuum.pressurePa = 0.0;
+    auto viscous = makePair(coldWater.mu);
+    auto inviscid = makePair(0.0);
+    viscous.computeForces(vacuum);
+    inviscid.computeForces(vacuum);
+    const Vec3 deltaLeft = viscous.particles[0].force - inviscid.particles[0].force;
+    const Vec3 deltaRight = viscous.particles[1].force - inviscid.particles[1].force;
+    const Vec3 relativeVelocity = viscous.particles[0].vel - viscous.particles[1].vel;
+    CHECK("M0b", (deltaLeft + deltaRight).norm() < 1e-12 &&
+                     relativeVelocity.dot(deltaLeft - deltaRight) <= 0.0,
+          "Viscosita' SPH conserva la quantita' di moto e dissipa il moto relativo");
+
+    MatterSimulator capillary;
+    capillary.gravity = Vec3(0, 0, 0);
+    capillary.waterBulkModulus_ = 0.0;
+    capillary.waterProperties_.mu = 0.0;
+    for (int z = 0; z < 3; ++z)
+      for (int y = 0; y < 3; ++y)
+        for (int x = 0; x < 3; ++x) {
+          Particle drop;
+          drop.type = MatterType::Water;
+          drop.pos = Vec3(0.1 * x, 0.1 * y, 0.1 * z);
+          drop.mass = 0.025;
+          drop.radius = 0.055;
+          capillary.particles.push_back(drop);
+        }
+    cleanroom::AirProperties capillaryAir;
+    capillaryAir.pressurePa = 0.0;
+    capillary.computeForces(capillaryAir);
+    Vec3 netInternalForce(0, 0, 0);
+    real totalCapillaryMagnitude = 0.0;
+    for (const Particle &drop : capillary.particles) {
+      netInternalForce = netInternalForce + drop.force;
+      totalCapillaryMagnitude += drop.force.norm();
+    }
+    CHECK("M0d", totalCapillaryMagnitude > 0.0 &&
+                     netInternalForce.norm() < 1e-12 * totalCapillaryMagnitude,
+          "CSF produce trazione interna non nulla con risultante globale nulla");
+
+    MatterSimulator sandWater;
+    sandWater.gravity = Vec3(0, 0, 0);
+    sandWater.waterProperties_.sigma = 0.0;
+    sandWater.waterProperties_.mu = 0.0;
+    Particle grain, fluid;
+    grain.type = MatterType::Sand;
+    grain.pos = Vec3(-0.05, 0, 0);
+    grain.vel = Vec3(1, 0, 0);
+    grain.radius = 0.045;
+    grain.mass = 0.04;
+    fluid.type = MatterType::Water;
+    fluid.pos = Vec3(0.05, 0, 0);
+    fluid.vel = Vec3(-1, 0, 0);
+    fluid.radius = 0.055;
+    fluid.mass = 0.025;
+    fluid.density = 1000.0;
+    sandWater.particles = {grain, fluid};
+    cleanroom::AirProperties noAir;
+    noAir.pressurePa = 0.0;
+    sandWater.computeForces(noAir);
+    const Vec3 sandWaterDrag = sandWater.particles[0].force;
+    const Vec3 waterDrag = sandWater.particles[1].force;
+    const Vec3 relativeDrag = sandWaterDrag - waterDrag;
+    CHECK("M0e", sandWaterDrag.x < 0.0 &&
+             (sandWaterDrag + waterDrag).norm() < 1e-12 &&
+             relativeDrag.dot(grain.vel - fluid.vel) < 0.0,
+        "Drag sabbia-acqua usa la legge condivisa, conserva quantita' di moto e dissipa");
+  }
+
   // --------------------------------------------------------------------------
   // M1: Particelle Elementari: Coulomb e Raggio di Compton
   // --------------------------------------------------------------------------

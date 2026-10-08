@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  test_continuum_physics.cpp  -  Test Suite Fisica dei Mezzi Continui (NQG)
 // ============================================================================
@@ -5,6 +6,8 @@
 #include <iostream>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <string>
 
 using namespace nqg;
 using namespace nqg::continuum;
@@ -33,6 +36,8 @@ int main() {
   // 1. Acqua Continua: Onde di Gerstner, Snell, Fresnel e Beer-Lambert
   // --------------------------------------------------------------------------
   ContinuousWaterBody water;
+  water.initialFill(water.basinCenter.x - 2.0, water.basinCenter.x + 2.0,
+                    water.basinCenter.y - 2.0, water.basinCenter.y + 2.0, 0.45);
   real h0 = water.evaluateHeight(water.basinCenter.x, water.basinCenter.y, 0.0);
   CHECK(h0 > 0.40 && h0 < 0.55, "K1a", "Altezza pelo libero d'acqua ragionevole: h=" + std::to_string(h0) + " m");
 
@@ -58,6 +63,202 @@ int main() {
   Vec3 rdToWater = (Vec3(water.basinCenter.x, water.basinCenter.y, 0.45) - Vec3(0, 0, 1.75)).normalized();
   bool hitW = water.intersectWater(Vec3(0, 0, 1.75), rdToWater, 0.0, tW_hit, nW_hit, dW_hit);
   CHECK(hitW && tW_hit > 0.0, "K1f", "Intersezione analitica raggio-pelo d'acqua continuo: t=" + std::to_string(tW_hit));
+
+  // --------------------------------------------------------------------------
+  // 1b. Onde FISICHE: velocita' sqrt(g h), riva continua, infiltrazione
+  // --------------------------------------------------------------------------
+  {
+    ContinuousWaterBody pool;
+    pool.setBedProvider([](real x, real y) {
+      fluid::BedSample b;
+      if (std::abs(x) > 3.05 || std::abs(y) > 3.05) {
+        b.solid = true;
+        b.z = fluid::ShallowFlow::SOLID_Z;
+      }
+      return b;
+    });
+    pool.initialFill(-3.0, 3.0, -3.0, 3.0, 0.5);
+    const real volumeBeforeImpulse = pool.totalVolume();
+    pool.addImpulse(Vec3(0, 0, 0.5), 0.0, 0.05);
+    const real volumeAfterImpulse = pool.totalVolume();
+    const real etaAfterImpulse = pool.surfaceHeight(0.0, 0.0);
+    CHECK(std::abs(volumeAfterImpulse - volumeBeforeImpulse) < 1e-12 &&
+          etaAfterImpulse > 0.5,
+        "K1m", "Impulso d'onda modifica la superficie senza cambiare volume: dV=" +
+             std::to_string(volumeAfterImpulse - volumeBeforeImpulse));
+    const real eta0 = pool.surfaceHeight(1.5, 0.0);
+    real tArrive = -1.0;
+    for (int i = 0; i < 300 && tArrive < 0; ++i) {
+      pool.step(0.01);
+      if (std::abs(pool.surfaceHeight(1.5, 0.0) - eta0) > 2e-4)
+        tArrive = 0.01 * (i + 1);
+    }
+    const real cTh = std::sqrt(9.80665 * 0.5);
+    CHECK(tArrive > 0.35 * 1.5 / cTh && tArrive < 1.6 * 1.5 / cTh, "K1g",
+          "Onda fisica: arrivo a 1.5 m dopo t=" + std::to_string(tArrive) +
+              " s (c teorica " + std::to_string(cTh) + " m/s)");
+    const real v0 = pool.totalVolume();
+    for (int i = 0; i < 100; ++i)
+      pool.step(0.01);
+    CHECK(std::abs(pool.totalVolume() - v0) < 1e-6 * v0 + 1e-9, "K1h",
+          "Volume conservato dopo l'impulso e la propagazione");
+
+    ContinuousWaterBody centroidPool;
+    centroidPool.initialFill(-2.0, 2.0, -2.0, 2.0, 0.6);
+    RigidSolidElement fullBody;
+    fullBody.size = Vec3(0.8, 0.8, 1.0);
+    fullBody.pos = Vec3(0.0, 0.0, 0.5);
+    fullBody.syncMass();
+    RigidSolidElement halfBody = fullBody;
+    halfBody.fillFraction = 0.5;
+    halfBody.syncMass();
+    const HydroResult fullHydro =
+      bodyHydro(centroidPool, fullBody, Vec3(0, 0, 0), 9.80665);
+    const HydroResult halfHydro =
+      bodyHydro(centroidPool, halfBody, Vec3(0, 0, 0), 9.80665);
+    CHECK(fullHydro.wet && halfHydro.wet &&
+          std::abs(halfHydro.submergedVolume /
+                 fullHydro.submergedVolume -
+               0.5) < 1e-10 &&
+          (halfHydro.centroid - fullHydro.centroid).norm() < 1e-10,
+        "K1l", "Frazione piena 0.5 dimezza la spinta senza spostare il centro: z=" +
+             std::to_string(fullHydro.centroid.z) + "/" +
+             std::to_string(halfHydro.centroid.z));
+
+    ContinuousWaterBody stillPool;
+    stillPool.initialFill(-2.0, 2.0, -2.0, 2.0, 0.6);
+    RigidSolidElement floatingCube;
+    floatingCube.size = Vec3(0.4, 0.4, 0.4);
+    floatingCube.density = 700.0;
+    floatingCube.pos = Vec3(0, 0, 0.25);
+    floatingCube.syncMass();
+    ContinuousWindField noWind;
+    noWind.baseDrift = Vec3(0, 0, 0);
+    noWind.turbulenceIntensity = 0;
+    real maxTailVerticalSpeed = 0.0;
+    for (int i = 0; i < 600; ++i) {
+      stillPool.step(0.01);
+      floatingCube.stepDynamics(0.01, Vec3(0, 0, -9.80665), stillPool,
+                                noWind, 0.0, 0.0);
+      if (i >= 500)
+        maxTailVerticalSpeed =
+            std::max(maxTailVerticalSpeed, std::abs(floatingCube.vel.z));
+    }
+    CHECK(maxTailVerticalSpeed < 0.05,
+          "K1q", "Cubo galleggiante in acqua ferma senza jitter persistente: max |vz|=" +
+              std::to_string(maxTailVerticalSpeed) + " m/s");
+
+    bool hydrostaticSweepAccurate = true;
+    real maxHydrostaticVolumeError = 0.0;
+    ContinuousWaterBody sweepPool;
+    sweepPool.initialFill(-2.0, 2.0, -2.0, 2.0, 0.6);
+    for (const real centerZ : {0.35, 0.45, 0.55, 0.65}) {
+      RigidSolidElement probe;
+      probe.size = Vec3(0.4, 0.4, 0.4);
+      probe.pos = Vec3(0, 0, centerZ);
+      probe.syncMass();
+      const HydroResult sampled =
+          bodyHydro(sweepPool, probe, Vec3(0, 0, 0), 9.80665);
+      const real expected = 0.4 * 0.4 *
+                std::clamp(0.6 - (centerZ - 0.2), 0.0, 0.4);
+        maxHydrostaticVolumeError =
+          std::max(maxHydrostaticVolumeError,
+               std::abs(sampled.submergedVolume - expected));
+      hydrostaticSweepAccurate =
+        hydrostaticSweepAccurate &&
+        std::abs(sampled.submergedVolume - expected) < 1e-5;
+    }
+    CHECK(hydrostaticSweepAccurate,
+          "K1r", "Volume idrostatico del cubo, errore massimo=" +
+            std::to_string(maxHydrostaticVolumeError) + " m^3");
+
+    fluid::ShallowFlow visualField(0.1, 8, 8);
+    visualField.fillRect(-3.0, 3.0, -3.0, 3.0, 0.5);
+    const real visualVolume = visualField.totalVolume();
+    const auto fullCoverage = fluid::estimateObserverSurface(
+      visualField, 0.0, 0.0, 0.1, 0.1, 64, 0x1234);
+    const auto fullCoverageRepeat = fluid::estimateObserverSurface(
+      visualField, 0.0, 0.0, 0.1, 0.1, 64, 0x1234);
+    fluid::ShallowFlow visualShore(0.1, 8, 8);
+    visualShore.fillRect(-3.0, 0.0, -3.0, 3.0, 0.5);
+    const auto partialCoverage = fluid::estimateObserverSurface(
+      visualShore, 0.0, 0.0, 0.4, 0.4, 256, 0x5678);
+    CHECK(fullCoverage.wetProbability == 1.0 &&
+          std::abs(fullCoverage.meanEta - 0.5) < 1e-10 &&
+          fullCoverage.etaVariance < 1e-20 &&
+          fullCoverage.wetProbability == fullCoverageRepeat.wetProbability &&
+          fullCoverage.meanEta == fullCoverageRepeat.meanEta &&
+          partialCoverage.wetProbability > 0.0 &&
+          partialCoverage.wetProbability < 1.0 &&
+          visualField.totalVolume() == visualVolume,
+          "K1k", "Stima Monte Carlo observer-only: copertura=" +
+               std::to_string(partialCoverage.wetProbability) +
+               ", eta=" + std::to_string(fullCoverage.meanEta) +
+               ", var=" + std::to_string(fullCoverage.etaVariance));
+
+    // riva: profondita' continua (nessun salto sul bordo)
+    ContinuousWaterBody beach;
+    beach.initialFill(-1.0, 1.0, -1.0, 1.0, 0.02);
+    real maxJump = 0.0, prev = beach.depthAt(-1.5, 0.0);
+    real prevS = 0.0;
+    for (real x = -1.4; x < -0.6; x += 0.01) {
+      auto s = beach.flow.sample(x, 0.0);
+      const real d = s.wet ? s.depth : 0.0;
+      maxJump = std::max(maxJump, std::abs(d - prevS));
+      prevS = d;
+    }
+    (void)prev;
+    CHECK(maxJump < 0.004, "K1i",
+          "Riva continua: salto massimo di profondita' per cm = " +
+              std::to_string(maxJump) + " m");
+
+    // infiltrazione: il terreno permeabile assorbe l'acqua e il fronte si ferma
+    ContinuousWaterBody soil;
+    soil.setBedProvider([](real x, real y) {
+      (void)x;
+      (void)y;
+      fluid::BedSample b;
+      b.infil = 1e-3;
+      b.retention = 1e-3;
+      return b;
+    });
+    soil.addVolume(0, 0, 0.3, 0.01);
+    const real vs0 = soil.totalVolume();
+    for (int i = 0; i < 400; ++i)
+      soil.step(0.05);
+    CHECK(soil.totalVolume() < 0.2 * vs0, "K1j",
+          "Infiltrazione: volume " + std::to_string(vs0) + " -> " +
+              std::to_string(soil.totalVolume()) + " m^3 (fronte fermo)");
+
+    ContinuousWaterBody thinFilm;
+    thinFilm.initialFill(-1.0, 1.0, -1.0, 1.0, 5e-5);
+    RigidSolidElement filmBody;
+    filmBody.size = Vec3(0.2, 0.2, 0.2);
+    filmBody.pos = Vec3(0.0, 0.0, 0.1);
+    filmBody.setMaterial(materials::Id::HardPlastic);
+    const HydroResult thinFilmHydro =
+      bodyHydro(thinFilm, filmBody, Vec3(0, 0, 0), 9.80665);
+    const auto visualThinFilm = thinFilm.flow.sample(0.0, 0.0);
+    CHECK(thinFilmHydro.wet && thinFilmHydro.film > 0.0 &&
+          thinFilmHydro.film < thinFilm.flow.visibleDepth &&
+          !visualThinFilm.wet,
+        "K1n", "Film fisico sotto la soglia visiva rilevato: h=" +
+          std::to_string(thinFilmHydro.film) + " m");
+    const HydroResult slidingHydro =
+      bodyHydro(thinFilm, filmBody, Vec3(0.1, 0, 0), 9.80665);
+    CHECK(slidingHydro.dragCoeff.x > 0.0 &&
+          std::isfinite(slidingHydro.dragCoeff.x),
+        "K1o", "Resistenza viscosa del film sottile finita: c=" +
+          std::to_string(slidingHydro.dragCoeff.x) + " kg/s");
+    filmBody.vel = Vec3(0.1, 0, 0);
+    ContinuousWindField stillAir;
+    stillAir.baseDrift = Vec3(0, 0, 0);
+    stillAir.turbulenceIntensity = 0.0;
+    filmBody.stepDynamics(0.01, Vec3(0, 0, 0), thinFilm, stillAir, 0.0, 0.0);
+    CHECK(filmBody.vel.x >= 0.0 && filmBody.vel.x < 0.1,
+        "K1p", "Il film dissipa lo scorrimento senza invertirlo: vx=" +
+          std::to_string(filmBody.vel.x) + " m/s");
+  }
 
   // --------------------------------------------------------------------------
   // 2. Vento Continuo: Divergenza Nulla div(u) = 0 (Curl-Noise)
@@ -121,7 +322,7 @@ int main() {
   // --------------------------------------------------------------------------
   QuantumWavepacketField qf;
   real lambdaC = qf.comptonWavelength();
-  CHECK(lambdaC > 1e-15 && lambdaC < 1e-10, "K5a", "Lunghezza d'onda di Compton dell'elettrone: lambda_C=" + std::to_string(lambdaC) + " m");
+  CHECK(lambdaC > 1e-15 && lambdaC < 1e-10, "K5a", "Lunghezza d'onda di Compton dell'elettrone: lambda_C=" + [&]{ char b[32]; std::snprintf(b, sizeof b, "%.3e", lambdaC); return std::string(b); }() + " m");
 
   real psiSqCenter = qf.evaluateDensity(qf.center);
   real psiSqFar = qf.evaluateDensity(qf.center + Vec3(1.0, 0, 0));

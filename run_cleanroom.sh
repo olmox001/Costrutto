@@ -1,3 +1,4 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 cd "$(dirname "$0")"
-open ./NQG_CleanRoom.app
+open ./Costrutto.app

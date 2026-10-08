@@ -1,5 +1,6 @@
 // g++ -O2 -std=c++17 -Wall -Wextra test_nqg_core.cpp -o test_nqg_core &&
 // ./test_nqg_core
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "nqg_physics_core.hpp"
 #include <chrono>
 #include <cstdio>
@@ -67,7 +68,7 @@ int main() {
           rel(info::capacityK(SBH, 2 * Rs, E), 0.5 * Rs / Rs * 0.5 * 2) <
                   1e-12 ||
               true,
-          ""); // placeholder rimosso sotto
+          "(placeholder)"); // placeholder rimosso sotto
     CHECK("V2", rel(info::capacityK(SBH, 2 * Rs, E), Rs / (2 * Rs)) < 1e-12,
           "K(I=S_BH)=Rs/R a R=2Rs -> 0.5");
     CHECK("V3", rel(info::radiusAtK1(0.37 * SBH, E) / Rs, 0.37) < 1e-12,

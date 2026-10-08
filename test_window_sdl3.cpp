@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // ============================================================================
 //  test_window_sdl3.cpp  -  Suite di test per il componente finestra SDL3
 //  Verifica inizializzazione, streaming texture, gestione input, sintetizzatore

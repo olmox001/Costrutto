@@ -361,135 +361,93 @@
 #
 # ---------------------------------------------------------------------------*/
 // ============================================================================
-//  nqg_air_physics.hpp  -  Termodinamica e Meccanica dei Fluidi dell'Aria
-//  FIX 2025: 'g' parametrico in computeAerodynamicForces, commento Archimede
-//  corretto, guardie numeriche su pow/divisioni.
-//  FIX 2025c (performance):
-//    - pow(r,1.5) -> r*sqrt(r); pow(Re,0.687) -> exp(0.687*log(Re))
-//    - eliminata una divisione vettoriale (vRel/vMag) usando scalare k
-//    - v2 = vRel.dot(vRel) riusato per dragMag (evita vMag*vMag)
-//    - vRel testata come v2 (no sqrt inutile sul ramo d'uscita)
-//  FIX 2026 (unificazione):
-//    - quadraticDrag()/quadraticDragCoeff(): UNICA legge di resistenza
-//      F = -1/2 rho Cd A |v| v usata per aria E acqua e per ogni forma
-//      (prima: tre implementazioni diverse, con l'aria contata due volte).
-//    - sphereDragCoefficient(): crisi di resistenza continua (niente salto
-//      0.44 -> 0.15 a Re = 2e5).
+//  nqg_materials.hpp  -  Tabella dei materiali di base (SORGENTE UNICA)
+//  ---------------------------------------------------------------------------
+//  Ogni corpo rigido ricava da QUI densita', attrito, restituzione, rotolamento
+//  e aspetto. La massa NON si assegna mai a mano: mass = rho_materiale x
+//  volume_di_materia (syncMass). Un oggetto "cavo" (cassa, palla) e' descritto
+//  da materiale + spessore di parete (RigidSolidElement::setHollow), cosi' la
+//  densita' media risulta dalla geometria e non da un numero magico.
+//  Valori tipici da letteratura (kg/m^3, coefficienti adimensionali).
 // ============================================================================
-
-#ifndef NQG_AIR_PHYSICS_HPP
-#define NQG_AIR_PHYSICS_HPP
+#ifndef NQG_MATERIALS_HPP
+#define NQG_MATERIALS_HPP
 
 #include "nqg_engine3d.hpp"
-#include "nqg_drag_physics.hpp"
 #include "nqg_physics_core.hpp"
 
 namespace nqg {
-namespace cleanroom {
+namespace materials {
 
-using engine::Rgb;
-using engine::Vec3;
-
-struct AirProperties {
-  real temperatureK = 293.15;
-  real pressurePa = 101325.0;
-  Vec3 windVelocity = Vec3(0, 0, 0);
-  real scatteringCoeff = 0.0035;
-  Rgb airHazeColor = {0.85f, 0.90f, 0.98f};
-
-  static constexpr real R_air = 287.058;
-  static constexpr real gamma_air = 1.4;
-
-  real density() const {
-    if (temperatureK <= 1.0)
-      return 0.0;
-    return pressurePa / (R_air * temperatureK);
-  }
-
-  real dynamicViscosity() const {
-    constexpr real T0 = 273.15;
-    constexpr real mu0 = 1.716e-5;
-    constexpr real S = 110.4;
-    const real T = temperatureK;
-    if (T <= 1.0)
-      return 0.0;
-    // pow(T/T0, 1.5) = (T/T0) * sqrt(T/T0)
-    const real r = T / T0;
-    const real r32 = r * std::sqrt(r);
-    return mu0 * r32 * (T0 + S) / (T + S);
-  }
-
-  real kinematicViscosity() const {
-    const real rho = density();
-    if (rho < 1e-9 || !std::isfinite(rho))
-      return 0.0;
-    return dynamicViscosity() / rho;
-  }
-
-  real speedOfSound() const {
-    const real T = temperatureK > 1.0 ? temperatureK : 1.0;
-    return std::sqrt(gamma_air * R_air * T);
-  }
-
-  static real sphereDragCoefficient(real Re) {
-    if (!(Re > 1e-6))
-      return 0.0;
-    if (Re < 1.0)
-      return 24.0 / Re;
-    if (Re < 1000.0) {
-      // pow(Re,0.687) = exp(0.687*log(Re))  (una sola trascendente)
-      return (24.0 / Re) * (1.0 + 0.15 * std::exp(0.687 * std::log(Re)));
-    }
-    if (Re < 2.0e5)
-      return 0.44;
-    if (Re > 4.0e5)
-      return 0.15;
-    // crisi di resistenza: raccordo liscio in log(Re) fra 2e5 e 4e5
-    const real x = std::log(Re / 2.0e5) / std::log(2.0);
-    const real w = x * x * (3.0 - 2.0 * x);
-    return 0.44 * (1.0 - w) + 0.15 * w;
-  }
-
-  void computeAerodynamicForces(real sphereRadius, real sphereMass,
-                                const Vec3 &pos, const Vec3 &vel, Vec3 &fDrag,
-                                Vec3 &fBuoyancy, real &ReOut,
-                                real gravityMag = 9.80665) const {
-    computeAerodynamicForces(sphereRadius, sphereMass, pos, vel, fDrag,
-                 fBuoyancy, ReOut,
-                 Vec3(0, 0, -std::abs(gravityMag)));
-    }
-
-    void computeAerodynamicForces(real sphereRadius, real sphereMass,
-                  const Vec3 &pos, const Vec3 &vel, Vec3 &fDrag,
-                  Vec3 &fBuoyancy, real &ReOut,
-                  const Vec3 &gravityVec) const {
-    (void)pos;
-    (void)sphereMass;
-    const real rho = density();
-    real mu = dynamicViscosity();
-    if (mu < 1e-12)
-      mu = 1e-12;
-    const real r2 = sphereRadius * sphereRadius;
-    const real area = PI * r2;
-    const real volume = (4.0 / 3.0) * PI * r2 * sphereRadius;
-
-    fBuoyancy = gravityVec * (-rho * volume);
-
-    const Vec3 vRel = vel - windVelocity;
-    const real v2 = vRel.dot(vRel);
-    if (v2 < 1e-14 || rho < 1e-9 || !std::isfinite(v2)) {
-      fDrag = Vec3(0, 0, 0);
-      ReOut = 0.0;
-      return;
-    }
-    const real vMag = std::sqrt(v2);
-    const real Re = (rho * vMag * (2.0 * sphereRadius)) / mu;
-    ReOut = Re;
-    fDrag = quadraticDrag(rho, sphereDragCoefficient(Re), area, vRel);
-  }
+struct Material {
+  const char *name = "generico";
+  real density = 1000.0;     // kg/m^3 (materiale pieno)
+  real restitution = 0.30;   // coefficiente di restituzione (urto verso rigido)
+  real mu_s = 0.50;          // attrito statico
+  real mu_k = 0.40;          // attrito cinetico
+  real rolling = 0.015;      // resistenza al rotolamento C_rr
+  engine::Rgb albedo = {0.80f, 0.78f, 0.74f};
+  real metallic = 0.0;
+  real roughness = 0.5;
 };
 
-} // namespace cleanroom
+enum class Id {
+  Concrete,
+  Plaster,
+  CeramicTile,
+  Brick,
+  Stone,
+  Steel,
+  Aluminium,
+  Glass,
+  OakWood,
+  PineWood,
+  Plywood,
+  Cardboard,
+  RubberBall,
+  HardPlastic,
+  Foam,
+  Ice,
+  HumanBody,
+  QuartzSand
+};
+
+inline const Material &get(Id id) {
+  using engine::Rgb;
+  static const Material T[] = {
+      // nome           rho     e     mus   muk   Crr    albedo                     met   rough
+      {"calcestruzzo", 2400.0, 0.10, 0.65, 0.55, 0.020, Rgb{0.62f, 0.62f, 0.60f}, 0.00, 0.90},
+      {"intonaco",     1200.0, 0.05, 0.60, 0.50, 0.020, Rgb{0.88f, 0.86f, 0.82f}, 0.05, 0.80},
+      {"piastrella",   2300.0, 0.05, 0.45, 0.35, 0.010, Rgb{0.78f, 0.76f, 0.72f}, 0.00, 0.65},
+      {"mattone",      1900.0, 0.15, 0.65, 0.55, 0.020, Rgb{0.65f, 0.35f, 0.28f}, 0.00, 0.85},
+      {"pietra",       2700.0, 0.20, 0.60, 0.50, 0.015, Rgb{0.55f, 0.55f, 0.55f}, 0.00, 0.70},
+      {"acciaio",      7850.0, 0.45, 0.60, 0.45, 0.005, Rgb{0.66f, 0.67f, 0.70f}, 0.90, 0.30},
+      {"alluminio",    2700.0, 0.40, 0.55, 0.40, 0.006, Rgb{0.78f, 0.79f, 0.82f}, 0.90, 0.35},
+      {"vetro",        2500.0, 0.55, 0.40, 0.30, 0.004, Rgb{0.80f, 0.90f, 0.90f}, 0.00, 0.05},
+      {"rovere",        750.0, 0.30, 0.55, 0.40, 0.015, Rgb{0.72f, 0.55f, 0.35f}, 0.00, 0.55},
+      {"abete",         500.0, 0.30, 0.50, 0.38, 0.015, Rgb{0.80f, 0.65f, 0.42f}, 0.00, 0.60},
+      {"compensato",    600.0, 0.25, 0.50, 0.38, 0.015, Rgb{0.65f, 0.45f, 0.28f}, 0.00, 0.62},
+      {"cartone",       690.0, 0.10, 0.55, 0.45, 0.020, Rgb{0.70f, 0.55f, 0.38f}, 0.00, 0.85},
+      {"gomma",        1100.0, 0.75, 0.90, 0.75, 0.012, Rgb{0.88f, 0.25f, 0.20f}, 0.00, 0.35},
+      {"plastica",     1050.0, 0.45, 0.40, 0.30, 0.008, Rgb{0.88f, 0.88f, 0.82f}, 0.20, 0.30},
+      {"polistirolo",    30.0, 0.15, 0.50, 0.40, 0.020, Rgb{0.95f, 0.95f, 0.93f}, 0.00, 0.80},
+      {"ghiaccio",      917.0, 0.20, 0.10, 0.05, 0.003, Rgb{0.80f, 0.90f, 0.95f}, 0.00, 0.10},
+      {"corpo umano",   985.0, 0.00, 0.90, 0.70, 0.000, Rgb{0.80f, 0.62f, 0.52f}, 0.00, 0.60},
+      {"sabbia/quarzo",2650.0, 0.15, 0.65, 0.60, 0.050, Rgb{0.86f, 0.74f, 0.44f}, 0.00, 0.88},
+  };
+  return T[int(id)];
+}
+
+// Frazione di volume occupata dalla materia in un guscio di spessore t
+// (inviluppo di semi-lati h): 1 - prod(1 - t/h_i). t=0 -> corpo pieno.
+inline real shellFraction(real hx, real hy, real hz, real t) {
+  if (!(t > 0.0))
+    return 1.0;
+  auto k = [&](real h) { return h > 1e-12 ? std::max(0.0, 1.0 - t / h) : 0.0; };
+  return std::clamp(1.0 - k(hx) * k(hy) * k(hz), 1e-6, 1.0);
+}
+
+} // namespace materials
 } // namespace nqg
 
-#endif
+#endif // NQG_MATERIALS_HPP

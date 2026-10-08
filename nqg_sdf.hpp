@@ -361,135 +361,473 @@
 #
 # ---------------------------------------------------------------------------*/
 // ============================================================================
-//  nqg_air_physics.hpp  -  Termodinamica e Meccanica dei Fluidi dell'Aria
-//  FIX 2025: 'g' parametrico in computeAerodynamicForces, commento Archimede
-//  corretto, guardie numeriche su pow/divisioni.
-//  FIX 2025c (performance):
-//    - pow(r,1.5) -> r*sqrt(r); pow(Re,0.687) -> exp(0.687*log(Re))
-//    - eliminata una divisione vettoriale (vRel/vMag) usando scalare k
-//    - v2 = vRel.dot(vRel) riusato per dragMag (evita vMag*vMag)
-//    - vRel testata come v2 (no sqrt inutile sul ramo d'uscita)
-//  FIX 2026 (unificazione):
-//    - quadraticDrag()/quadraticDragCoeff(): UNICA legge di resistenza
-//      F = -1/2 rho Cd A |v| v usata per aria E acqua e per ogni forma
-//      (prima: tre implementazioni diverse, con l'aria contata due volte).
-//    - sphereDragCoefficient(): crisi di resistenza continua (niente salto
-//      0.44 -> 0.15 a Re = 2e5).
+//  nqg_sdf.hpp  -  Rappresentazione geometrica a Signed Distance Field (SDF)
+//
+//  Sostituisce TUTTA la modellazione poligonale/box (AABB, OBB+SAT, vertici,
+//  facce) con campi di distanza con segno:  d(p) < 0 dentro, = 0 sulla
+//  superficie, > 0 fuori, |grad d| = 1 (distanza euclidea, Lipschitz 1).
+//
+//  Il modulo e' il "core geometrico" del motore ed e' usato attivamente da:
+//   - ray casting / ombre / rifrazione  -> sphere tracing  (Field::raycast)
+//   - collisioni solido-solido          -> penetrazione = -d(p_superficie)
+//   - collisioni sfera-solido           -> d(c) < r, normale = grad d
+//   - collisione del giocatore (capsula)-> campionamento d lungo l'asse
+//   - letto dell'acqua                  -> raggio verticale sul campo
+//   - occlusione ambientale             -> campionamento di d lungo la normale
+//
+//  Un Field e' un albero CSG compatto (vettore di nodi):
+//    primitive : Sphere, Box (arrotondabile), CylinderZ, HalfSpace
+//    operatori : Union, Subtract, Intersect, SmoothUnion
+//  Ogni nodo calcola distanza E gradiente analitico (normali esatte su facce).
 // ============================================================================
-
-#ifndef NQG_AIR_PHYSICS_HPP
-#define NQG_AIR_PHYSICS_HPP
+#ifndef NQG_SDF_HPP
+#define NQG_SDF_HPP
 
 #include "nqg_engine3d.hpp"
-#include "nqg_drag_physics.hpp"
-#include "nqg_physics_core.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <vector>
 
 namespace nqg {
-namespace cleanroom {
+namespace sdf {
 
-using engine::Rgb;
 using engine::Vec3;
 
-struct AirProperties {
-  real temperatureK = 293.15;
-  real pressurePa = 101325.0;
-  Vec3 windVelocity = Vec3(0, 0, 0);
-  real scatteringCoeff = 0.0035;
-  Rgb airHazeColor = {0.85f, 0.90f, 0.98f};
+namespace detail {
+inline real sgn(real v) { return v < 0.0 ? -1.0 : 1.0; }
+} // namespace detail
 
-  static constexpr real R_air = 287.058;
-  static constexpr real gamma_air = 1.4;
-
-  real density() const {
-    if (temperatureK <= 1.0)
-      return 0.0;
-    return pressurePa / (R_air * temperatureK);
+// ---------------------------------------------------------------- primitive
+// Box con semi-lati h (estensione ESTERNA), spigoli arrotondati di raggio rnd.
+inline real boxEval(const Vec3 &q, const Vec3 &h, real rnd, Vec3 *g) {
+  const real wx = std::abs(q.x) - (h.x - rnd);
+  const real wy = std::abs(q.y) - (h.y - rnd);
+  const real wz = std::abs(q.z) - (h.z - rnd);
+  const real ox = std::max(wx, 0.0), oy = std::max(wy, 0.0),
+             oz = std::max(wz, 0.0);
+  const real out = std::sqrt(ox * ox + oy * oy + oz * oz);
+  if (out > 0.0) {
+    if (g)
+      *g = Vec3(ox > 0 ? detail::sgn(q.x) * (ox / out) : 0.0,
+                oy > 0 ? detail::sgn(q.y) * (oy / out) : 0.0,
+                oz > 0 ? detail::sgn(q.z) * (oz / out) : 0.0);
+    return out - rnd;
   }
-
-  real dynamicViscosity() const {
-    constexpr real T0 = 273.15;
-    constexpr real mu0 = 1.716e-5;
-    constexpr real S = 110.4;
-    const real T = temperatureK;
-    if (T <= 1.0)
-      return 0.0;
-    // pow(T/T0, 1.5) = (T/T0) * sqrt(T/T0)
-    const real r = T / T0;
-    const real r32 = r * std::sqrt(r);
-    return mu0 * r32 * (T0 + S) / (T + S);
+  const real m = std::max({wx, wy, wz});
+  if (g) {
+    if (wx >= wy && wx >= wz)
+      *g = Vec3(detail::sgn(q.x), 0, 0);
+    else if (wy >= wz)
+      *g = Vec3(0, detail::sgn(q.y), 0);
+    else
+      *g = Vec3(0, 0, detail::sgn(q.z));
   }
+  return m - rnd;
+}
 
-  real kinematicViscosity() const {
-    const real rho = density();
-    if (rho < 1e-9 || !std::isfinite(rho))
-      return 0.0;
-    return dynamicViscosity() / rho;
+inline real sphereEval(const Vec3 &q, real r, Vec3 *g) {
+  const real l = q.norm();
+  if (g)
+    *g = l > 1e-12 ? q * (1.0 / l) : Vec3(0, 0, 1);
+  return l - r;
+}
+
+// Cilindro con asse z, raggio R, semi-altezza hh.
+inline real cylZEval(const Vec3 &q, real R, real hh, Vec3 *g) {
+  const real rxy = std::sqrt(q.x * q.x + q.y * q.y);
+  const real dr = rxy - R, dz = std::abs(q.z) - hh;
+  const real ox = std::max(dr, 0.0), oz = std::max(dz, 0.0);
+  const real out = std::sqrt(ox * ox + oz * oz);
+  const Vec3 radial = rxy > 1e-12 ? Vec3(q.x / rxy, q.y / rxy, 0) : Vec3(1, 0, 0);
+  if (out > 0.0) {
+    if (g)
+      *g = radial * (ox / out) + Vec3(0, 0, detail::sgn(q.z) * (oz / out));
+    return out;
   }
+  if (g)
+    *g = (dr >= dz) ? radial : Vec3(0, 0, detail::sgn(q.z));
+  return std::max(dr, dz);
+}
 
-  real speedOfSound() const {
-    const real T = temperatureK > 1.0 ? temperatureK : 1.0;
-    return std::sqrt(gamma_air * R_air * T);
-  }
-
-  static real sphereDragCoefficient(real Re) {
-    if (!(Re > 1e-6))
-      return 0.0;
-    if (Re < 1.0)
-      return 24.0 / Re;
-    if (Re < 1000.0) {
-      // pow(Re,0.687) = exp(0.687*log(Re))  (una sola trascendente)
-      return (24.0 / Re) * (1.0 + 0.15 * std::exp(0.687 * std::log(Re)));
+// ----------------------------------------------------------- ray utilities
+// Clip del raggio contro il volume di inviluppo [lo,hi] (solo accelerazione).
+inline bool clipBox(const Vec3 &ro, const Vec3 &rd, const Vec3 &lo,
+                    const Vec3 &hi, real &t0, real &t1) {
+  const real o[3] = {ro.x, ro.y, ro.z}, d[3] = {rd.x, rd.y, rd.z};
+  const real l[3] = {lo.x, lo.y, lo.z}, h[3] = {hi.x, hi.y, hi.z};
+  for (int i = 0; i < 3; ++i) {
+    if (std::abs(d[i]) < 1e-12) {
+      if (o[i] < l[i] || o[i] > h[i])
+        return false;
+      continue;
     }
-    if (Re < 2.0e5)
-      return 0.44;
-    if (Re > 4.0e5)
-      return 0.15;
-    // crisi di resistenza: raccordo liscio in log(Re) fra 2e5 e 4e5
-    const real x = std::log(Re / 2.0e5) / std::log(2.0);
-    const real w = x * x * (3.0 - 2.0 * x);
-    return 0.44 * (1.0 - w) + 0.15 * w;
+    real ta = (l[i] - o[i]) / d[i], tb = (h[i] - o[i]) / d[i];
+    if (ta > tb)
+      std::swap(ta, tb);
+    t0 = std::max(t0, ta);
+    t1 = std::min(t1, tb);
+    if (t0 > t1)
+      return false;
+  }
+  return true;
+}
+
+// Sphere tracing generico. f(p, grad) -> distanza con segno (+ gradiente).
+// Partenza fuori: primo impatto. Partenza dentro: punto di uscita (normale
+// verso l'esterno).
+template <class Fn>
+inline bool sphereTrace(Fn &&f, const Vec3 &ro, const Vec3 &rd, real t0,
+                        real t1, real tMin, real &tOut, Vec3 &nOut,
+                        int maxSteps = 192, real eps = 1e-6) {
+  real t = t0;
+  Vec3 g(0, 0, 1);
+  real d = f(ro + rd * t, g);
+  if (!std::isfinite(d))
+    return false;
+  const real s = d < 0.0 ? -1.0 : 1.0;
+  for (int i = 0; i < maxSteps; ++i) {
+    const real ad = s * d;
+    if (ad < eps * (1.0 + t)) {
+      t = std::max(t + ad, tMin);
+      if (t > t1 + 1e-3)
+        return false;
+      f(ro + rd * t, g);
+      tOut = t;
+      nOut = g;
+      return true;
+    }
+    t += ad;
+    if (t > t1)
+      return false;
+    d = f(ro + rd * t, g);
+    if (!std::isfinite(d))
+      return false;
+  }
+  return false;
+}
+
+// Box (primitiva singola) senza costruire un Field.
+inline bool raycastBox(const Vec3 &ro, const Vec3 &rd, const Vec3 &center,
+                       const Vec3 &half, real rnd, real tMin, real &tOut,
+                       Vec3 &nOut) {
+  const Vec3 pad(1e-3, 1e-3, 1e-3);
+  real t0 = tMin, t1 = 1e30;
+  if (!clipBox(ro, rd, center - half - pad, center + half + pad, t0, t1))
+    return false;
+  auto fn = [&](const Vec3 &p, Vec3 &g) {
+    return boxEval(p - center, half, rnd, &g);
+  };
+  return sphereTrace(fn, ro, rd, t0, t1, tMin, tOut, nOut);
+}
+
+// ------------------------------------------------------------------- Field
+class Field {
+public:
+  enum class Op : unsigned char {
+    Sphere,
+    Box,
+    CylinderZ,
+    HalfSpace,
+    Union,
+    Subtract,
+    Intersect,
+    SmoothUnion
+  };
+  struct Node {
+    Op op = Op::Sphere;
+    Vec3 c = Vec3(0, 0, 0); // centro / punto del piano
+    Vec3 h = Vec3(0, 0, 0); // semi-lati (Box), (R,hh,0) (Cyl), normale (Plane)
+    real r = 0;             // raggio sfera / arrotondamento box
+    real k = 0;             // raggio di raccordo smooth-union
+    int a = -1, b = -1;
+  };
+
+  std::vector<Node> nodes;
+  int root = -1;
+
+  // --- costruzione (restituiscono l'indice del nodo)
+  int sphere(const Vec3 &c, real r) {
+    Node n;
+    n.op = Op::Sphere;
+    n.c = c;
+    n.r = r;
+    return push(n);
+  }
+  int box(const Vec3 &c, const Vec3 &half, real round = 0.0) {
+    Node n;
+    n.op = Op::Box;
+    n.c = c;
+    n.h = half;
+    n.r = std::min(round, std::min({half.x, half.y, half.z}));
+    return push(n);
+  }
+  int cylinderZ(const Vec3 &c, real radius, real halfHeight) {
+    Node n;
+    n.op = Op::CylinderZ;
+    n.c = c;
+    n.h = Vec3(radius, halfHeight, 0);
+    return push(n);
+  }
+  int halfSpace(const Vec3 &point, const Vec3 &normal) {
+    Node n;
+    n.op = Op::HalfSpace;
+    n.c = point;
+    n.h = normal.normalized();
+    return push(n);
+  }
+  int unite(int a, int b) { return combine(Op::Union, a, b, 0); }
+  int subtract(int a, int b) { return combine(Op::Subtract, a, b, 0); }
+  int intersect(int a, int b) { return combine(Op::Intersect, a, b, 0); }
+  int smoothUnite(int a, int b, real k) {
+    return combine(Op::SmoothUnion, a, b, std::max(k, 1e-9));
+  }
+  void setRoot(int i) {
+    root = i;
+    if (root >= 0)
+      bounds(root, bmin_, bmax_);
+  }
+  bool empty() const { return root < 0; }
+
+  // --- fabbriche di comodo
+  static Field makeBox(const Vec3 &half, real round = 0.0) {
+    Field f;
+    f.setRoot(f.box(Vec3(0, 0, 0), half, round));
+    return f;
+  }
+  static Field makeSphere(real r) {
+    Field f;
+    f.setRoot(f.sphere(Vec3(0, 0, 0), r));
+    return f;
+  }
+  static Field makeCylinderZ(real radius, real halfHeight) {
+    Field f;
+    f.setRoot(f.cylinderZ(Vec3(0, 0, 0), radius, halfHeight));
+    return f;
   }
 
-  void computeAerodynamicForces(real sphereRadius, real sphereMass,
-                                const Vec3 &pos, const Vec3 &vel, Vec3 &fDrag,
-                                Vec3 &fBuoyancy, real &ReOut,
-                                real gravityMag = 9.80665) const {
-    computeAerodynamicForces(sphereRadius, sphereMass, pos, vel, fDrag,
-                 fBuoyancy, ReOut,
-                 Vec3(0, 0, -std::abs(gravityMag)));
+  // --- interrogazione
+  const Vec3 &boundMin() const { return bmin_; }
+  const Vec3 &boundMax() const { return bmax_; }
+  Vec3 boundHalf() const { return (bmax_ - bmin_) * 0.5; }
+
+  real eval(const Vec3 &p) const {
+    return root < 0 ? 1e9 : evalNode(root, p, nullptr);
+  }
+  real evalGrad(const Vec3 &p, Vec3 &g) const {
+    if (root < 0) {
+      g = Vec3(0, 0, 1);
+      return 1e9;
     }
+    return evalNode(root, p, &g);
+  }
+  Vec3 normal(const Vec3 &p) const {
+    Vec3 g(0, 0, 1);
+    evalGrad(p, g);
+    return g;
+  }
+  bool inside(const Vec3 &p) const { return eval(p) < 0.0; }
 
-    void computeAerodynamicForces(real sphereRadius, real sphereMass,
-                  const Vec3 &pos, const Vec3 &vel, Vec3 &fDrag,
-                  Vec3 &fBuoyancy, real &ReOut,
-                  const Vec3 &gravityVec) const {
-    (void)pos;
-    (void)sphereMass;
-    const real rho = density();
-    real mu = dynamicViscosity();
-    if (mu < 1e-12)
-      mu = 1e-12;
-    const real r2 = sphereRadius * sphereRadius;
-    const real area = PI * r2;
-    const real volume = (4.0 / 3.0) * PI * r2 * sphereRadius;
+  // Ray casting per sphere tracing, accelerato dal volume di inviluppo.
+  bool raycast(const Vec3 &ro, const Vec3 &rd, real tMin, real tMax,
+               real &tOut, Vec3 &nOut) const {
+    if (root < 0)
+      return false;
+    const Vec3 pad(1e-3, 1e-3, 1e-3);
+    real t0 = tMin, t1 = tMax;
+    if (!clipBox(ro, rd, bmin_ - pad, bmax_ + pad, t0, t1))
+      return false;
+    auto fn = [&](const Vec3 &p, Vec3 &g) { return evalNode(root, p, &g); };
+    return sphereTrace(fn, ro, rd, t0, t1, tMin, tOut, nOut);
+  }
 
-    fBuoyancy = gravityVec * (-rho * volume);
+  // 26 punti di superficie (8 spigoli, 12 mezzerie di bordo, 6 centri faccia
+  // dell'inviluppo), ottenuti per RAYCAST sul campo: servono come punti di
+  // contatto / appoggio per forme qualsiasi.
+  std::array<Vec3, 26> surfaceSamples() const {
+    std::array<Vec3, 26> out;
+    const Vec3 c = (bmin_ + bmax_) * 0.5, h = (bmax_ - bmin_) * 0.5;
+    const real R = h.norm() * 2.0 + 1.0;
+    int k = 0;
+    for (int sx = -1; sx <= 1; ++sx)
+      for (int sy = -1; sy <= 1; ++sy)
+        for (int sz = -1; sz <= 1; ++sz) {
+          if (!sx && !sy && !sz)
+            continue;
+          const Vec3 dir(sx * h.x, sy * h.y, sz * h.z);
+          const real len = dir.norm();
+          Vec3 p = c + dir;
+          if (len > 1e-12) {
+            const Vec3 u = dir * (1.0 / len);
+            const Vec3 ro = c + u * (len + R);
+            const Vec3 rd = u * -1.0;
+            real t;
+            Vec3 n;
+            if (raycast(ro, rd, 0.0, 1e30, t, n)) {
+              p = ro + rd * t;
+              Vec3 g;
+              const real d = evalGrad(p, g);
+              p = p - g * d; // proiezione esatta sulla superficie
+            }
+          }
+          out[k++] = p;
+        }
+    return out;
+  }
 
-    const Vec3 vRel = vel - windVelocity;
-    const real v2 = vRel.dot(vRel);
-    if (v2 < 1e-14 || rho < 1e-9 || !std::isfinite(v2)) {
-      fDrag = Vec3(0, 0, 0);
-      ReOut = 0.0;
+private:
+  Vec3 bmin_ = Vec3(-1e9, -1e9, -1e9), bmax_ = Vec3(1e9, 1e9, 1e9);
+
+  int push(const Node &n) {
+    nodes.push_back(n);
+    return int(nodes.size()) - 1;
+  }
+  int combine(Op op, int a, int b, real k) {
+    Node n;
+    n.op = op;
+    n.a = a;
+    n.b = b;
+    n.k = k;
+    return push(n);
+  }
+
+  real evalNode(int i, const Vec3 &p, Vec3 *g) const {
+    const Node &n = nodes[std::size_t(i)];
+    switch (n.op) {
+    case Op::Sphere:
+      return sphereEval(p - n.c, n.r, g);
+    case Op::Box:
+      return boxEval(p - n.c, n.h, n.r, g);
+    case Op::CylinderZ:
+      return cylZEval(p - n.c, n.h.x, n.h.y, g);
+    case Op::HalfSpace:
+      if (g)
+        *g = n.h;
+      return (p - n.c).dot(n.h);
+    default:
+      break;
+    }
+    Vec3 ga(0, 0, 1), gb(0, 0, 1);
+    const real da = evalNode(n.a, p, g ? &ga : nullptr);
+    const real db = evalNode(n.b, p, g ? &gb : nullptr);
+    switch (n.op) {
+    case Op::Union:
+      if (da <= db) {
+        if (g)
+          *g = ga;
+        return da;
+      }
+      if (g)
+        *g = gb;
+      return db;
+    case Op::Subtract: {
+      const real nd = -db;
+      if (da >= nd) {
+        if (g)
+          *g = ga;
+        return da;
+      }
+      if (g)
+        *g = gb * -1.0;
+      return nd;
+    }
+    case Op::Intersect:
+      if (da >= db) {
+        if (g)
+          *g = ga;
+        return da;
+      }
+      if (g)
+        *g = gb;
+      return db;
+    default: { // SmoothUnion (min polinomiale)
+      const real h = std::clamp(0.5 + 0.5 * (db - da) / n.k, 0.0, 1.0);
+      if (g)
+        *g = (gb * (1.0 - h) + ga * h).normalized();
+      return db * (1.0 - h) + da * h - n.k * h * (1.0 - h);
+    }
+    }
+  }
+
+  void bounds(int i, Vec3 &lo, Vec3 &hi) const {
+    const Node &n = nodes[std::size_t(i)];
+    switch (n.op) {
+    case Op::Sphere:
+      lo = n.c - Vec3(n.r, n.r, n.r);
+      hi = n.c + Vec3(n.r, n.r, n.r);
       return;
+    case Op::Box:
+      lo = n.c - n.h;
+      hi = n.c + n.h;
+      return;
+    case Op::CylinderZ:
+      lo = n.c - Vec3(n.h.x, n.h.x, n.h.y);
+      hi = n.c + Vec3(n.h.x, n.h.x, n.h.y);
+      return;
+    case Op::HalfSpace:
+      lo = Vec3(-1e9, -1e9, -1e9);
+      hi = Vec3(1e9, 1e9, 1e9);
+      return;
+    default:
+      break;
     }
-    const real vMag = std::sqrt(v2);
-    const real Re = (rho * vMag * (2.0 * sphereRadius)) / mu;
-    ReOut = Re;
-    fDrag = quadraticDrag(rho, sphereDragCoefficient(Re), area, vRel);
+    Vec3 la, ha, lb, hb;
+    bounds(n.a, la, ha);
+    bounds(n.b, lb, hb);
+    if (n.op == Op::Subtract) {
+      lo = la;
+      hi = ha;
+    } else if (n.op == Op::Intersect) {
+      lo = Vec3(std::max(la.x, lb.x), std::max(la.y, lb.y),
+                std::max(la.z, lb.z));
+      hi = Vec3(std::min(ha.x, hb.x), std::min(ha.y, hb.y),
+                std::min(ha.z, hb.z));
+    } else {
+      const real k = n.op == Op::SmoothUnion ? n.k : 0.0;
+      lo = Vec3(std::min(la.x, lb.x) - k, std::min(la.y, lb.y) - k,
+                std::min(la.z, lb.z) - k);
+      hi = Vec3(std::max(ha.x, hb.x) + k, std::max(ha.y, hb.y) + k,
+                std::max(ha.z, hb.z) + k);
+    }
   }
 };
 
-} // namespace cleanroom
+// ------------------------------------------------- collisione capsula/SDF
+// Capsula verticale (raggio, altezza, eyeHeight = quota occhi sopra i piedi)
+// contro un campo qualsiasi: query(p, n) -> distanza con segno e normale
+// uscente. Spinge fuori lungo il gradiente e annulla la velocita' entrante.
+template <class Query>
+inline bool resolveCapsule(Vec3 &camPos, Vec3 &camVel, real radius,
+                           real eyeHeight, real height, Query &&query,
+                           real margin = 0.0, int iters = 4) {
+  bool moved = false;
+  constexpr int N = 5;
+  for (int it = 0; it < iters; ++it) {
+    bool any = false;
+    for (int k = 0; k < N; ++k) {
+      const real foot = camPos.z - eyeHeight;
+      const real z0 = foot + radius, z1 = foot + height - radius;
+      const real z = z0 + (z1 - z0) * real(k) / real(N - 1);
+      const Vec3 p(camPos.x, camPos.y, z);
+      Vec3 n(0, 0, 1);
+      const real d = query(p, n);
+      const real pen = radius + margin - d;
+      if (pen > 0.0 && std::isfinite(pen)) {
+        camPos = camPos + n * pen;
+        const real vn = camVel.dot(n);
+        if (vn < 0.0)
+          camVel = camVel - n * vn;
+        any = moved = true;
+      }
+    }
+    if (!any)
+      break;
+  }
+  return moved;
+}
+
+} // namespace sdf
 } // namespace nqg
 
-#endif
+#endif // NQG_SDF_HPP
